@@ -13,22 +13,15 @@ def _required(name: str) -> str:
     return value
 
 
-def _parse_weights(raw: str) -> tuple[float, float] | None:
-    if not raw:
-        return None
-    parts = [part.strip() for part in raw.split(",") if part.strip()]
-    if len(parts) != 2:
-        raise ValueError("RETRIEVAL_HYBRID_RRF_WEIGHTS must be two comma-separated numbers")
-    try:
-        return (float(parts[0]), float(parts[1]))
-    except ValueError as error:
-        raise ValueError("RETRIEVAL_HYBRID_RRF_WEIGHTS must be numeric") from error
-
-
-def _parse_scope(raw: str) -> str:
-    if raw not in ("Local", "Global"):
-        raise ValueError("RETRIEVAL_FULL_TEXT_SCORE_SCOPE must be 'Local' or 'Global'")
-    return raw
+def parse_catalog_poll_seconds(raw: str | None) -> int:
+    if raw is None:
+        return 7200
+    if not raw or not raw.isascii() or not raw.isdecimal():
+        raise ValueError("RETRIEVAL_CATALOG_POLL_SECONDS must be an integer from 60 through 86400")
+    seconds = int(raw)
+    if not 60 <= seconds <= 86400:
+        raise ValueError("RETRIEVAL_CATALOG_POLL_SECONDS must be an integer from 60 through 86400")
+    return seconds
 
 
 @dataclass(frozen=True)
@@ -47,7 +40,6 @@ class RetrievalConfig:
     gateway_client_id: str
     gateway_principal_id: str
     deployment_instance_id: str
-    catalog_digest: str
     retrieval_timeout_seconds: float
     generation_timeout_seconds: float
     agent_timeout_seconds: float
@@ -60,11 +52,7 @@ class RetrievalConfig:
     app_insights_connection_string: str | None
     include_citations: bool
     acl_enabled: bool
-    over_fetch_factor: int = 1
-    full_text_score_scope: str = "Global"
-    hybrid_rrf_weights: tuple[float, float] | None = None
-    default_scoring_profile: str | None = None
-    synonyms_enabled: bool = False
+    catalog_poll_seconds: int = 7200
     catalog_container: str = "retrieval-config"
     operation_timeout_seconds: float = 27.0
 
@@ -85,7 +73,6 @@ def load_retrieval_config() -> RetrievalConfig:
         gateway_client_id=_required("RETRIEVAL_GATEWAY_CLIENT_ID"),
         gateway_principal_id=_required("RETRIEVAL_GATEWAY_PRINCIPAL_ID"),
         deployment_instance_id=_required("DEPLOYMENT_INSTANCE_ID"),
-        catalog_digest=_required("RETRIEVAL_CATALOG_DIGEST"),
         retrieval_timeout_seconds=float(os.getenv("RETRIEVAL_TIMEOUT_SECONDS", "5.0")),
         generation_timeout_seconds=float(os.getenv("GENERATION_TIMEOUT_SECONDS", "15.0")),
         agent_timeout_seconds=float(os.getenv("AGENT_TIMEOUT_SECONDS", "8.0")),
@@ -100,11 +87,7 @@ def load_retrieval_config() -> RetrievalConfig:
         app_insights_connection_string=os.getenv("APPLICATIONINSIGHTS_CONNECTION_STRING", "").strip() or None,
         include_citations=os.getenv("INCLUDE_CITATIONS", "true").strip().lower() != "false",
         acl_enabled=os.getenv("ACL_ENABLED", "true").strip().lower() not in ("false", "0", "no"),
-        over_fetch_factor=int(os.getenv("RETRIEVAL_OVER_FETCH_FACTOR", "5")),
-        full_text_score_scope=_parse_scope(os.getenv("RETRIEVAL_FULL_TEXT_SCORE_SCOPE", "Global")),
-        hybrid_rrf_weights=_parse_weights(os.getenv("RETRIEVAL_HYBRID_RRF_WEIGHTS", "").strip()),
-        default_scoring_profile=os.getenv("RETRIEVAL_DEFAULT_SCORING_PROFILE", "").strip() or None,
-        synonyms_enabled=os.getenv("RETRIEVAL_SYNONYMS_ENABLED", "false").strip().lower() in ("true", "1", "yes"),
+        catalog_poll_seconds=parse_catalog_poll_seconds(os.getenv("RETRIEVAL_CATALOG_POLL_SECONDS")),
         catalog_container=os.getenv("RETRIEVAL_CONFIG_CONTAINER", "retrieval-config").strip() or "retrieval-config",
         operation_timeout_seconds=float(os.getenv("RETRIEVAL_OPERATION_TIMEOUT_SECONDS", "27.0")),
     )

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable, Hashable, Iterable, TypeVar
+from typing import Any, Callable, Hashable, Iterable, Mapping, TypeVar
 
 
 T = TypeVar("T")
@@ -95,3 +95,27 @@ def evidence_identity(item: Any) -> tuple[str, str] | None:
 
 def citation_label(index: int) -> str:
     return f"[S{index}]"
+
+
+def _citation_value(item: Any, field: str) -> Any:
+    return item[field] if isinstance(item, Mapping) else getattr(item, field)
+
+
+def citation_location(item: Any) -> str:
+    return str(_citation_value(item, "locator_label"))
+
+
+def citation_source(item: Any) -> str:
+    return f"{_citation_value(item, 'source_name')}, {citation_location(item)}"
+
+
+def citation_url(item: Any) -> str:
+    source = _citation_value(item, "source_url") or _citation_value(item, "source_name")
+    source_text = str(source).lower()
+    source_name = str(_citation_value(item, "source_name")).lower()
+    if (
+        str(_citation_value(item, "locator_kind")) == "page"
+        and (source_text.endswith(".pdf") or ".pdf#" in source_text or source_name.endswith(".pdf"))
+    ):
+        return f"{source}#page={_citation_value(item, 'locator_ordinal_start')}"
+    return source

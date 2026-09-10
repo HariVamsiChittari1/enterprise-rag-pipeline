@@ -15,12 +15,14 @@ from types import SimpleNamespace
 from typing import Any
 
 import azure.cosmos
+import azure.ai.contentunderstanding
 import azure.identity
 import httpx
 import openai
 import pytest
 
 import function_app
+from config import ExtractionProvider
 
 
 @pytest.fixture(autouse=True)
@@ -57,6 +59,14 @@ class FakeAzureOpenAI:
         FakeAzureOpenAI.instances.append(self)
 
 
+class FakeContentUnderstandingClient:
+    instances: list["FakeContentUnderstandingClient"] = []
+
+    def __init__(self, **kwargs: Any) -> None:
+        self.kwargs = kwargs
+        FakeContentUnderstandingClient.instances.append(self)
+
+
 def _fake_config(**overrides: Any) -> SimpleNamespace:
     base = dict(
         managed_identity_client_id="mi-client-id",
@@ -66,6 +76,7 @@ def _fake_config(**overrides: Any) -> SimpleNamespace:
         cosmos_source_documents_container="source-documents",
         cosmos_search_chunks_container="search-chunks",
         openai_endpoint="https://openai.example",
+        content_understanding_endpoint="https://cu.example",
         key_vault_uri="https://vault.example",
         certificate_secret_name="sharepoint-cert",
         tenant_id="tenant-id",
@@ -103,6 +114,56 @@ def test_build_openai_client_constructs_sdk_client_once(monkeypatch: pytest.Monk
 
     assert first is second
     assert len(FakeAzureOpenAI.instances) == 1
+
+
+def test_build_cu_client_constructs_sdk_client_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    FakeContentUnderstandingClient.instances.clear()
+    credential = object()
+    monkeypatch.setattr(
+        azure.ai.contentunderstanding,
+        "ContentUnderstandingClient",
+        FakeContentUnderstandingClient,
+    )
+    monkeypatch.setattr(
+        azure.identity,
+        "DefaultAzureCredential",
+        lambda **kwargs: credential,
+    )
+    config = _fake_config(content_understanding_endpoint="https://cu.example/")
+
+    first = function_app._build_cu_client(config)
+    second = function_app._build_cu_client(config)
+
+    assert first is second
+    assert len(FakeContentUnderstandingClient.instances) == 1
+    assert first.kwargs == {
+        "endpoint": "https://cu.example",
+        "credential": credential,
+    }
+
+
+@pytest.mark.parametrize(
+    ("extraction_enabled", "provider", "expected"),
+    [
+        (False, None, (None, None)),
+        (True, ExtractionProvider.DOCUMENT_INTELLIGENCE, ("di", None)),
+        (True, ExtractionProvider.CONTENT_UNDERSTANDING, (None, "cu")),
+    ],
+)
+def test_build_extraction_clients_constructs_only_selected_provider(
+    monkeypatch: pytest.MonkeyPatch,
+    extraction_enabled: bool,
+    provider: ExtractionProvider | None,
+    expected: tuple[str | None, str | None],
+) -> None:
+    config = _fake_config(
+        extraction_enabled=extraction_enabled,
+        extraction_provider=provider,
+    )
+    monkeypatch.setattr(function_app, "_build_di_client", lambda _config: "di")
+    monkeypatch.setattr(function_app, "_build_cu_client", lambda _config: "cu")
+
+    assert function_app._build_extraction_clients(config) == expected
 
 
 def test_build_sharepoint_client_rejects_missing_site_url(monkeypatch: pytest.MonkeyPatch) -> None:

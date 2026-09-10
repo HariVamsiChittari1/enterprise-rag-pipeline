@@ -7,13 +7,18 @@ import pytest
 from ingestion.models import (
     ActivityOutcome,
     ActivityStatus,
+    CanonicalExtractionResult,
+    CanonicalSegment,
     ChunkingProfile,
+    ContentModality,
     DocumentStage,
     DocumentStatus,
     EmbeddingProfile,
     EnrichmentStatuses,
     Entity,
+    ExtractionProvenance,
     IngestionRunRecord,
+    LocatorKind,
     ModuleStatus,
     ProfileSnapshot,
     RunCounters,
@@ -21,8 +26,14 @@ from ingestion.models import (
     RunStatus,
     SearchChunkRecord,
     Settings,
+    SourceLocator,
     SourceControlRecord,
     SourceDocumentRecord,
+    VisualDisposition,
+    VisualCoverage,
+    VisualCoverageStatus,
+    VisualManifestEntry,
+    VisualRelevance,
     canonical_group_ids,
     content_sha256,
     create_chunk_id,
@@ -30,8 +41,11 @@ from ingestion.models import (
     create_document_key,
     create_run_id,
     create_source_run_id,
+    create_visual_manifest_pages,
     run_record_id,
     safe_error_from_exception,
+    serialized_size_bytes,
+    visual_manifest_hash,
 )
 
 
@@ -118,18 +132,137 @@ def test_settings_and_run_serialize_exact_configuration_snapshot() -> None:
     ]
 
 
-def test_document_record_enforces_deterministic_keys_and_pdf_contract() -> None:
+def test_document_record_enforces_deterministic_keys() -> None:
     record = build_document_record()
 
     item = record.to_cosmos_item()
     assert item["sourceRunId"] == "source:run-a"
+    assert item["recordType"] == "source_document"
     assert item["allowedGroupIds"] == ["group-a"]
     assert item["status"] == "discovered"
 
+
+def test_visual_manifest_pages_are_deterministic_and_size_bounded() -> None:
+    document = build_document_record()
+    entries = tuple(
+        VisualManifestEntry(
+            ordinal=index,
+            visual_id=f"visual-{index:03d}",
+            object_type="chart",
+            source_locator=SourceLocator(LocatorKind.PAGE, f"Page {index + 1}", index + 1, index + 1),
+            relevance=VisualRelevance.REQUIRED,
+            disposition=VisualDisposition.DESCRIBED,
+            description="x" * 8_000,
+            provenance=(ExtractionProvenance.DIRECT,),
+        )
+        for index in range(60)
+    )
+
+    pages = create_visual_manifest_pages(document, entries)
+    replay = create_visual_manifest_pages(document, entries)
+
+    assert len(pages) > 1
+    assert pages == replay
+    assert tuple(page.page_index for page in pages) == tuple(range(len(pages)))
+    assert all(page.page_count == len(pages) for page in pages)
+    assert all(page.record_type == "visual_manifest_page" for page in pages)
+    assert all(serialized_size_bytes(page.to_cosmos_item()) <= 128 * 1024 for page in pages)
+    assert visual_manifest_hash(pages) == visual_manifest_hash(replay)
+
+
+def test_document_manifest_binding_is_atomic() -> None:
     values = document_values()
-    values["mime_type"] = "text/plain"
-    with pytest.raises(ValueError, match="only PDF"):
+    values["visual_manifest_page_count"] = 1
+
+    with pytest.raises(ValueError, match="manifest page count and hash"):
         SourceDocumentRecord(**values)
+
+
+
+@pytest.mark.parametrize(
+    "mime_type",
+    [
+        "application/pdf",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "text/markdown",
+        "text/plain",
+    ],
+)
+def test_document_record_accepts_supported_source_mime_types(mime_type: str) -> None:
+    values = document_values()
+    values["mime_type"] = mime_type
+
+    record = SourceDocumentRecord(**values)
+
+    assert record.mime_type == mime_type
+
+
+def test_document_record_rejects_unsupported_source_mime_type() -> None:
+    values = document_values()
+    values["mime_type"] = "application/octet-stream"
+
+    with pytest.raises(ValueError, match="MIME type is not supported"):
+        SourceDocumentRecord(**values)
+
+
+def test_canonical_extraction_requires_complete_visual_accounting() -> None:
+    segment = CanonicalSegment(
+        ordinal=0,
+        text="Text plus a factual chart description.",
+        locator=SourceLocator(LocatorKind.SLIDE, "Slide 1", 1, 1),
+        modalities=(ContentModality.TEXT, ContentModality.VISUAL_DESCRIPTION),
+        provenance=(ExtractionProvenance.DIRECT, ExtractionProvenance.RENDERED),
+    )
+    coverage = VisualCoverage(
+        status=VisualCoverageStatus.COMPLETE,
+        inventory_count=1,
+        required_count=1,
+        described_count=1,
+        excluded_count=0,
+        unsupported_count=0,
+        uncovered_count=0,
+    )
+
+    result = CanonicalExtractionResult((segment,), coverage)
+
+    assert result.segments[0].locator.kind is LocatorKind.SLIDE
+
+
+def test_visual_coverage_rejects_unexplained_required_visuals() -> None:
+    with pytest.raises(ValueError, match="required visual accounting"):
+        VisualCoverage(
+            status=VisualCoverageStatus.COMPLETE,
+            inventory_count=2,
+            required_count=2,
+            described_count=1,
+            excluded_count=0,
+            unsupported_count=0,
+            uncovered_count=0,
+        )
+
+
+def test_canonical_extraction_rejects_visual_count_without_visual_modality() -> None:
+    segment = CanonicalSegment(
+        ordinal=0,
+        text="Text-only source segment.",
+        locator=SourceLocator(LocatorKind.SECTION, "Document", 1, 1),
+        modalities=(ContentModality.TEXT,),
+        provenance=(ExtractionProvenance.DIRECT,),
+    )
+    coverage = VisualCoverage(
+        status=VisualCoverageStatus.COMPLETE,
+        inventory_count=1,
+        required_count=1,
+        described_count=1,
+        excluded_count=0,
+        unsupported_count=0,
+        uncovered_count=0,
+    )
+
+    with pytest.raises(ValueError, match="visual descriptions do not match coverage"):
+        CanonicalExtractionResult((segment,), coverage)
 
 
 def test_retired_document_requires_retirement_fields_and_prior_ready_state() -> None:
@@ -177,6 +310,11 @@ def test_chunk_record_separates_original_and_embedding_text() -> None:
     }
     assert item["isRetrievable"] is False
     assert item["lifecycleGeneration"] == 0
+    assert item["locatorKind"] == "page"
+    assert item["locatorLabel"] == "Page 1"
+    assert item["modalities"] == ["text", "visual_description"]
+    assert item["provenance"] == ["direct"]
+    assert item["visualCoverage"] == "complete"
 
 
 def test_lifecycle_admission_fields_are_strict() -> None:
@@ -277,6 +415,13 @@ def chunk_values() -> dict[str, object]:
         "page_start": 1,
         "page_end": 1,
         "section_path": ("Heading",),
+        "locator_kind": LocatorKind.PAGE,
+        "locator_label": "Page 1",
+        "locator_ordinal_start": 1,
+        "locator_ordinal_end": 1,
+        "modalities": (ContentModality.TEXT, ContentModality.VISUAL_DESCRIPTION),
+        "provenance": (ExtractionProvenance.DIRECT,),
+        "visual_coverage": VisualCoverageStatus.COMPLETE,
         "chunk_index": 0,
         "created_at": UTC,
         "content": content,

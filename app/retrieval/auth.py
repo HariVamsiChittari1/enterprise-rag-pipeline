@@ -224,33 +224,6 @@ def parse_gateway_request_id(value: str | None) -> str:
     return canonical
 
 
-def principal_from_easy_auth(
-    encoded_principal: str | None,
-    expected_tenant_id: str,
-    group_resolver: GroupResolver | None = None,
-    *,
-    acl_enabled: bool = True,
-) -> Principal:
-    by_type = _claims_by_type(encoded_principal)
-    user_id = _single_claim(by_type, "oid")
-    tenant_id = _single_claim(by_type, "tid")
-    if tenant_id != expected_tenant_id:
-        raise AuthorizationError("unexpected_tenant")
-
-    if not acl_enabled:
-        return Principal(user_id, tenant_id, frozenset())
-
-    if group_resolver is None:
-        raise AuthorizationError("security_groups_unresolved")
-    try:
-        group_ids = group_resolver.resolve_transitive_security_groups(user_id)
-    except Exception as error:
-        raise AuthorizationError("security_groups_unresolved") from error
-    if not group_ids or not all(isinstance(group_id, str) and group_id for group_id in group_ids):
-        raise AuthorizationError("security_groups_unresolved")
-    return Principal(user_id, tenant_id, frozenset(group_ids))
-
-
 def require_easy_auth_role(
     encoded_principal: str | None,
     expected_tenant_id: str,

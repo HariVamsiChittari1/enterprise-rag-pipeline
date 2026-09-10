@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import hashlib
 import os
 import time
 import threading
 import uuid
 from contextlib import ExitStack, asynccontextmanager
-from dataclasses import asdict, replace
-from typing import Any
+from dataclasses import asdict
+from typing import Any, Mapping
 
 import httpx
 import structlog
@@ -31,17 +32,19 @@ from retrieval.auth import (
     principal_from_gateway,
     parse_gateway_request_id,
 )
-from retrieval.catalog import CatalogError, CosmosCatalogLoader
+from retrieval.catalog import CatalogError, RequestPolicy, RuntimeCatalogLoader
 from retrieval.config import RetrievalConfig, load_retrieval_config
-from retrieval.config_loader import (
-    redact_catalog,
-)
 from retrieval.cosmos import RetrievalMode, RetrievedChunk
 from retrieval.cosmos_registry import CosmosRegistry, build_cosmos_registry, load_cosmos_instance_configs
-from retrieval.pipeline import RetrievalDependencyError, citation_label
+from retrieval.pipeline import (
+    RetrievalDependencyError,
+    citation_label,
+    citation_location,
+    citation_url,
+)
 from retrieval.service import RagService, UnknownScoringProfileError
-from retrieval.synonyms import SynonymExpander
-from retrieval.telemetry import write_audit_records
+from retrieval.runtime_catalog import RuntimeCatalogProvider
+from retrieval.telemetry import CATALOG_LOGGER_NAME, catalog_event_emitter, write_audit_records
 
 try:
     from retrieval.agent import create_rag_agent
@@ -75,15 +78,13 @@ class _AppState:
     group_resolver: GraphGroupResolver
     audit_container: Any
     agent_chat_client: Any
-    scoring_profiles: dict[str, Any]
-    synonym_expanders: dict[str, SynonymExpander]
-    catalog_version: str | None
+    catalog_provider: RuntimeCatalogProvider
 
 
 _state = _AppState()
 
 
-def _configure_tracing(config: RetrievalConfig) -> None:
+def _configure_tracing(config: RetrievalConfig, *, credential: ManagedIdentityCredential | None = None) -> None:
     """Best-effort GenAI OpenTelemetry tracing (gen_ai.usage.* spans in App Insights).
 
     No-ops if APPLICATIONINSIGHTS_CONNECTION_STRING isn't configured, so existing
@@ -96,7 +97,11 @@ def _configure_tracing(config: RetrievalConfig) -> None:
         from azure.monitor.opentelemetry import configure_azure_monitor
         from opentelemetry.instrumentation.openai_v2 import OpenAIInstrumentor
 
-        configure_azure_monitor(connection_string=config.app_insights_connection_string)
+        configure_azure_monitor(
+            connection_string=config.app_insights_connection_string,
+            logger_name=CATALOG_LOGGER_NAME,
+            credential=credential,
+        )
         OpenAIInstrumentor().instrument()
         logger.info("tracing_configured")
     except Exception:
@@ -106,11 +111,12 @@ def _configure_tracing(config: RetrievalConfig) -> None:
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
     resources = ExitStack()
+    provider: RuntimeCatalogProvider | None = None
     try:
         config = load_retrieval_config()
-        _configure_tracing(config)
         credential = ManagedIdentityCredential(client_id=config.managed_identity_client_id)
         resources.callback(_close_resource, credential)
+        _configure_tracing(config, credential=credential)
 
         instance_configs = load_cosmos_instance_configs(
             default_source_id=os.getenv("INGESTION_SOURCE_ID", "default"),
@@ -162,31 +168,19 @@ async def _lifespan(app: FastAPI):
             _state.agent_chat_client = None
 
         catalog_container = db.get_container_client(config.catalog_container)
-        loaded_catalog = CosmosCatalogLoader(
-            catalog_container,
-            config.deployment_instance_id,
-            config.catalog_digest,
-        ).load()
-        _loaded_profiles = loaded_catalog.profiles
-        _loaded_maps = loaded_catalog.synonym_maps
-        catalog_version = loaded_catalog.version
-        config = replace(
-            config,
-            default_scoring_profile=loaded_catalog.default_profile,
-            over_fetch_factor=loaded_catalog.over_fetch_factor,
-            full_text_score_scope=loaded_catalog.full_text_score_scope,
-            hybrid_rrf_weights=loaded_catalog.hybrid_weights,
-            synonyms_enabled=loaded_catalog.synonyms_enabled,
+        provider = RuntimeCatalogProvider(
+            RuntimeCatalogLoader(catalog_container, config.deployment_instance_id),
+            config.catalog_poll_seconds,
+            emit=catalog_event_emitter(
+                os.getenv("CONTAINER_APP_REVISION", ""),
+                os.getenv("CONTAINER_APP_REPLICA_NAME", ""),
+                application=os.getenv("CONTAINER_APP_NAME", ""),
+                deployment_instance_hash=hashlib.sha256(config.deployment_instance_id.encode("utf-8")).hexdigest(),
+            ),
         )
+        await provider.start()
+        _state.catalog_provider = provider
         _state.config = config
-        _loaded_expanders = {
-            name: SynonymExpander(synonym_map) for name, synonym_map in _loaded_maps.items()
-        }
-        _state.scoring_profiles = _loaded_profiles
-        _state.synonym_expanders = _loaded_expanders
-        _state.catalog_version = catalog_version
-        if config.synonyms_enabled and not _loaded_expanders:
-            logger.warning("synonyms_enabled_but_no_maps_loaded")
 
         _state.rag_service = RagService(
             _state.openai_client,
@@ -198,13 +192,7 @@ async def _lifespan(app: FastAPI):
             max_evidence=config.max_evidence_chunks,
             max_planned_queries=config.max_planned_queries,
             acl_enabled=config.acl_enabled,
-            scoring_profiles=_loaded_profiles,
-            default_scoring_profile=config.default_scoring_profile,
-            over_fetch_factor=config.over_fetch_factor,
-            full_text_score_scope=config.full_text_score_scope,
-            hybrid_rrf_weights=config.hybrid_rrf_weights,
-            synonym_expanders=_loaded_expanders,
-            synonyms_enabled=config.synonyms_enabled,
+            catalog_provider=provider,
         )
         resources.callback(_close_resource, _state.rag_service)
         graph_client = httpx.Client(
@@ -218,17 +206,13 @@ async def _lifespan(app: FastAPI):
             cosmos_endpoint=config.cosmos_endpoint,
             cosmos_instances=len(registry),
             acl_enabled=config.acl_enabled,
-            scoring_profiles=redact_catalog(_loaded_profiles),
-            synonym_maps=sorted(_loaded_expanders.keys()),
-            default_scoring_profile=config.default_scoring_profile,
-            full_text_score_scope=config.full_text_score_scope,
-            over_fetch_factor=config.over_fetch_factor,
-            synonyms_enabled=config.synonyms_enabled,
-            deployment_instance_id=config.deployment_instance_id,
-            catalog_version=catalog_version,
+            catalog_version=provider.snapshot.digest,
+            catalog_etag=provider.snapshot.etag,
         )
         yield
     finally:
+        if provider is not None:
+            await provider.close()
         resources.close()
         logger.info("retrieval_service_stopped")
 
@@ -388,6 +372,7 @@ class QueryRequest(BaseModel):
 class Citation(BaseModel):
     ref: str
     source_name: str
+    location: str
     url: str
 
 
@@ -395,6 +380,15 @@ class QueryResponse(BaseModel):
     answer: str
     citations: list[Citation]
     request_id: str
+
+
+def _citation_from_result(index: int, chunk: Mapping[str, Any]) -> Citation:
+    return Citation(
+        ref=citation_label(index),
+        source_name=str(chunk["source_name"]),
+        location=citation_location(chunk),
+        url=citation_url(chunk),
+    )
 
 
 @app.post("/api/query", response_model=QueryResponse)
@@ -414,6 +408,7 @@ async def query(request: Request, body: QueryRequest, background_tasks: Backgrou
         raise HTTPException(status_code=429, detail="rate_limit_exceeded")
 
     mode = RetrievalMode(body.mode)
+    policy = _state.rag_service.capture_policy(body.scoring_profile, body.expand_synonyms)
 
     queries, planning_usage = await asyncio.to_thread(
         _state.rag_service.plan_queries, body.question, body.history or None,
@@ -430,6 +425,7 @@ async def query(request: Request, body: QueryRequest, background_tasks: Backgrou
             body.scoring_profile,
             body.expand_synonyms,
             body.top_k,
+            policy=policy,
         )
         if result is not None:
             path = "agentic"
@@ -446,6 +442,7 @@ async def query(request: Request, body: QueryRequest, background_tasks: Backgrou
             body.top_k,
             body.scoring_profile,
             body.expand_synonyms,
+            policy=policy,
         )
 
     background_tasks.add_task(
@@ -469,23 +466,19 @@ async def query(request: Request, body: QueryRequest, background_tasks: Backgrou
         request_id, principal.user_id, principal.tenant_id,
         body.question, answer_text, len(result["citations"]),
         path, body.mode, len(queries), int(elapsed * 1000),
-        getattr(_state, "catalog_version", None),
-        body.scoring_profile or getattr(_state.config, "default_scoring_profile", None),
-        _effective_synonym_map(
-            body.scoring_profile, body.expand_synonyms,
-        ),
+        policy.snapshot.digest,
+        policy.profile.name if policy.profile is not None else None,
+        policy.expander.map_name if policy.expander is not None else None,
         any(record.get("degraded") is True or record.get("retrieval_degraded") is True
             for record in result.get("usage", [])),
+        policy.snapshot.etag,
+        policy.snapshot.operation_id,
     )
 
     return QueryResponse(
         answer=result["answer"],
         citations=[
-            Citation(
-                ref=citation_label(i),
-                source_name=c["source_name"],
-                url=f"{c['source_url']}#page={c['page_number']}" if c.get("source_url") else f"{c['source_name']}#page={c['page_number']}",
-            )
+            _citation_from_result(i, c)
             for i, c in enumerate(result["citations"], start=1)
         ] if _state.config.include_citations else [],
         request_id=request_id,
@@ -498,6 +491,7 @@ def _write_query_summary(
     path: str, mode: str, planned_queries: int, e2e_latency_ms: int,
     catalog_version: str | None, scoring_profile: str | None,
     synonym_map: str | None, retrieval_degraded: bool,
+    catalog_etag: str | None = None, catalog_operation_id: str | None = None,
 ) -> None:
     from retrieval.telemetry import write_audit_records
     write_audit_records(container, request_id, user_id, tenant_id, mode, [{
@@ -511,21 +505,12 @@ def _write_query_summary(
         "planned_queries": planned_queries,
         "e2e_latency_ms": e2e_latency_ms,
         "catalog_version": catalog_version,
+        "catalog_etag": catalog_etag,
+        "catalog_operation_id": catalog_operation_id,
         "scoring_profile": scoring_profile,
         "synonym_map": synonym_map,
         "retrieval_degraded": retrieval_degraded,
     }])
-
-
-def _effective_synonym_map(
-    requested_profile: str | None, expand_synonyms: bool | None,
-) -> str | None:
-    if not getattr(_state.config, "synonyms_enabled", False) or expand_synonyms is False:
-        return None
-    profile_name = requested_profile or getattr(_state.config, "default_scoring_profile", None)
-    profiles = getattr(_state, "scoring_profiles", {}) or {}
-    profile = profiles.get(profile_name) if profile_name else None
-    return profile.synonym_map if profile is not None else None
 
 
 async def _run_agentic_path(
@@ -537,11 +522,13 @@ async def _run_agentic_path(
     scoring_profile: str | None = None,
     expand_synonyms: bool | None = None,
     top_k: int | None = None,
+    *,
+    policy: RequestPolicy | None = None,
 ) -> dict[str, Any] | None:
     """Run the Agent Framework agent. Returns None on timeout/error (caller falls back)."""
     # Resolved outside the try/except so a config error (unknown profile) fails fast
     # instead of routing silently through the standard-path fallback.
-    _state.rag_service.validate_scoring_profile(scoring_profile)
+    policy = policy or _state.rag_service.capture_policy(scoring_profile, expand_synonyms)
     try:
         agent_deadline = time.monotonic() + _state.config.agent_timeout_seconds
         retrieved_chunks: list[RetrievedChunk] = []
@@ -556,6 +543,7 @@ async def _run_agentic_path(
             expand_synonyms=expand_synonyms,
             forced_mode=mode,
             deadline_monotonic=agent_deadline,
+            policy=policy,
         )
         agent = create_rag_agent(
             _state.agent_chat_client, search_tool, model=_state.config.chat_deployment,
@@ -586,6 +574,7 @@ async def _run_agentic_path(
             "answer": answer_text.strip(),
             "citations": [asdict(c) for c in retrieved_chunks],
             "usage": planning_usage + agentic_usage,
+            "policy": policy.metadata(),
         }
     except asyncio.TimeoutError:
         log.warning("agent_timeout", timeout=_state.config.agent_timeout_seconds)

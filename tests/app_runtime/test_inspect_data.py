@@ -21,9 +21,11 @@ import function_app
 class FakeContainer:
     def __init__(self) -> None:
         self.queries: list[str] = []
+        self.partition_keys: list[Any] = []
 
     def query_items(self, query: str, parameters: list[dict] | None = None, **kwargs: Any) -> list[dict]:
         self.queries.append(query)
+        self.partition_keys.append(kwargs.get("partition_key"))
         return []
 
 
@@ -91,4 +93,38 @@ def test_inspect_data_run_id_filter_does_not_add_ordering(monkeypatch: pytest.Mo
     assert response.status_code == 200
     assert len(container.queries) == 1
     assert "ORDER BY" not in container.queries[0]
+
+
+def test_inspect_data_catalog_uses_deployment_partition(monkeypatch: pytest.MonkeyPatch) -> None:
+    container = FakeContainer()
+    monkeypatch.setattr(azure.cosmos, "CosmosClient", _fake_cosmos_client_factory(container))
+    request = FakeRequest({"container": "retrieval-config", "deploymentInstanceId": "deploy-1"})
+
+    response = function_app.inspect_data(request)
+
+    assert response.status_code == 200
+    assert container.partition_keys == ["deploy-1"]
+    assert "ORDER BY" not in container.queries[0]
+
+
+def test_inspect_data_catalog_requires_deployment_instance(monkeypatch: pytest.MonkeyPatch) -> None:
+    container = FakeContainer()
+    monkeypatch.setattr(azure.cosmos, "CosmosClient", _fake_cosmos_client_factory(container))
+    request = FakeRequest({"container": "retrieval-config"})
+
+    response = function_app.inspect_data(request)
+
+    assert response.status_code == 400
+    assert container.queries == []
+
+
+def test_inspect_data_catalog_rejects_run_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    container = FakeContainer()
+    monkeypatch.setattr(azure.cosmos, "CosmosClient", _fake_cosmos_client_factory(container))
+    request = FakeRequest({"container": "retrieval-config", "deploymentInstanceId": "deploy-1", "runId": "run-1"})
+
+    response = function_app.inspect_data(request)
+
+    assert response.status_code == 400
+    assert container.queries == []
 

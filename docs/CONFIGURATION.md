@@ -1,4 +1,7 @@
-# Environment Variable Reference
+---
+title: Environment Variable Reference
+description: Deployment inputs and runtime configuration for ingestion and retrieval
+---
 
 This is the single inventory for deployment inputs and runtime environment variables used by ingestion, the Function query gateway, ACA retrieval, and the temporary catalog publisher.
 
@@ -9,10 +12,67 @@ This is the single inventory for deployment inputs and runtime environment varia
 | Client deployment input | Operator through the selected azd environment or guarded phase arguments | Set and review before running `scripts/deploy.ps1`. |
 | Generated runtime setting | Bicep or the deployment controller | Do not hand-edit in the deployed Function or Container App; change the owning Bicep input and redeploy. |
 | Runtime fallback | Application code | Used when Bicep does not emit an override. Add a deployment parameter before relying on a client-specific override. |
-| Catalog-owned setting | Pinned retrieval catalog | Configure in `app/retrieval/catalog.example.json` or a reviewed client catalog, not as an ACA environment override. |
-| Secret | azd/secure Bicep input or external Key Vault | Never put the value in source, reports, command output, or documentation. |
+| Catalog-owned setting | Mutable runtime catalog | Edit the singleton's `config` in Cosmos Data Explorer after runtime-catalog deployment; see the direct-edit procedure below. Do not use ACA environment overrides. |
+| Secret | Protected azd secret reference or external Key Vault | Set an azd-managed secret with `azd env set-secret <name>`; never put the value in source, reports, command output, documentation, or a plaintext azd environment value. |
 
-Do not write scoring, freshness, or synonym JSON directly into Cosmos. Follow the [catalog property reference](API_REFERENCE.md#catalog-property-reference), publish through the guarded catalog phases, and pin the returned digest.
+### Direct catalog editing
+
+The current source supports configuration-only editing and create-only bootstrap.
+Local validation does not establish deployed behavior. Use this procedure only
+after deploying and verifying the current runtime contract; never reset existing
+Cosmos data to bypass a bootstrap conflict.
+
+After that deployment, use Cosmos Data Explorer with approved data-plane access
+and private-network reachability to the configured retrieval-config container:
+
+Open the item with `id` equal to `runtime-catalog` in the deployment's
+`deploymentInstanceId` partition. Keep both fields and
+`type: retrieval-runtime-catalog` unchanged. Do not edit Cosmos system fields.
+
+Retain a protected previous valid item outside the repository before editing.
+Edit only `config`: `retrieval`, `profiles`, `synonymMaps`, and optional
+`defaultProfile`. Use the [source example](../app/retrieval/catalog.example.json)
+for the config structure. Definitions make profiles and maps available;
+profile selection and map/function references apply their behavior. There are
+no feature switches.
+
+Save the whole item. No operation UUID or timestamp is required. Optional
+`change` metadata, when present, must remain structurally valid; it does not
+identify a later direct edit. Cosmos `_etag` and the validated configuration
+digest identify the serving generation.
+
+Allow the configured polling interval before checking adoption. The source
+accepts `RETRIEVAL_CATALOG_POLL_SECONDS` from 60 through 86,400 seconds and
+defaults to 7,200 only when unset. Changing relevance values needs no
+application deployment; changing the polling setting is deployment-owned.
+
+Check each replica's observed ETag hash and digest, not only the stored item or
+optional writer metadata. The read-only `observe` command in the
+[setup guide](AZURE_SETUP.md#catalog-observation-and-optional-writer) requires an
+unchanged, ready cohort bracketing observations for at least 30 seconds. Allow
+the poll interval, a five-second read deadline, and telemetry ingestion and
+inventory time. The observer defaults to a 300-second deadline, so set a longer
+deadline than the poll interval when needed, up to 86,460 seconds. Missing logs,
+unready revisions, restarts, membership changes, or degraded health cannot prove
+adoption. Export latency and process identity must be verified in the target.
+
+The loader validates the entire item before atomically replacing its immutable
+snapshot. Invalid edits or read failures retain the running process's
+last-known-good configuration with degraded health. A new process starts on a
+built-in baseline when the item is absent, but a present item must be valid or
+startup fails closed. Restore the protected previous valid body if an edit
+is rejected; it is accepted under its new Cosmos ETag, without generating a new
+operation UUID.
+
+Direct edits do not guarantee guarded-writer history, automatic rollback, or
+semantic audit attribution. Coordinate concurrent editors; this procedure does
+not claim portal conflict detection. Data-plane authorization is not restricted
+to this one item. The guarded writer remains optional, with its own validation,
+history, and ETag checks; its audit/replica assurance must not be
+reported as complete. Never delete the container or unrelated ingestion, ACL,
+document, or chunk data to change relevance configuration.
+
+`azd env set` writes a plaintext value to the local azd environment. Do not use it for `WEBHOOK_CLIENT_STATE` or another secret. Use `azd env set-secret WEBHOOK_CLIENT_STATE` interactively, or supply the value from an organization-approved external secret source used by the guarded deployment controller.
 
 ## Client Deployment Inputs
 
@@ -37,9 +97,21 @@ The guarded controller also requires reviewed `ExpectedPlanHash`, `ExpectedSourc
 | `AZURE_OPENAI_ACCOUNT_NAME` | Yes | Existing account name | Existing Azure OpenAI account consumed by Function and retrieval. |
 | `AZURE_OPENAI_RESOURCE_GROUP` | Yes | Existing resource group | Resource group in the deployment subscription containing the account. |
 | `OPENAI_EMBEDDING_DEPLOYMENT_NAME` | No | `text-embedding-3-large` | Existing 3,072-dimensional embedding deployment. |
-| `OPENAI_CHAT_DEPLOYMENT_NAME` | Yes | Existing chat deployment | Chat model used for planning, standard generation, and agent generation. |
+| `OPENAI_CHAT_DEPLOYMENT_NAME` | Yes | Existing chat deployment | Chat model used for bounded visual descriptions, planning, standard generation, and agent generation. |
 
 The deployment does not create the Azure OpenAI account or model deployments and does not configure their capacity.
+
+### Content Understanding
+
+| Variable | Required | Default/example | Purpose |
+| --- | --- | --- | --- |
+| `DOCUMENT_INTELLIGENCE_ENABLED` | No | `true` | Enables Document Intelligence as an extraction provider. |
+| `CONTENT_UNDERSTANDING_ENABLED` | No | `false` | Provisions Content Understanding and enables it as an extraction provider. |
+| `CONTENT_UNDERSTANDING_ANALYZER_ID` | When Content Understanding is enabled | `prebuilt-documentSearch` | Analyzer ID verified by the guarded Final phase and injected into the Function App. |
+
+When extraction is enabled, at least one provider must be enabled. Content Understanding takes precedence when both providers are enabled; the Function constructs only the selected provider client. Markdown extraction remains direct and provider-independent. Document Intelligence uses `prebuilt-layout` plus Azure OpenAI vision for required visual descriptions. The Document Intelligence `2024-11-30` API is generally available. The Content Understanding production API is `2025-11-01`; `2026-06-01-preview` is a separate preview API without an SLA. These API versions are service status facts, not configurable environment variables in this deployment; the pinned Python client packages own data-plane compatibility.
+
+Content Understanding uses `prebuilt-documentSearch`. Microsoft can update a prebuilt analyzer definition even when its ID remains unchanged, so production environments that require invariant analyzer behavior should copy and govern an analyzer definition instead of treating this ID as a version pin. Confirm regional account, model, and analyzer availability before enabling the provider.
 
 ### SharePoint and certificate
 
@@ -88,7 +160,11 @@ The Function UAMI must receive `Retrieval.Gateway` on the retrieval API applicat
 | `ACR_NAME` | Build, operations | Foundation output/operator selection | Registry used by the guarded build and operations phases. |
 | `RELEASE_BUILD_ID` | Build | Reviewed release identifier | Temporary image tag used during ACR build; must match the controller's restricted pattern. |
 | `RETRIEVAL_IMAGE_REFERENCE` | Operations and Final | Output from executed `Build` | Immutable `registry/repository@sha256:<64 lowercase hex>`. |
-| `RETRIEVAL_CATALOG_DIGEST` | Operations and Final | Output from catalog validation | Immutable `sha256:<64 lowercase hex>` pinned into retrieval startup. |
+| `RETRIEVAL_CATALOG_DIGEST` | Explicit initialization only | Output from seed validation | Reviewed seed digest; never injected as a runtime selection pin. Ordinary redeployment verifies the current singleton. |
+| `RETRIEVAL_CATALOG_POLL_SECONDS` | Optional | Default `7200` only when absent | Integer `60` through `86400`; malformed or blank values fail. Requires guarded serving redeployment. |
+| `CATALOG_EDITOR_PRINCIPAL_ID` | Optional | Reviewed human principal object ID | Container-scoped metadata/read/replace/query/change-feed access. No create, delete, or upsert. |
+| `CATALOG_WRITER_PRINCIPAL_ID` | Optional | Reviewed optional writer object ID | Editor actions plus create for guarded history/outcome records. No delete or upsert. |
+| `CATALOG_OBSERVER_PRINCIPAL_ID` | Optional | Reviewed observer object ID | App-scoped Reader and workspace Log Analytics Reader. No catalog writes. |
 
 `DEPLOY_SERVING` and `DEPLOY_OPERATIONS` are internal phase switches set by `scripts/deploy.ps1`; clients should not set them manually.
 
@@ -123,6 +199,16 @@ The active Function Bicep module injects the following settings. Values shown as
 | `PROCESS_DOCUMENT_MAX_ATTEMPTS` | Runtime fallback `5` | Maximum retries inside `process_document_activity`. Current Bicep does not emit an override. |
 | `PROCESS_DOCUMENT_RETRY_DELAY_SECONDS` | Runtime fallback `60` | Base retry delay; deterministic document jitter adds 0–29 seconds. Current Bicep does not emit an override. |
 
+`app/host.json` sets `durableTask.maxConcurrentActivityFunctions` to `1`. This matches the Python
+worker's one-function-at-a-time model ([Durable Functions concurrency](https://learn.microsoft.com/azure/azure-functions/durable/durable-functions-perf-and-scale#language-runtime-considerations)):
+each document activity is long-running and memory-heavy (extraction, figure rendering, vision,
+embeddings), so a higher per-worker limit would pin idle activities in one worker's memory instead
+of letting the scale controller distribute them across workers. Increase ingestion throughput by
+scaling out to more workers (and/or raising `FUNCTIONS_WORKER_PROCESS_COUNT` where per-worker memory
+allows), not by raising the activity throttle.
+
+The deployed Durable Task Scheduler retains terminal orchestration history for 30 days by default. This is scheduler-owned state, not an application environment variable. Confirm the scheduler configuration against organizational retention requirements before relying on that duration; explicit purge operations can remove terminal history earlier.
+
 ### SharePoint and ingestion services
 
 | Variable | Value/default | Purpose |
@@ -134,11 +220,15 @@ The active Function Bicep module injects the following settings. Values shown as
 | `SHAREPOINT_APP_CLIENT_ID` | Client input | Certificate-auth application. |
 | `SHAREPOINT_CERTIFICATE_SECRET_NAME` | `sharepoint-app-cert` unless overridden | Certificate PFX secret name. |
 | `KEY_VAULT_URI` | Generated from existing vault | Certificate vault URI. |
-| `DOCUMENT_INTELLIGENCE_ENDPOINT` | Generated | Extraction endpoint; code requires it when extraction is enabled. |
+| `DOCUMENT_INTELLIGENCE_ENDPOINT` | Generated | Document Intelligence endpoint used when that provider is selected. |
+| `DOCUMENT_INTELLIGENCE_ENABLED` | Client input/default `true` | Enables Document Intelligence selection when Content Understanding is disabled. |
+| `CONTENT_UNDERSTANDING_ENDPOINT` | Generated when enabled; otherwise empty | Content Understanding endpoint used when that provider is selected. |
+| `CONTENT_UNDERSTANDING_ENABLED` | Client input/default `false` | Enables Content Understanding and gives it precedence over Document Intelligence. |
+| `CONTENT_UNDERSTANDING_ANALYZER_ID` | Client input/default `prebuilt-documentSearch` | Selected Content Understanding analyzer ID. Empty when Content Understanding is disabled; the prebuilt definition can change independently of the ID. |
 | `AZURE_LANGUAGE_ENDPOINT` | Generated | Enrichment endpoint; code requires it when any enrichment module is enabled. |
 | `OPENAI_ENDPOINT` | Generated | Azure OpenAI endpoint used by ingestion embeddings. |
 | `OPENAI_EMBEDDING_DEPLOYMENT_NAME` | Client input/default `text-embedding-3-large` | Embedding deployment recorded in Function settings. |
-| `OPENAI_CHAT_DEPLOYMENT_NAME` | Client input | Chat deployment recorded in Function settings. |
+| `OPENAI_CHAT_DEPLOYMENT_NAME` | Client input | Chat deployment used for bounded visual descriptions and recorded in Function settings. |
 
 ### Cosmos DB
 
@@ -158,14 +248,19 @@ The active Function Bicep module injects the following settings. Values shown as
 | `KEY_PHRASES_ENABLED` | Runtime fallback `true` | Enables key-phrase enrichment. Same boolean parsing. |
 | `ENTITIES_ENABLED` | Runtime fallback `true` | Enables entity enrichment. Same boolean parsing. |
 | `SUMMARY_ENABLED` | Runtime fallback `false` | Enables summary enrichment. Same boolean parsing. |
-| `ALLOWED_FILE_EXTENSIONS` | Runtime fallback `.pdf` | Comma-separated, case-normalized suffixes. Only PDF extraction is implemented. |
+| `ALLOWED_FILE_EXTENSIONS` | Bicep value `.md,.pdf,.docx,.pptx,.xlsx`; runtime fallback `.pdf` | Comma-separated, case-normalized suffixes. The deployed five-format contract is emitted by Bicep. |
 | `CHUNK_MAX_TOKENS` | `800` | Maximum chunk token count. |
 | `CHUNK_OVERLAP_TOKENS` | `100` | Token overlap between adjacent chunks. |
 | `ACL_MAX_PAGES` | `10` | Maximum permission/group paging calls per ACL read. |
 | `DOWNLOAD_TIMEOUT_SECONDS` | `120` | Source download HTTP timeout in seconds. |
 | `DELTA_MAX_PAGES` | `200` | Maximum Graph delta pages per tick. |
 | `EMBEDDING_BATCH_SIZE` | `100` | Ingestion embedding batch size. |
-| `MAX_PDF_PAGES` | `500` | Maximum accepted PDF pages. |
+| `MAX_PDF_PAGES` | Runtime setting `500`; effective application cap `300` | Configurable PDF page ceiling, bounded by the shared 300-document-unit application limit. |
+| `VISION_MAX_OUTPUT_TOKENS` | `400` | Maximum tokens returned for one bounded visual description. |
+| `VISION_MAX_IMAGE_BYTES` | `2097152` | Maximum bytes accepted for one linked Markdown image or extracted figure. |
+| `VISION_MAX_FIGURES` | `60` | Maximum figures described for one source document. |
+
+Shared application limits also reject source files over 100 MB and rendered Office-to-PDF derivatives over 200 MB. These limits are stricter than some provider-tier limits and apply before or around provider analysis. Document Intelligence S0 supports up to 500 MB and 2,000 PDF/TIFF pages; F0 supports 4 MB and processes only the first two pages. The effective limit is always the lowest applicable application, provider-tier, and format-specific limit.
 
 ### Timers, webhooks, and query gateway
 
@@ -187,7 +282,8 @@ The active Function Bicep module injects the following settings. Values shown as
 
 ## ACA Retrieval Runtime
 
-The retrieval Bicep module emits 29 settings. Catalog values replace the five relevance fallbacks after startup.
+The retrieval Bicep module owns connectivity and operational settings. Relevance
+values come exclusively from the validated runtime catalog snapshot.
 
 ### Required connectivity and identity
 
@@ -207,11 +303,16 @@ The retrieval Bicep module emits 29 settings. Catalog values replace the five re
 | `RETRIEVAL_GATEWAY_CLIENT_ID` | Yes | Function UAMI client ID | Expected service token `azp`. |
 | `RETRIEVAL_GATEWAY_PRINCIPAL_ID` | Yes | Function UAMI principal ID | Expected service token `oid`. |
 | `DEPLOYMENT_INSTANCE_ID` | Yes | Client target | Catalog partition key. |
-| `RETRIEVAL_CATALOG_DIGEST` | Yes | Immutable build output | Exact catalog version loaded at startup. |
+| `RETRIEVAL_CATALOG_POLL_SECONDS` | No | `7200` | Bounded runtime refresh interval; see direct-edit timing above. |
 | `RETRIEVAL_CONFIG_CONTAINER` | No | `retrieval-config` | Catalog container. |
 | `APPLICATIONINSIGHTS_CONNECTION_STRING` | No | Generated; empty disables tracing setup | Sensitive telemetry connection string. Do not print. |
 
 ### Retrieval behavior and limits
+
+The guarded controller's `-IncludeCitations` boolean argument sets
+`INCLUDE_CITATIONS` through Bicep and defaults to `$true`. Deploy with
+`-IncludeCitations:$false` to return an empty citation array; this does not
+remove reference markers from generated answer text.
 
 | Variable | Required | Value/default | Accepted values and effect |
 | --- | --- | --- | --- |
@@ -231,15 +332,16 @@ The retrieval Bicep module emits 29 settings. Catalog values replace the five re
 
 ### Catalog-owned relevance settings
 
-These environment variables exist as code fallbacks, but active startup replaces them with the pinned catalog. Do not configure them to customize a managed client environment; change and publish the catalog instead.
+Do not use relevance environment overrides. Edit the singleton's `config`;
+each request captures one immutable snapshot before planning and retrieval.
 
-| Variable | Code fallback | Catalog replacement |
+| Concern | Catalog property | Application |
 | --- | --- | --- |
-| `RETRIEVAL_OVER_FETCH_FACTOR` | `5` | `config.retrieval.overFetchFactor` |
-| `RETRIEVAL_FULL_TEXT_SCORE_SCOPE` | `Global` | `config.retrieval.fullTextScoreScope` |
-| `RETRIEVAL_HYBRID_RRF_WEIGHTS` | Empty (`None`) | `config.retrieval.hybridWeights` |
-| `RETRIEVAL_DEFAULT_SCORING_PROFILE` | Empty (`None`) | `config.defaultProfile` |
-| `RETRIEVAL_SYNONYMS_ENABLED` | `false` | `config.synonymsEnabled` |
+| Over-fetch | `config.retrieval.overFetchFactor` | Shared candidate limit tuning |
+| Full-text scope | `config.retrieval.fullTextScoreScope` | Shared score statistics scope |
+| Hybrid weights | `config.retrieval.hybridWeights` | Positive vector/text weights |
+| Default profile | Optional `config.defaultProfile` | Absent means no default scoring profile |
+| Synonyms | Selected profile's `synonymMap` | Referenced map applies unless the request opts out |
 
 ### Optional multi-instance registry
 
@@ -272,9 +374,14 @@ The job container itself receives this runtime contract:
 | `COSMOS_DATABASE` | `rag-db` | Catalog database. |
 | `RETRIEVAL_CONFIG_CONTAINER` | `retrieval-config` | Catalog container. |
 | `DEPLOYMENT_INSTANCE_ID` | Passed through from the controller | Catalog partition key. |
-| `EXPECTED_CATALOG_DIGEST` | `RETRIEVAL_CATALOG_DIGEST` | Ensures the job publishes the reviewed catalog content. |
+| `EXPECTED_CATALOG_DIGEST` | `RETRIEVAL_CATALOG_DIGEST`, publish only | Checks seed integrity on create-only initialization; absent for read-only verification. |
 | `MANAGED_IDENTITY_CLIENT_ID` | Operations UAMI client ID | Selects the job identity for Cosmos access. |
-| `CATALOG_PATH` | Runtime fallback `/app/retrieval/catalog.example.json` | Catalog path inside the image; current Bicep does not inject an override. |
+| `CATALOG_PATH` | Runtime fallback `/app/retrieval/catalog.example.json`, publish only | Seed path inside the reviewed image. Verification does not load a seed file. |
+
+`-CatalogOperation publish-catalog` selects explicit initialization. The default
+`verify-catalog` operation only reads the current singleton. `Final` requires a
+verified read-only execution against the reviewed image and target; retain the
+job until Final and E2E checks finish. See [Azure setup](AZURE_SETUP.md).
 
 ## Validation Sources
 

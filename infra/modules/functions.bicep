@@ -64,6 +64,18 @@ param chatDeploymentName string
 @description('Document Intelligence endpoint')
 param documentIntelligenceEndpoint string
 
+@description('Enable Document Intelligence extraction')
+param documentIntelligenceEnabled bool
+
+@description('Content Understanding endpoint')
+param contentUnderstandingEndpoint string
+
+@description('Stable copied Content Understanding analyzer ID')
+param contentUnderstandingAnalyzerId string
+
+@description('Enable Content Understanding extraction')
+param contentUnderstandingEnabled bool
+
 @description('Azure AI Language endpoint')
 param languageEndpoint string
 
@@ -268,8 +280,36 @@ resource functionApp 'Microsoft.Web/sites@2025-03-01' = {
           value: chatDeploymentName
         }
         {
+          name: 'VISION_MAX_OUTPUT_TOKENS'
+          value: '400'
+        }
+        {
+          name: 'VISION_MAX_IMAGE_BYTES'
+          value: '2097152'
+        }
+        {
+          name: 'VISION_MAX_FIGURES'
+          value: '60'
+        }
+        {
           name: 'DOCUMENT_INTELLIGENCE_ENDPOINT'
           value: documentIntelligenceEndpoint
+        }
+        {
+          name: 'DOCUMENT_INTELLIGENCE_ENABLED'
+          value: string(documentIntelligenceEnabled)
+        }
+        {
+          name: 'CONTENT_UNDERSTANDING_ENDPOINT'
+          value: contentUnderstandingEndpoint
+        }
+        {
+          name: 'CONTENT_UNDERSTANDING_ANALYZER_ID'
+          value: contentUnderstandingAnalyzerId
+        }
+        {
+          name: 'CONTENT_UNDERSTANDING_ENABLED'
+          value: string(contentUnderstandingEnabled)
         }
         {
           name: 'AZURE_LANGUAGE_ENDPOINT'
@@ -290,6 +330,10 @@ resource functionApp 'Microsoft.Web/sites@2025-03-01' = {
         {
           name: 'INGESTION_SOURCE_ID'
           value: ingestionSourceId
+        }
+        {
+          name: 'ALLOWED_FILE_EXTENSIONS'
+          value: '.md,.pdf,.docx,.pptx,.xlsx'
         }
         {
           name: 'SHAREPOINT_ASSIGNED_DRIVE_ID'

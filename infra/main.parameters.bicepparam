@@ -6,6 +6,15 @@ param openAiAccountName = readEnvironmentVariable('AZURE_OPENAI_ACCOUNT_NAME')
 param openAiResourceGroupName = readEnvironmentVariable('AZURE_OPENAI_RESOURCE_GROUP')
 param embeddingDeploymentName = readEnvironmentVariable('OPENAI_EMBEDDING_DEPLOYMENT_NAME', 'text-embedding-3-large')
 param chatDeploymentName = readEnvironmentVariable('OPENAI_CHAT_DEPLOYMENT_NAME')
+param documentIntelligenceEnabled = readEnvironmentVariable('DOCUMENT_INTELLIGENCE_ENABLED', 'true') == 'true'
+param contentUnderstandingEnabled = readEnvironmentVariable('CONTENT_UNDERSTANDING_ENABLED', 'false') == 'true'
+param aclEnabled = readEnvironmentVariable('ACL_ENABLED', 'true') == 'true'
+param includeCitations = readEnvironmentVariable('INCLUDE_CITATIONS', 'true') == 'true'
+param contentUnderstandingAnalyzerId = readEnvironmentVariable(
+  'CONTENT_UNDERSTANDING_ANALYZER_ID',
+  'prebuilt-documentSearch'
+)
+param contentUnderstandingAllowedIpAddress = readEnvironmentVariable('CONTENT_UNDERSTANDING_ALLOWED_IP_ADDRESS', '')
 param sharePointTenantId = readEnvironmentVariable('SHAREPOINT_TENANT_ID')
 param sharePointAppClientId = readEnvironmentVariable('SHAREPOINT_APP_CLIENT_ID')
 param sharePointDriveId = readEnvironmentVariable('SHAREPOINT_ASSIGNED_DRIVE_ID')
@@ -37,9 +46,17 @@ param deployServing = readEnvironmentVariable('DEPLOY_SERVING', 'false') == 'tru
 param deployOperations = readEnvironmentVariable('DEPLOY_OPERATIONS', 'false') == 'true'
 param retrievalImageReference = readEnvironmentVariable('RETRIEVAL_IMAGE_REFERENCE', '')
 param retrievalCatalogDigest = readEnvironmentVariable('RETRIEVAL_CATALOG_DIGEST', '')
+param catalogEditorPrincipalId = readEnvironmentVariable('CATALOG_EDITOR_PRINCIPAL_ID', '')
+param catalogWriterPrincipalId = readEnvironmentVariable('CATALOG_WRITER_PRINCIPAL_ID', '')
+param catalogObserverPrincipalId = readEnvironmentVariable('CATALOG_OBSERVER_PRINCIPAL_ID', '')
+param catalogOperation = readEnvironmentVariable('CATALOG_OPERATION', 'verify-catalog')
+param retrievalCatalogPollSeconds = int(readEnvironmentVariable('RETRIEVAL_CATALOG_POLL_SECONDS', '7200'))
 param retrievalMinReplicas = int(readEnvironmentVariable('RETRIEVAL_MIN_REPLICAS', '1'))
 param retrievalMaxReplicas = int(readEnvironmentVariable('RETRIEVAL_MAX_REPLICAS', '5'))
 param retrievalZoneRedundant = readEnvironmentVariable('RETRIEVAL_ZONE_REDUNDANT', 'false') == 'true'
+param functionIntegrationSubnetNsgId = readEnvironmentVariable('SUBNET_FUNCTION_INTEGRATION_NSG_ID', '')
+param privateEndpointSubnetNsgId = readEnvironmentVariable('SUBNET_PRIVATE_ENDPOINTS_NSG_ID', '')
+param acaEnvironmentSubnetNsgId = readEnvironmentVariable('SUBNET_ACA_ENVIRONMENT_NSG_ID', '')
 param tags = {
   DeploymentInstance: readEnvironmentVariable('DEPLOYMENT_INSTANCE_ID')
   Project: 'RAG-SharePoint'

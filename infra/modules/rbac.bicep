@@ -10,6 +10,9 @@ param storageAccountId string
 @description('Document Intelligence resource ID')
 param documentIntelligenceId string
 
+@description('Content Understanding resource ID')
+param contentUnderstandingId string
+
 @description('Azure AI Language resource ID')
 param languageServiceId string
 
@@ -28,6 +31,10 @@ resource documentIntelligence 'Microsoft.CognitiveServices/accounts@2024-10-01' 
   name: split(documentIntelligenceId, '/')[8]
 }
 
+resource contentUnderstanding 'Microsoft.CognitiveServices/accounts@2025-06-01' existing = if (!empty(contentUnderstandingId)) {
+  name: split(contentUnderstandingId, '/')[8]
+}
+
 resource languageService 'Microsoft.CognitiveServices/accounts@2024-10-01' existing = {
   name: split(languageServiceId, '/')[8]
 }
@@ -42,6 +49,7 @@ var roles = {
   StorageQueueDataContributor: '974c5e8b-45b9-4653-ba55-5f855dd0fb88'
   StorageTableDataContributor: '0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3'
   CognitiveServicesUser: 'a97b65f3-24c7-4388-baec-2e87135dc908'
+  ContentUnderstandingContributor: '59a2dba3-6303-4fd8-9a2e-8cbb4bdda972'
   MonitoringMetricsPublisher: '3913510d-42f4-4e42-8a64-420c390055eb'
 }
 
@@ -101,6 +109,19 @@ resource documentIntelligenceUser 'Microsoft.Authorization/roleAssignments@2022-
   }
 }
 
+resource contentUnderstandingContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (!empty(contentUnderstandingId)) {
+  name: guid(contentUnderstanding.id, principalId, roles.ContentUnderstandingContributor)
+  scope: contentUnderstanding
+  properties: {
+    roleDefinitionId: subscriptionResourceId(
+      'Microsoft.Authorization/roleDefinitions',
+      roles.ContentUnderstandingContributor
+    )
+    principalId: principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
 resource languageServiceUser 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   name: guid(languageService.id, principalId, roles.CognitiveServicesUser)
   scope: languageService
@@ -124,4 +145,4 @@ resource monitoringPublisher 'Microsoft.Authorization/roleAssignments@2022-04-01
   }
 }
 
-output roleAssignmentsCreated int = 7
+output roleAssignmentsCreated int = empty(contentUnderstandingId) ? 7 : 8

@@ -46,11 +46,14 @@ class SynonymMap:
         return cls(name=name, rules=tuple(rules))
 
 
+@dataclass(frozen=True, init=False)
 class SynonymExpander:
     """Expand a free-text query into a bounded set of parameterizable terms."""
 
+    _map: SynonymMap
+
     def __init__(self, synonym_map: SynonymMap) -> None:
-        self._map = synonym_map
+        object.__setattr__(self, "_map", synonym_map)
 
     @property
     def map_name(self) -> str:

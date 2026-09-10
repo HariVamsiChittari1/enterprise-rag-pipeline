@@ -35,10 +35,10 @@ param gatewayPrincipalId string
 @minLength(1)
 param deploymentInstanceId string
 
-@description('Immutable retrieval catalog digest')
-@minLength(71)
-@maxLength(71)
-param catalogDigest string
+@description('Runtime catalog poll interval in seconds')
+@minValue(60)
+@maxValue(86400)
+param catalogPollSeconds int = 7200
 
 @description('Enable ACL filtering at retrieval time')
 param aclEnabled bool = true
@@ -88,7 +88,7 @@ param openAiApiVersion string = '2024-10-21'
 @description('Include source citations in query responses')
 param includeCitations bool = true
 
-@description('Cosmos container containing versioned retrieval catalogs.')
+@description('Cosmos container containing the mutable runtime catalog.')
 param retrievalConfigContainer string = 'retrieval-config'
 
 @description('Wall-clock operation deadline at ACA ingress')
@@ -111,7 +111,7 @@ var envVars = [
   { name: 'RETRIEVAL_GATEWAY_CLIENT_ID', value: gatewayClientId }
   { name: 'RETRIEVAL_GATEWAY_PRINCIPAL_ID', value: gatewayPrincipalId }
   { name: 'DEPLOYMENT_INSTANCE_ID', value: deploymentInstanceId }
-  { name: 'RETRIEVAL_CATALOG_DIGEST', value: catalogDigest }
+  { name: 'RETRIEVAL_CATALOG_POLL_SECONDS', value: string(catalogPollSeconds) }
   { name: 'ACL_ENABLED', value: string(aclEnabled) }
   { name: 'INCLUDE_CITATIONS', value: string(includeCitations) }
   { name: 'MAX_EVIDENCE_CHUNKS', value: maxEvidenceChunks }

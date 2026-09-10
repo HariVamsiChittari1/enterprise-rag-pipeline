@@ -18,7 +18,12 @@ from typing import Any, Mapping
 
 from azure.core import MatchConditions
 
-from ingestion.models import DocumentStatus, RETIRED_REASONS
+from ingestion.models import (
+    DocumentStatus,
+    RETIRED_REASONS,
+    SOURCE_DOCUMENT_RECORD_TYPE,
+    VISUAL_MANIFEST_PAGE_RECORD_TYPE,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +34,7 @@ ACL_RESYNC_TRIGGER_ID = "acl-resync-trigger"
 LIFECYCLE_RECONCILE_TRIGGER_ID = "lifecycle-reconcile-trigger"
 MAX_PATCH_BATCH_OPERATIONS = 100
 MAX_PATCH_BATCH_ATTEMPTS = 3
+MAX_MANIFEST_CONFLICT_ATTEMPTS = 3
 PATCH_RETRY_BASE_SECONDS = 0.25
 TRANSIENT_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 504})
 INTERNAL_PAGE_SIZE = 100
@@ -127,8 +133,9 @@ class DocumentLifecycleRepository:
             "SELECT c.documentId, c.sourceRunId, c.documentKey, c.itemId, "
             "c.allowedGroupIds, c.aclHash, c.eTag, c.status, "
             "c.lifecycleGeneration, c._etag FROM c "
-            "WHERE ARRAY_CONTAINS(@statuses, c.status) OR "
-            "(c.status = @retiredStatus AND c.retiredReason = @retiredReason)"
+            "WHERE c.recordType = @recordType AND ("
+            "ARRAY_CONTAINS(@statuses, c.status) OR "
+            "(c.status = @retiredStatus AND c.retiredReason = @retiredReason))"
         )
         parameters = [
             {
@@ -137,6 +144,7 @@ class DocumentLifecycleRepository:
             },
             {"name": "@retiredStatus", "value": DocumentStatus.RETIRED.value},
             {"name": "@retiredReason", "value": "acl_revoked"},
+            {"name": "@recordType", "value": SOURCE_DOCUMENT_RECORD_TYPE},
         ]
         try:
             iterator = self._source_documents.query_items(
@@ -155,7 +163,8 @@ class DocumentLifecycleRepository:
             "SELECT c.documentId, c.sourceRunId, c.documentKey, c.itemId, "
             "c.allowedGroupIds, c.aclHash, c.eTag, c.status, "
             "c.lifecycleGeneration, c._etag FROM c "
-            "WHERE ARRAY_CONTAINS(@statuses, c.status) AND c.documentId = @documentId"
+            "WHERE c.recordType = @recordType "
+            "AND ARRAY_CONTAINS(@statuses, c.status) AND c.documentId = @documentId"
         )
         parameters = [
             {
@@ -163,6 +172,7 @@ class DocumentLifecycleRepository:
                 "value": [DocumentStatus.READY.value, DocumentStatus.ACL_REFRESHING.value],
             },
             {"name": "@documentId", "value": document_id},
+            {"name": "@recordType", "value": SOURCE_DOCUMENT_RECORD_TYPE},
         ]
         try:
             rows = list(
@@ -187,13 +197,15 @@ class DocumentLifecycleRepository:
             "SELECT c.documentId, c.sourceRunId, c.documentKey, c.itemId, "
             "c.allowedGroupIds, c.aclHash, c.eTag, c.status, "
             "c.lifecycleGeneration, c._etag, c._ts FROM c "
-            "WHERE c.status = @retiredStatus AND c.retiredReason = @retiredReason "
+            "WHERE c.recordType = @recordType AND c.status = @retiredStatus "
+            "AND c.retiredReason = @retiredReason "
             "AND c.documentId = @documentId"
         )
         parameters = [
             {"name": "@retiredStatus", "value": DocumentStatus.RETIRED.value},
             {"name": "@retiredReason", "value": "acl_revoked"},
             {"name": "@documentId", "value": document_id},
+            {"name": "@recordType", "value": SOURCE_DOCUMENT_RECORD_TYPE},
         ]
         try:
             rows = list(self._source_documents.query_items(
@@ -220,12 +232,15 @@ class DocumentLifecycleRepository:
     ) -> bool:
         query = (
             "SELECT c.sourceRunId, c.eTag, c.status, c._ts FROM c "
-            "WHERE c.documentId = @documentId"
+            "WHERE c.recordType = @recordType AND c.documentId = @documentId"
         )
         try:
             rows = list(self._source_documents.query_items(
                 query=query,
-                parameters=[{"name": "@documentId", "value": document_id}],
+                parameters=[
+                    {"name": "@documentId", "value": document_id},
+                    {"name": "@recordType", "value": SOURCE_DOCUMENT_RECORD_TYPE},
+                ],
                 enable_cross_partition_query=True,
                 max_item_count=INTERNAL_PAGE_SIZE,
             ))
@@ -259,17 +274,21 @@ class DocumentLifecycleRepository:
             "c.lifecycleGeneration, c.allowedGroupIds, c.aclHash, "
             "c.expectedChunkCount, c.pendingAllowedGroupIds, c.pendingAclHash, "
             "c.pendingRetiredReason, c._etag FROM c "
-            "WHERE ARRAY_CONTAINS(@statuses, c.status)"
+            "WHERE c.recordType = @recordType "
+            "AND ARRAY_CONTAINS(@statuses, c.status)"
         )
-        parameters = [{
-            "name": "@statuses",
-            "value": [
-                DocumentStatus.ADMITTING.value,
-                DocumentStatus.ACL_REFRESHING.value,
-                DocumentStatus.RETIRING.value,
-                DocumentStatus.DELETING.value,
-            ],
-        }]
+        parameters = [
+            {
+                "name": "@statuses",
+                "value": [
+                    DocumentStatus.ADMITTING.value,
+                    DocumentStatus.ACL_REFRESHING.value,
+                    DocumentStatus.RETIRING.value,
+                    DocumentStatus.DELETING.value,
+                ],
+            },
+            {"name": "@recordType", "value": SOURCE_DOCUMENT_RECORD_TYPE},
+        ]
         try:
             iterator = self._source_documents.query_items(
                 query=query,
@@ -296,12 +315,14 @@ class DocumentLifecycleRepository:
         _validate_page_size(page_size)
         query = (
             "SELECT c.documentId FROM c "
-            "WHERE c.status = 'ready'"
+            "WHERE c.recordType = @recordType AND c.status = 'ready'"
         )
         try:
             iterator = self._source_documents.query_items(
                 query=query,
-                parameters=[],
+                parameters=[
+                    {"name": "@recordType", "value": SOURCE_DOCUMENT_RECORD_TYPE}
+                ],
                 enable_cross_partition_query=True,
                 max_item_count=page_size,
             )
@@ -331,12 +352,16 @@ class DocumentLifecycleRepository:
             "SELECT c.documentId, c.sourceRunId, c.documentKey, c.itemId, "
             "c.allowedGroupIds, c.aclHash, c.eTag, c.status, "
             "c.lifecycleGeneration, c._etag FROM c "
-            "WHERE c.status = 'ready' AND c.documentId = @documentId"
+            "WHERE c.recordType = @recordType AND c.status = 'ready' "
+            "AND c.documentId = @documentId"
         )
         try:
             rows = list(self._source_documents.query_items(
                 query=query,
-                parameters=[{"name": "@documentId", "value": document_id}],
+                parameters=[
+                    {"name": "@documentId", "value": document_id},
+                    {"name": "@recordType", "value": SOURCE_DOCUMENT_RECORD_TYPE},
+                ],
                 enable_cross_partition_query=True,
                 max_item_count=INTERNAL_PAGE_SIZE,
             ))
@@ -383,6 +408,91 @@ class DocumentLifecycleRepository:
 
     def delete_orphan_chunk(self, *, chunk_id: str, document_key: str) -> None:
         self._delete_item(self._search_chunks, chunk_id, document_key)
+
+    def fail_timed_out_document(
+        self,
+        *,
+        source_run_id: str,
+        document_id: str,
+        error_code: str,
+    ) -> bool:
+        if not isinstance(error_code, str) or not error_code.strip() or len(error_code) > 100:
+            raise ValueError("error_code must be between 1 and 100 characters")
+        timeout_statuses = {
+            DocumentStatus.DISCOVERED.value,
+            DocumentStatus.PROCESSING.value,
+            DocumentStatus.ADMITTING.value,
+            DocumentStatus.READY.value,
+        }
+        timed_out: Mapping[str, Any] | None = None
+        for _ in range(MAX_MANIFEST_CONFLICT_ATTEMPTS):
+            try:
+                current = self._read_document(source_run_id, document_id)
+            except LifecycleConflictError:
+                return False
+            status = current.get("status")
+            if status == DocumentStatus.FAILED.value:
+                error = current.get("error")
+                if (
+                    not isinstance(error, Mapping)
+                    or error.get("code") != error_code.strip()
+                    or error.get("stage") != "orchestration"
+                ):
+                    return False
+                timed_out = current
+                break
+            if status not in timeout_statuses:
+                return False
+            now = _now_iso()
+            generation = _require_generation(current) + 1
+            try:
+                timed_out = self._source_documents.patch_item(
+                    item=document_id,
+                    partition_key=source_run_id,
+                    patch_operations=[
+                        {"op": "set", "path": "/status", "value": DocumentStatus.FAILED.value},
+                        {"op": "set", "path": "/stage", "value": "terminal"},
+                        {"op": "set", "path": "/lifecycleGeneration", "value": generation},
+                        {"op": "set", "path": "/readyAt", "value": None},
+                        {"op": "set", "path": "/failedAt", "value": now},
+                        {
+                            "op": "set",
+                            "path": "/error",
+                            "value": {
+                                "code": error_code.strip(),
+                                "stage": "orchestration",
+                                "retryable": True,
+                            },
+                        },
+                        {"op": "set", "path": "/updatedAt", "value": now},
+                    ],
+                    filter_predicate=(
+                        "from c where c.status = 'discovered' OR "
+                        "c.status = 'processing' OR c.status = 'admitting' OR "
+                        "c.status = 'ready'"
+                    ),
+                    etag=_require_etag(current, "document timeout closure"),
+                    match_condition=MatchConditions.IfNotModified,
+                )
+                break
+            except Exception as error:
+                if _error_status(error) == 412:
+                    continue
+                if _error_status(error) == 404:
+                    return False
+                raise LifecycleRepositoryError("Cosmos document timeout closure failed") from None
+        if timed_out is None:
+            raise LifecycleConflictError("document kept changing during timeout closure")
+
+        document_key = timed_out.get("documentKey")
+        if not isinstance(document_key, str) or not document_key:
+            raise LifecycleRepositoryError("Cosmos timed-out document key is malformed")
+        self.set_document_chunks_retrievable(
+            document_key=document_key,
+            lifecycle_generation=_require_generation(timed_out),
+            is_retrievable=False,
+        )
+        return True
 
     def retire_document(
         self,
@@ -721,6 +831,15 @@ class DocumentLifecycleRepository:
         )
         for chunk_id in self._list_chunk_ids(document_key):
             self._delete_item(self._search_chunks, chunk_id, document_key)
+        for manifest_page_id in self._list_visual_manifest_page_ids(
+            source_run_id,
+            document_id,
+        ):
+            self._delete_item(
+                self._source_documents,
+                manifest_page_id,
+                source_run_id,
+            )
         try:
             self._source_documents.delete_item(
                 item=document_id,
@@ -764,6 +883,37 @@ class DocumentLifecycleRepository:
             if continuation is None:
                 break
         return rows
+
+    def _list_visual_manifest_page_ids(
+        self,
+        source_run_id: str,
+        document_id: str,
+    ) -> list[str]:
+        query = (
+            "SELECT c.id FROM c WHERE c.sourceRunId = @sourceRunId "
+            "AND c.documentId = @documentId AND c.recordType = @recordType"
+        )
+        parameters = [
+            {"name": "@sourceRunId", "value": source_run_id},
+            {"name": "@documentId", "value": document_id},
+            {"name": "@recordType", "value": VISUAL_MANIFEST_PAGE_RECORD_TYPE},
+        ]
+        try:
+            rows = self._source_documents.query_items(
+                query=query,
+                parameters=parameters,
+                partition_key=source_run_id,
+                max_item_count=INTERNAL_PAGE_SIZE,
+            )
+            return [row["id"] for row in rows]
+        except (KeyError, TypeError):
+            raise LifecycleRepositoryError(
+                "Cosmos visual-manifest row is malformed"
+            ) from None
+        except Exception:
+            raise LifecycleRepositoryError(
+                "Cosmos visual-manifest scan failed"
+            ) from None
 
     def _read_document(self, source_run_id: str, document_id: str) -> dict[str, Any]:
         try:
@@ -844,6 +994,64 @@ class DocumentLifecycleRepository:
             self._ingestion_runs.upsert_item(body=item)
         except Exception:
             raise LifecycleRepositoryError("Cosmos trigger-instance save failed") from None
+
+    def try_claim_trigger_instance_id(
+        self,
+        source_id: str,
+        control_id: str,
+        expected_instance_id: str | None,
+        instance_id: str,
+    ) -> bool:
+        """Atomically replace the last-dispatched trigger ID when state is unchanged."""
+        if not instance_id:
+            raise ValueError("instance_id is required")
+        item = {
+            "id": control_id,
+            "sourceId": source_id,
+            "currentInstanceId": instance_id,
+            "updatedAt": _now_iso(),
+        }
+        try:
+            current = self._ingestion_runs.read_item(
+                item=control_id,
+                partition_key=source_id,
+            )
+        except Exception as error:
+            if _error_status(error) != 404:
+                raise LifecycleRepositoryError(
+                    "Cosmos trigger-instance claim read failed"
+                ) from None
+            if expected_instance_id is not None:
+                return False
+            try:
+                self._ingestion_runs.create_item(body=item)
+            except Exception as create_error:
+                if _error_status(create_error) == 409:
+                    return False
+                raise LifecycleRepositoryError(
+                    "Cosmos trigger-instance claim create failed"
+                ) from None
+            return True
+
+        current_instance_id = current.get("currentInstanceId")
+        if current_instance_id is not None and not isinstance(current_instance_id, str):
+            raise LifecycleRepositoryError("Cosmos trigger-instance record is malformed")
+        if current_instance_id != expected_instance_id:
+            return False
+        try:
+            self._ingestion_runs.replace_item(
+                item=control_id,
+                body=item,
+                etag=_require_etag(current, "trigger-instance claim"),
+                match_condition=MatchConditions.IfNotModified,
+            )
+        except Exception as error:
+            if _error_status(error) in {409, 412}:
+                return False
+            raise LifecycleRepositoryError(
+                "Cosmos trigger-instance claim replace failed"
+            ) from None
+        return True
 
     def get_webhook_subscription_id(self, source_id: str) -> str | None:
         try:

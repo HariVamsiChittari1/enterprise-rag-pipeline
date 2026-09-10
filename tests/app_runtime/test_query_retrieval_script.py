@@ -4,6 +4,7 @@ import importlib.util
 from pathlib import Path
 import sys
 
+import pytest
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT_PATH = PROJECT_ROOT / "tools" / "script_query_retrieval.py"
@@ -75,6 +76,29 @@ def test_matrix_audit_rejects_scoring_profile_and_catalog_mismatch() -> None:
     assert any("catalog_version" in message for message in failures)
 
 
+@pytest.mark.parametrize("observed_etag", [None, '"later"', '"expected"'])
+def test_matrix_audit_checks_generation_even_when_digest_matches(observed_etag) -> None:
+    failures = query_script._validate_matrix_audit(
+        {
+            "path": "standard",
+            "mode": "hybrid",
+            "effective_retrieval_modes": ["hybrid"],
+            "retrieval_degraded": False,
+            "citations_count": 1,
+            "catalog_version": "sha256:catalog",
+            "catalog_etag": observed_etag,
+        },
+        expected_path="standard",
+        expected_mode="hybrid",
+        expected_profile=None,
+        expected_catalog_sha="sha256:catalog",
+        expected_catalog_etag='"expected"',
+    )
+
+    assert bool(failures) is (observed_etag != '"expected"')
+    assert all("catalog_etag" in message for message in failures)
+
+
 def test_matrix_audit_rejects_missing_citations() -> None:
     failures = query_script._validate_matrix_audit(
         {
@@ -111,6 +135,7 @@ def test_matrix_runs_all_six_path_mode_combinations(monkeypatch) -> None:
             "citations_count": 1,
             "scoring_profile": request.get("scoring_profile"),
             "catalog_version": "sha256:catalog",
+            "catalog_etag": '"generation"',
         }
 
     monkeypatch.setattr(query_script, "_post_json", fake_post)
@@ -128,10 +153,12 @@ def test_matrix_runs_all_six_path_mode_combinations(monkeypatch) -> None:
         scoring_profile="fresh",
         expected_scoring_profile="fresh",
         expected_catalog_sha="sha256:catalog",
+        expected_catalog_etag='"generation"',
     )
 
     assert len(results) == 6
     assert all(result["status"] == "passed" for result in results)
+    assert all(result["catalogEtag"] == '"generation"' for result in results)
     assert {(result["expectedPath"], result["mode"]) for result in results} == {
         (path, mode)
         for path in ("standard", "agentic")

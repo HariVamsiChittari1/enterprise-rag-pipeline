@@ -7,6 +7,15 @@ param location string = resourceGroup().location
 @description('Private Link targets and DNS zones')
 param privateEndpointTargets array
 
+@description('Existing Function integration subnet network security group resource ID')
+param functionIntegrationSubnetNsgId string = ''
+
+@description('Existing private endpoint subnet network security group resource ID')
+param privateEndpointSubnetNsgId string = ''
+
+@description('Existing ACA environment subnet network security group resource ID')
+param acaEnvironmentSubnetNsgId string = ''
+
 @description('Resource tags')
 param tags object = {}
 
@@ -28,16 +37,21 @@ module virtualNetwork 'br/public:avm/res/network/virtual-network:0.10.0' = {
         name: integrationSubnetName
         addressPrefix: '10.20.0.0/27'
         delegation: 'Microsoft.App/environments'
+        networkSecurityGroupResourceId: functionIntegrationSubnetNsgId
+        privateEndpointNetworkPolicies: 'Disabled'
       }
       {
         name: privateEndpointSubnetName
         addressPrefix: '10.20.0.32/27'
+        networkSecurityGroupResourceId: privateEndpointSubnetNsgId
         privateEndpointNetworkPolicies: 'Disabled'
       }
       {
         name: 'aca-environment'
         addressPrefix: '10.20.2.0/23'
         delegation: 'Microsoft.App/environments'
+        networkSecurityGroupResourceId: acaEnvironmentSubnetNsgId
+        privateEndpointNetworkPolicies: 'Disabled'
       }
     ]
     tags: tags

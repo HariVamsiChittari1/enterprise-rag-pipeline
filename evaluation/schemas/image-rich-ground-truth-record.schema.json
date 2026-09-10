@@ -1,0 +1,148 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://bfl.example/schemas/rag/image-rich-ground-truth-record.schema.json",
+  "title": "Protected Image-Rich PoC Ground Truth Record",
+  "description": "PoC-only ground truth. Query class governs required evidence: text-only and mixed require exactText; visual-only requires SME-approved expected facts; acl requires an ACL principal expectation.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "queryId",
+    "queryClass",
+    "question",
+    "expectedContext",
+    "expectedCitations",
+    "principalCaseLabel",
+    "smeNotes"
+  ],
+  "properties": {
+    "queryId": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$"
+    },
+    "queryClass": {
+      "enum": ["visual_only", "text_only", "mixed", "acl"]
+    },
+    "question": { "type": "string", "minLength": 1, "maxLength": 4000 },
+    "expectedContext": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/context" }
+    },
+    "expectedCitations": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1, "maxLength": 500 }
+    },
+    "principalCaseLabel": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 100
+    },
+    "smeNotes": { "type": "string", "maxLength": 8000 }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "queryClass": { "const": "text_only" } } },
+      "then": {
+        "properties": {
+          "expectedContext": {
+            "items": {
+              "required": ["exactText"],
+              "properties": {
+                "requiredModality": { "const": "text" }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "queryClass": { "const": "visual_only" } } },
+      "then": {
+        "properties": {
+          "expectedContext": {
+            "items": {
+              "required": ["visualType", "expectedFacts"],
+              "properties": {
+                "requiredModality": { "const": "visual_description" }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "queryClass": { "const": "mixed" } } },
+      "then": {
+        "properties": {
+          "expectedContext": {
+            "items": {
+              "anyOf": [
+                { "required": ["exactText"] },
+                { "required": ["visualType", "expectedFacts"] }
+              ]
+            }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "context": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sourceItemId",
+        "documentId",
+        "sourceContentHash",
+        "requiredModality",
+        "locatorKind",
+        "locatorLabel",
+        "locatorOrdinalStart",
+        "locatorOrdinalEnd"
+      ],
+      "properties": {
+        "sourceItemId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500
+        },
+        "documentId": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "sourceContentHash": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "requiredModality": {
+          "enum": ["text", "visual_description"]
+        },
+        "locatorKind": {
+          "enum": ["page", "section", "slide", "worksheet"]
+        },
+        "locatorLabel": { "type": "string", "minLength": 1, "maxLength": 200 },
+        "locatorOrdinalStart": { "type": "integer", "minimum": 1 },
+        "locatorOrdinalEnd": { "type": "integer", "minimum": 1 },
+        "exactText": { "type": "string", "minLength": 1, "maxLength": 32000 },
+        "visualType": {
+          "enum": [
+            "flow-diagram",
+            "rich-image-diagram",
+            "workflow-screenshot",
+            "chart",
+            "smartart-shape",
+            "scan"
+          ]
+        },
+        "expectedFacts": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 20,
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1, "maxLength": 2000 }
+        }
+      }
+    }
+  }
+}

@@ -56,6 +56,9 @@ param maxReplicas int = 5
 @description('Resource tags')
 param tags object = {}
 
+@description('Observer principal authorized to read revision and replica inventories')
+param observerPrincipalId string = ''
+
 resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
   name: containerAppName
   location: location
@@ -113,6 +116,18 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
         maxReplicas: maxReplicas
       }
     }
+  }
+}
+
+resource observerReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (!empty(observerPrincipalId)) {
+  name: guid(containerApp.id, observerPrincipalId, 'acdd72a7-3385-48ef-bd42-f606fba81ae7')
+  scope: containerApp
+  properties: {
+    roleDefinitionId: subscriptionResourceId(
+      'Microsoft.Authorization/roleDefinitions',
+      'acdd72a7-3385-48ef-bd42-f606fba81ae7'
+    )
+    principalId: observerPrincipalId
   }
 }
 

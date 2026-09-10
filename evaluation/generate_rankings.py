@@ -195,10 +195,24 @@ def _sorted_hex(items: list[str]) -> list[str]:
 
 
 def _identity_ranking(chunks: list[Any]) -> list[dict[str, Any]]:
-    return [
-        {"documentItemId": chunk.document_id, "pageNumber": chunk.page_number}
-        for chunk in chunks
-    ]
+    ranking: list[dict[str, Any]] = []
+    for chunk in chunks:
+        locator_kind = getattr(chunk.locator_kind, "value", chunk.locator_kind)
+        if locator_kind != "page":
+            raise GenerateRankingsError(
+                "the generic ranking benchmark accepts page locators only"
+            )
+        if chunk.locator_ordinal_start != chunk.locator_ordinal_end:
+            raise GenerateRankingsError(
+                "the generic ranking benchmark requires a single-page locator"
+            )
+        ranking.append(
+            {
+                "documentItemId": chunk.document_id,
+                "pageNumber": chunk.locator_ordinal_start,
+            }
+        )
+    return ranking
 
 
 def _validate_deny_set(
@@ -326,7 +340,7 @@ def generate_rankings(
         "experimentId", "runId", "datasetHash", "datasetComponents",
         "principalCase", "retrievalMode", "k", "evaluationAsOf",
         "candidateSetHash", "baselineRankingHash", "candidateRankingHash",
-        "startedAt",
+        "startedAt", "catalogSha", "catalogEtag",
     }
     collisions = computed_manifest_fields & set(manifest_extras)
     if collisions:
@@ -364,8 +378,9 @@ def generate_rankings(
         pool_signatures: list[dict[str, Any]] = []
 
         try:
-            service.get_scoring_profile(baseline_profile_name)
-            service.get_scoring_profile(candidate_profile_name)
+            snapshot = service.capture_snapshot()
+            baseline_policy = service.capture_policy(baseline_profile_name, snapshot=snapshot)
+            candidate_policy = service.capture_policy(candidate_profile_name, snapshot=snapshot)
         except Exception as error:
             raise GenerateRankingsError("evaluation profile is not in the catalog") from error
 
@@ -380,6 +395,7 @@ def generate_rankings(
                 mode=retrieval_mode,
                 top_k=top_k,
                 scoring_profile=baseline_profile_name,
+                policy=baseline_policy,
             )
             candidate_pool: EvaluationPool = service.retrieve_evaluation_pool(
                 question,
@@ -388,6 +404,7 @@ def generate_rankings(
                 mode=retrieval_mode,
                 top_k=top_k,
                 scoring_profile=candidate_profile_name,
+                policy=candidate_policy,
             )
             _validate_raw_pool(
                 query_id, pool,
@@ -430,6 +447,8 @@ def generate_rankings(
             "runId": run_id,
             "datasetHash": dataset_hash,
             "datasetComponents": dataset_components,
+            "catalogSha": snapshot.digest.removeprefix("sha256:"),
+            "catalogEtag": snapshot.etag,
             "principalCase": principal_case_label,
             "retrievalMode": retrieval_mode.value,
             "k": top_k,

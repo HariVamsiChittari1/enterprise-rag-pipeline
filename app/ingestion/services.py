@@ -9,18 +9,29 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any
 
-from config import IngestionConfig
+from config import ExtractionProvider, IngestionConfig
 from ingestion.chunking import chunk_pages, token_count
 from ingestion.embedding import embed_texts
 from ingestion.enrichment import enrich_chunks
 from ingestion.errors import TerminalDocumentError
-from ingestion.extraction import extract_pdf
+from ingestion.extraction import (
+    MIN_TEXT_CHARACTERS,
+    VisionExtractionConfig,
+    extract_content_understanding,
+    extract_markdown,
+    extract_office_document_intelligence,
+    extract_pdf,
+    extract_rendered_pdf_visuals,
+)
 from ingestion.graph import (
     DeltaResetRequired,
     DiscoveryState,
     DiscoveryStep,
+    ResolvedMarkdownImage,
     VerifiedAcl,
     discovered_pdf_from_item,
+    resolve_source_format,
+    validate_source_signature,
 )
 from ingestion.lifecycle_repository import (
     DocumentLifecycleRepository,
@@ -31,11 +42,13 @@ from ingestion.lifecycle_repository import (
 from ingestion.models import (
     ActivityOutcome,
     ActivityStatus,
+    CanonicalExtractionResult,
     Chunk,
     DocumentStage,
     DocumentStatus,
     EnrichmentProfile,
     IngestionRunRecord,
+    Page,
     ProfileSnapshot,
     RETIRED_REASONS,
     RunCounters,
@@ -53,8 +66,15 @@ from ingestion.models import (
     create_document_key,
     create_run_id,
     create_source_run_id,
+    create_visual_manifest_pages,
     run_record_id,
     safe_error_from_exception,
+    visual_manifest_hash,
+)
+from ingestion.office_visuals import (
+    bind_office_content_understanding_visuals,
+    inventory_office_visuals,
+    merge_office_visuals,
 )
 from ingestion.repository import (
     ActivatedRun,
@@ -66,6 +86,18 @@ from ingestion.source_connector import SourceConnector
 from ingestion.telemetry import write_audit_record
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _SourceSnapshot:
+    source_format: str
+    mime_type: str
+
+
+@dataclass(frozen=True)
+class _AuthorizedImage:
+    image: ResolvedMarkdownImage
+    acl: VerifiedAcl
 
 
 def activate(config: IngestionConfig, repository: IngestionRepository, orchestration_instance_id: str) -> ActivatedRun:
@@ -139,7 +171,7 @@ def discover_all(
                     if discovered_modified is None or prev.record.source_modified_at == discovered_modified:
                         skipped += 1
                         continue
-            doc = _pdf_to_document(pdf, config, run_id)
+            doc = _source_to_document(pdf, config, run_id)
             stored = repository.create_discovered_document(doc)
             documents.append(stored.record)
 
@@ -158,6 +190,8 @@ def process_document(
     language_client: Any | None,
     openai_client: Any,
     audit_container: Any | None = None,
+    *,
+    cu_client: Any | None = None,
 ) -> ActivityOutcome:
     """Process a single document through the full pipeline."""
     try:
@@ -178,18 +212,227 @@ def process_document(
     current_doc = processing.record
     current_etag = processing.etag
     try:
+        limits = ScaleLimits()
+        source_snapshot = _read_and_validate_source_snapshot(connector, current_doc)
+        source_format = source_snapshot.source_format
         acl = connector.read_verified_acl(current_doc.item_id, config.acl_max_pages)
+        authorized_images: list[_AuthorizedImage] = []
 
-        content = connector.download_content_sync(current_doc.item_id, ScaleLimits().max_pdf_bytes, config.download_timeout_seconds)
+        content = connector.download_content_sync(
+            current_doc.item_id,
+            limits.max_source_bytes,
+            config.download_timeout_seconds,
+        )
+        validate_source_signature(source_format, content)
 
-        if config.extraction_enabled and di_client is not None:
+        if config.extraction_enabled:
             extraction_start = time.perf_counter()
-            pages = extract_pdf(di_client, content, max_pdf_pages=config.max_pdf_pages)
+            derivative_used = False
+            extraction_provider = "direct"
+            excluded_reasons: list[str] = []
+            unsupported_reasons: list[str] = []
+            vision_config = VisionExtractionConfig(
+                deployment=config.vision_deployment,
+                max_output_tokens=config.vision_max_output_tokens,
+                max_image_bytes=config.vision_max_image_bytes,
+                max_figures=min(
+                    config.vision_max_figures,
+                    limits.max_visual_descriptions,
+                ),
+            )
+            if source_format == ".md":
+                def load_markdown_image(path: str) -> bytes:
+                    image = connector.resolve_relative_markdown_image_sync(
+                        current_doc.parent_item_id,
+                        path,
+                        config.vision_max_image_bytes,
+                    )
+                    image_acl = connector.read_verified_acl(
+                        image.item_id,
+                        config.acl_max_pages,
+                    )
+                    if not set(acl.allowed_group_ids).issubset(
+                        image_acl.allowed_group_ids
+                    ):
+                        raise TerminalDocumentError(
+                            "markdown_image_acl_not_authorized"
+                        )
+                    image_content = connector.download_content_sync(
+                        image.item_id,
+                        config.vision_max_image_bytes,
+                        config.download_timeout_seconds,
+                    )
+                    authorized_images.append(_AuthorizedImage(image, image_acl))
+                    return image_content
+
+                extraction = extract_markdown(
+                    content,
+                    image_loader=load_markdown_image,
+                    openai_client=openai_client,
+                    vision_config=vision_config,
+                )
+                extraction_mode = "direct-markdown"
+            elif source_format == ".pdf":
+                if config.extraction_provider is ExtractionProvider.CONTENT_UNDERSTANDING:
+                    if cu_client is None:
+                        raise TerminalDocumentError(
+                            "content_understanding_configuration_missing"
+                        )
+                    extraction = extract_content_understanding(
+                        cu_client,
+                        content,
+                        source_snapshot.mime_type,
+                        max_pages=min(config.max_pdf_pages, limits.max_document_units),
+                        analyzer_id=config.content_understanding_analyzer_id,
+                    )
+                    extraction_provider = ExtractionProvider.CONTENT_UNDERSTANDING.value
+                    extraction_mode = config.content_understanding_analyzer_id
+                else:
+                    if di_client is None:
+                        raise TerminalDocumentError(
+                            "document_intelligence_configuration_missing"
+                        )
+                    extraction = extract_pdf(
+                        di_client,
+                        content,
+                        max_pdf_pages=min(
+                            config.max_pdf_pages,
+                            limits.max_document_units,
+                        ),
+                        openai_client=openai_client,
+                        vision_config=vision_config,
+                    )
+                    extraction_provider = ExtractionProvider.DOCUMENT_INTELLIGENCE.value
+                    extraction_mode = "prebuilt-layout"
+            else:
+                inventory = inventory_office_visuals(
+                    content,
+                    source_snapshot.mime_type,
+                    max_content_units=limits.max_document_units,
+                )
+                if len(inventory.required) > limits.max_visual_descriptions:
+                    raise TerminalDocumentError(
+                        "visual_description_limit_exceeded"
+                    )
+                if config.extraction_provider is ExtractionProvider.CONTENT_UNDERSTANDING:
+                    if cu_client is None:
+                        raise TerminalDocumentError(
+                            "content_understanding_configuration_missing"
+                        )
+                    analysis_content = connector.download_content_as_pdf_sync(
+                        current_doc.item_id,
+                        limits.max_rendered_pdf_bytes,
+                        config.download_timeout_seconds,
+                    )
+                    analysis_content_type = "application/pdf"
+                    derivative_used = True
+                    extraction = extract_content_understanding(
+                        cu_client,
+                        analysis_content,
+                        analysis_content_type,
+                        max_pages=min(config.max_pdf_pages, limits.max_document_units),
+                        analyzer_id=config.content_understanding_analyzer_id,
+                    )
+                    if (
+                        inventory.required
+                        and extraction.visual_coverage.required_count
+                        != len(inventory.required)
+                    ):
+                        raise TerminalDocumentError(
+                            "content_understanding_office_visual_coverage_mismatch"
+                        )
+                    extraction = bind_office_content_understanding_visuals(
+                        extraction,
+                        inventory,
+                        source_snapshot.mime_type,
+                    )
+                    native_segment_count = len(extraction.segments)
+                    extraction_provider = ExtractionProvider.CONTENT_UNDERSTANDING.value
+                    extraction_mode = config.content_understanding_analyzer_id
+                else:
+                    if di_client is None:
+                        raise TerminalDocumentError(
+                            "document_intelligence_configuration_missing"
+                        )
+                    native_extraction = extract_office_document_intelligence(
+                        di_client,
+                        content,
+                        source_snapshot.mime_type,
+                        max_pages=min(config.max_pdf_pages, limits.max_document_units),
+                    )
+                    native_segment_count = len(native_extraction.segments)
+                    rendered_visuals = ()
+                    if inventory.required:
+                        rendered_pdf = connector.download_content_as_pdf_sync(
+                            current_doc.item_id,
+                            limits.max_rendered_pdf_bytes,
+                            config.download_timeout_seconds,
+                        )
+                        rendered_visuals = extract_rendered_pdf_visuals(
+                            di_client,
+                            rendered_pdf,
+                            max_pdf_pages=min(
+                                config.max_pdf_pages,
+                                limits.max_document_units,
+                            ),
+                            openai_client=openai_client,
+                            vision_config=vision_config,
+                        )
+                        derivative_used = True
+                    extraction = merge_office_visuals(
+                        native_extraction,
+                        inventory,
+                        rendered_visuals,
+                        source_snapshot.mime_type,
+                    )
+                    extraction_provider = ExtractionProvider.DOCUMENT_INTELLIGENCE.value
+                    extraction_mode = "document-intelligence-layout+rendered-visuals"
+                excluded_reasons = sorted(
+                    {omission.reason for omission in inventory.excluded}
+                )
+                unsupported_reasons = sorted(
+                    {omission.reason for omission in inventory.unsupported}
+                )
+            if source_format in {".md", ".pdf"}:
+                native_segment_count = len(extraction.segments)
+            if (
+                extraction.visual_coverage.described_count
+                > limits.max_visual_descriptions
+            ):
+                raise TerminalDocumentError("visual_description_limit_exceeded")
+            if source_format not in {".md", ".pdf"} and sum(
+                len(segment.text) for segment in extraction.segments
+            ) > limits.max_office_characters:
+                raise TerminalDocumentError("office_character_limit_exceeded")
+            pages = _pages_from_extraction(extraction)
+            if sum(len(page.text) for page in pages) < MIN_TEXT_CHARACTERS:
+                raise TerminalDocumentError("extraction_insufficient_text")
             if audit_container is not None:
                 total_chars = sum(len(p.text) for p in pages)
+                provenance = sorted(
+                    {
+                        value.value
+                        for segment in extraction.segments
+                        for value in segment.provenance
+                    }
+                )
                 write_audit_record(audit_container, config.source_id, current_doc.source_run_id, {
-                    "operation": "document_extraction", "model": "prebuilt-layout",
+                    "operation": "document_extraction", "model": extraction_mode,
+                    "extractionProvider": extraction_provider,
+                    "format": source_format,
                     "pages": len(pages), "characters": total_chars,
+                    "nativeSegmentCount": native_segment_count,
+                    "derivativeUsed": derivative_used,
+                    "provenance": provenance,
+                    "visualCoverage": extraction.visual_coverage.status.value,
+                    "visualInventoryCount": extraction.visual_coverage.inventory_count,
+                    "visualRequiredCount": extraction.visual_coverage.required_count,
+                    "visualDescribedCount": extraction.visual_coverage.described_count,
+                    "visualExcludedCount": extraction.visual_coverage.excluded_count,
+                    "visualUnsupportedCount": extraction.visual_coverage.unsupported_count,
+                    "visualUncoveredCount": extraction.visual_coverage.uncovered_count,
+                    "excludedReasons": excluded_reasons,
+                    "unsupportedReasons": unsupported_reasons,
                     "latency_ms": int((time.perf_counter() - extraction_start) * 1000),
                     "documentId": current_doc.document_id, "sourceName": current_doc.source_name,
                 })
@@ -234,11 +477,53 @@ def process_document(
         now = _fmt(_utc_now())
         chunk_records = _build_chunk_records(current_doc, acl, chunks, searchable_texts, enrichments, embeddings, now)
 
-        current_doc = replace(current_doc, stage=DocumentStage.PERSISTING, page_count=len(pages), expected_chunk_count=len(chunk_records), content_hash=content_sha256("\n".join(p.text for p in pages)), extraction_mode="prebuilt-layout", updated_at=_fmt(_utc_now()))
+        current_doc = replace(current_doc, stage=DocumentStage.PERSISTING, page_count=len(pages), expected_chunk_count=len(chunk_records), content_hash=content_sha256("\n".join(p.text for p in pages)), extraction_mode=extraction_mode, updated_at=_fmt(_utc_now()))
         updated = repository.update_processing_document(current_doc, current_etag)
         current_doc, current_etag = updated.record, updated.etag
 
         written = repository.write_chunks(chunk_records)
+        manifest_pages = create_visual_manifest_pages(
+            current_doc,
+            extraction.visual_manifest_entries,
+        )
+        repository.write_visual_manifest_pages(manifest_pages)
+        current_doc = replace(
+            current_doc,
+            visual_manifest_page_count=len(manifest_pages),
+            visual_manifest_hash=visual_manifest_hash(manifest_pages),
+            updated_at=_fmt(_utc_now()),
+        )
+        updated = repository.update_processing_document(current_doc, current_etag)
+        current_doc, current_etag = updated.record, updated.etag
+
+        _read_and_validate_source_snapshot(
+            connector,
+            current_doc,
+            expected_snapshot=source_snapshot,
+        )
+        final_acl = connector.read_verified_acl(
+            current_doc.item_id,
+            config.acl_max_pages,
+        )
+        if final_acl != acl:
+            raise TerminalDocumentError("source_acl_changed_during_processing")
+        for authorized_image in authorized_images:
+            _validate_resolved_image_snapshot(
+                connector.read_item(authorized_image.image.item_id),
+                authorized_image.image,
+            )
+            final_image_acl = connector.read_verified_acl(
+                authorized_image.image.item_id,
+                config.acl_max_pages,
+            )
+            if final_image_acl != authorized_image.acl:
+                raise TerminalDocumentError(
+                    "markdown_image_acl_changed_during_processing"
+                )
+            if not set(final_acl.allowed_group_ids).issubset(
+                final_image_acl.allowed_group_ids
+            ):
+                raise TerminalDocumentError("markdown_image_acl_not_authorized")
 
         admitting_doc = replace(
             current_doc,
@@ -376,6 +661,8 @@ def run_delta_sync(
     language_client: Any | None,
     openai_client: Any,
     audit_container: Any | None = None,
+    *,
+    cu_client: Any | None = None,
 ) -> DeltaSyncOutcome:
     """One delta-sync tick: process adds/updates/deletes for source_id since the last
     cursor. Uses its own run_id per tick purely as a schema-compliant namespacing device
@@ -472,6 +759,7 @@ def run_delta_sync(
                 config, stored.record, stored.etag, repository, lifecycle_repository,
                 connector, di_client, language_client, openai_client,
                 audit_container=audit_container,
+                cu_client=cu_client,
             )
         except Exception:
             logger.error("delta_sync item %s failed", item_id, exc_info=True)
@@ -535,7 +823,7 @@ def _delta_item_to_document(
     ):
         return None
     pdf = discovered_pdf_from_item(item, ordinal)
-    return _pdf_to_document(pdf, config, run_id, ingestion_mode="delta-sync")
+    return _source_to_document(pdf, config, run_id, ingestion_mode="delta-sync")
 
 
 def _source_etag_changed(item: dict[str, Any], persisted_etag: str | None) -> bool:
@@ -859,21 +1147,73 @@ def _build_searchable_text(content: str, key_phrases: tuple[str, ...], summary: 
     return "\n\n".join(parts)
 
 
-def _pdf_to_document(pdf: Any, config: IngestionConfig, run_id: str, ingestion_mode: str = "full-sync") -> SourceDocumentRecord:
-    document_id = create_document_id(config.source_id, config.drive_id, pdf.item_id)
+def _read_and_validate_source_snapshot(
+    connector: SourceConnector,
+    document: SourceDocumentRecord,
+    *,
+    expected_snapshot: _SourceSnapshot | None = None,
+) -> _SourceSnapshot:
+    item = connector.read_item(document.item_id)
+    if item is None:
+        raise TerminalDocumentError("source_item_not_found")
+    name = item.get("name")
+    e_tag = item.get("eTag")
+    size = item.get("size")
+    file_metadata = item.get("file")
+    graph_mime = (
+        file_metadata.get("mimeType") if isinstance(file_metadata, dict) else None
+    )
+    if name != document.source_name:
+        raise TerminalDocumentError("source_name_changed_during_processing")
+    if e_tag != document.e_tag:
+        raise TerminalDocumentError("source_etag_changed_during_processing")
+    if size != document.size_bytes:
+        raise TerminalDocumentError("source_size_changed_during_processing")
+    source_format = resolve_source_format(name, graph_mime)
+    normalized_mime = graph_mime.split(";", 1)[0].strip().lower()
+    snapshot = _SourceSnapshot(source_format, normalized_mime)
+    if expected_snapshot is not None and source_format != expected_snapshot.source_format:
+        raise TerminalDocumentError("source_format_changed_during_processing")
+    if expected_snapshot is not None and normalized_mime != expected_snapshot.mime_type:
+        raise TerminalDocumentError("source_mime_changed_during_processing")
+    return snapshot
+
+
+def _validate_resolved_image_snapshot(
+    item: dict[str, Any] | None,
+    expected: ResolvedMarkdownImage,
+) -> None:
+    if item is None:
+        raise TerminalDocumentError("markdown_image_removed_during_processing")
+    file_metadata = item.get("file")
+    mime_type = (
+        file_metadata.get("mimeType") if isinstance(file_metadata, dict) else None
+    )
+    if item.get("name") != expected.name:
+        raise TerminalDocumentError("markdown_image_name_changed_during_processing")
+    if item.get("eTag") != expected.e_tag:
+        raise TerminalDocumentError("markdown_image_etag_changed_during_processing")
+    if item.get("size") != expected.size_bytes:
+        raise TerminalDocumentError("markdown_image_size_changed_during_processing")
+    if not isinstance(mime_type, str) or mime_type.lower() != expected.mime_type:
+        raise TerminalDocumentError("markdown_image_mime_changed_during_processing")
+
+
+def _source_to_document(source: Any, config: IngestionConfig, run_id: str, ingestion_mode: str = "full-sync") -> SourceDocumentRecord:
+    document_id = create_document_id(config.source_id, config.drive_id, source.item_id)
     now = _fmt(_utc_now())
     return SourceDocumentRecord(
         source_id=config.source_id, run_id=run_id, drive_id=config.drive_id,
-        item_id=pdf.item_id, parent_item_id=pdf.parent_item_id,
-        source_name=pdf.name, source_path=pdf.source_path,
-        source_url=pdf.source_url, e_tag=pdf.e_tag,
-        mime_type="application/pdf", size_bytes=pdf.size_bytes,
-        discovery_ordinal=pdf.discovery_ordinal,
+        item_id=source.item_id, parent_item_id=source.parent_item_id,
+        source_name=source.name, source_path=source.source_path,
+        source_url=source.source_url, e_tag=source.e_tag,
+        mime_type=source.mime_type, size_bytes=source.size_bytes,
+        discovery_ordinal=source.discovery_ordinal,
         allowed_group_ids=("pending",), acl_hash=content_sha256("pending"),
         acl_evaluated_at=now,
         status=DocumentStatus.DISCOVERED, stage=DocumentStage.DISCOVERED,
         attempt_count=0, discovered_at=now, updated_at=now,
-        source_modified_at=getattr(pdf, "last_modified_date_time", None),
+        source_modified_at=getattr(source, "last_modified_date_time", None),
         ingestion_mode=ingestion_mode,
         id=document_id, document_id=document_id,
         source_run_id=create_source_run_id(config.source_id, run_id),
@@ -897,7 +1237,15 @@ def _build_chunk_records(
             source_name=document.source_name,
             source_url=document.source_url,
             page_start=chunk.page_number, page_end=chunk.page_number,
-            section_path=_section_path(chunk.content), chunk_index=chunk.ordinal,
+            section_path=_section_path(chunk.content),
+            locator_kind=chunk.locator.kind,
+            locator_label=chunk.locator.label,
+            locator_ordinal_start=chunk.locator.ordinal_start,
+            locator_ordinal_end=chunk.locator.ordinal_end,
+            modalities=chunk.modalities,
+            provenance=chunk.provenance,
+            visual_coverage=chunk.visual_coverage,
+            chunk_index=chunk.ordinal,
             created_at=now, content=chunk.content,
             content_hash=content_sha256(chunk.content),
             embedding_text=searchable,
@@ -917,6 +1265,20 @@ def _build_chunk_records(
             source_run_id=create_source_run_id(document.source_id, document.run_id),
         ))
     return tuple(records)
+
+
+def _pages_from_extraction(extraction: CanonicalExtractionResult) -> list[Page]:
+    return [
+        Page(
+            number=segment.locator.ordinal_start,
+            text=segment.text,
+            locator=segment.locator,
+            modalities=segment.modalities,
+            provenance=segment.provenance,
+            visual_coverage=extraction.visual_coverage.status,
+        )
+        for segment in extraction.segments
+    ]
 
 
 def _section_path(content: str) -> tuple[str, ...]:

@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import time
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import quote, unquote, urlparse
+from urllib.parse import quote, unquote, unquote_to_bytes, urlparse, urlsplit
 
 import httpx
 
@@ -29,6 +30,25 @@ DOWNLOAD_HOST_SUFFIXES = (
 CHILDREN_SELECT = "id,name,eTag,size,file,folder,package,parentReference,webUrl,lastModifiedDateTime"
 SUPPORTED_ACL_ROLES = frozenset({"read", "write", "owner"})
 ACL_POLICY_VERSION = "verified-entra-security-groups-v1"
+SUPPORTED_SOURCE_MIME_TYPES: dict[str, frozenset[str]] = {
+    ".md": frozenset({"text/markdown", "text/plain", "application/octet-stream"}),
+    ".pdf": frozenset({"application/pdf"}),
+    ".docx": frozenset(
+        {"application/vnd.openxmlformats-officedocument.wordprocessingml.document"}
+    ),
+    ".pptx": frozenset(
+        {"application/vnd.openxmlformats-officedocument.presentationml.presentation"}
+    ),
+    ".xlsx": frozenset(
+        {"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"}
+    ),
+}
+SUPPORTED_SOURCE_EXTENSIONS = tuple(SUPPORTED_SOURCE_MIME_TYPES)
+PDF_SIGNATURE = b"%PDF-"
+ZIP_SIGNATURES = (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")
+MARKDOWN_IMAGE_MIME_TYPE = "image/png"
+GRAPH_PDF_MAX_ATTEMPTS = 3
+GRAPH_PDF_MAX_RETRY_DELAY_SECONDS = 30.0
 
 
 @dataclass(frozen=True)
@@ -129,6 +149,7 @@ class DiscoveredPdf:
     source_path: str
     source_url: str
     e_tag: str
+    mime_type: str
     size_bytes: int
     discovery_ordinal: int
     last_modified_date_time: str | None = None
@@ -141,6 +162,7 @@ class DiscoveredPdf:
             "sourcePath": self.source_path,
             "sourceUrl": self.source_url,
             "eTag": self.e_tag,
+            "mimeType": self.mime_type,
             "sizeBytes": self.size_bytes,
             "discoveryOrdinal": self.discovery_ordinal,
             "lastModifiedDateTime": self.last_modified_date_time,
@@ -169,6 +191,15 @@ class DiscoveryStep:
 class VerifiedAcl:
     allowed_group_ids: tuple[str, ...]
     acl_hash: str
+
+
+@dataclass(frozen=True)
+class ResolvedMarkdownImage:
+    item_id: str
+    name: str
+    e_tag: str
+    size_bytes: int
+    mime_type: str
 
 
 class GraphDiscoveryLimitExceeded(RuntimeError):
@@ -283,6 +314,13 @@ def _optional_item_text(item: dict[str, Any], field_name: str) -> str | None:
 def discovered_pdf_from_item(item: dict[str, Any], ordinal: int) -> DiscoveredPdf:
     item_id = _require_item_text(item, "id")
     name = _require_item_text(item, "name")
+    file_metadata = item.get("file")
+    graph_mime = (
+        file_metadata.get("mimeType") if isinstance(file_metadata, dict) else None
+    )
+    resolve_source_format(name, graph_mime)
+    assert isinstance(graph_mime, str)
+    normalized_mime = graph_mime.split(";", 1)[0].strip().lower()
     size_bytes = item.get("size")
     if isinstance(size_bytes, bool) or not isinstance(size_bytes, int) or size_bytes < 0:
         raise ValueError("Graph PDF has an invalid size")
@@ -297,10 +335,50 @@ def discovered_pdf_from_item(item: dict[str, Any], ordinal: int) -> DiscoveredPd
         source_path=f"{parent_path}/{name}",
         source_url=_require_item_text(item, "webUrl"),
         e_tag=_require_item_text(item, "eTag"),
+        mime_type=normalized_mime,
         size_bytes=size_bytes,
         discovery_ordinal=ordinal,
         last_modified_date_time=_optional_item_text(item, "lastModifiedDateTime"),
     )
+
+
+def resolve_source_format(name: str, graph_mime: str | None) -> str:
+    """Validate one supported source extension against Graph's MIME metadata."""
+    if not isinstance(name, str) or "." not in name:
+        raise TerminalDocumentError("source_extension_missing")
+    extension = f".{name.rsplit('.', 1)[-1].strip().lower()}"
+    allowed_mimes = SUPPORTED_SOURCE_MIME_TYPES.get(extension)
+    if allowed_mimes is None:
+        raise TerminalDocumentError(f"source_extension_not_allowed:{extension}")
+    if not isinstance(graph_mime, str) or not graph_mime.strip():
+        raise TerminalDocumentError("source_mime_missing")
+    normalized_mime = graph_mime.split(";", 1)[0].strip().lower()
+    if normalized_mime not in allowed_mimes:
+        raise TerminalDocumentError(
+            f"source_mime_mismatch:{extension}:{normalized_mime}"
+        )
+    return extension
+
+
+def validate_source_signature(source_format: str, content: bytes) -> None:
+    """Reject source bytes that do not match their validated source format."""
+    if not content:
+        raise TerminalDocumentError(f"source_content_empty:{source_format}")
+    if source_format == ".pdf":
+        if not content.startswith(PDF_SIGNATURE):
+            raise TerminalDocumentError("source_signature_invalid:.pdf")
+        return
+    if source_format in {".docx", ".pptx", ".xlsx"}:
+        if not content.startswith(ZIP_SIGNATURES):
+            raise TerminalDocumentError(f"source_signature_invalid:{source_format}")
+        return
+    if source_format == ".md":
+        try:
+            content.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise TerminalDocumentError("source_signature_invalid:.md") from error
+        return
+    raise TerminalDocumentError(f"source_signature_unknown:{source_format}")
 
 
 def advance_discovery(
@@ -357,9 +435,13 @@ def advance_discovery(
             continue
         if pdfs_discovered >= limits.max_eligible_pdfs:
             raise GraphDiscoveryLimitExceeded("max_eligible_pdfs_exceeded")
-        discovered = discovered_pdf_from_item(item, pdfs_discovered)
-        if discovered.size_bytes > limits.max_pdf_bytes:
-            raise GraphDiscoveryLimitExceeded("max_pdf_bytes_exceeded")
+        try:
+            discovered = discovered_pdf_from_item(item, pdfs_discovered)
+        except TerminalDocumentError:
+            # Skip a single mislabeled/mismatched file rather than abort the whole traversal.
+            continue
+        if discovered.size_bytes > limits.max_source_bytes:
+            raise GraphDiscoveryLimitExceeded("max_source_bytes_exceeded")
         pdfs.append(discovered)
         pdfs_discovered += 1
 
@@ -544,7 +626,7 @@ def read_drive_item(
 ) -> dict[str, Any] | None:
     response = client.get(
         f"{GRAPH_ROOT}/drives/{quote(drive_id, safe='')}/items/{quote(item_id, safe='')}",
-        params={"$select": "id,name,eTag,cTag,file,folder,webUrl"},
+        params={"$select": "id,name,eTag,cTag,size,file,folder,webUrl"},
     )
     if response.status_code == 404:
         return None
@@ -916,6 +998,240 @@ def download_content_sync(
                 raise ValueError("Graph content download returned an unexpected redirect")
             dl_response.raise_for_status()
             return _read_bounded_sync(dl_response, max_bytes)
+
+
+def download_content_as_pdf_sync(
+    client: httpx.Client,
+    drive_id: str,
+    item_id: str,
+    max_bytes: int,
+    timeout_seconds: float,
+    *,
+    download_transport: httpx.BaseTransport | None = None,
+) -> bytes:
+    """Convert one drive item to PDF and download it through a trusted redirect."""
+    if max_bytes < 1:
+        raise ValueError("max_bytes must be positive")
+    if timeout_seconds <= 0:
+        raise ValueError("timeout_seconds must be positive")
+    url = (
+        f"{GRAPH_ROOT}/drives/{quote(drive_id, safe='')}/items/"
+        f"{quote(item_id, safe='')}/content?format=pdf"
+    )
+    validated_url: str | None = None
+    for attempt in range(GRAPH_PDF_MAX_ATTEMPTS):
+        retry_delay: float | None = None
+        with client.stream("GET", url, follow_redirects=False) as response:
+            if response.status_code in (301, 302, 303, 307, 308):
+                download_url = response.headers.get("location")
+                if not download_url:
+                    raise TerminalDocumentError("graph_pdf_conversion_redirect_missing")
+                validated_url = validate_download_url(download_url)
+                break
+            if response.status_code == 429 or response.status_code >= 500:
+                retry_delay = _graph_pdf_retry_delay(response, attempt)
+            elif 400 <= response.status_code < 500:
+                raise TerminalDocumentError("graph_pdf_conversion_rejected")
+            else:
+                response.raise_for_status()
+                return _validate_pdf_content(_read_bounded_sync(response, max_bytes))
+        if retry_delay is not None:
+            time.sleep(retry_delay)
+    if validated_url is None:
+        raise TimeoutError("graph_pdf_conversion_transient")
+
+    with httpx.Client(
+        timeout=timeout_seconds,
+        follow_redirects=False,
+        transport=download_transport,
+    ) as download_client:
+        for attempt in range(GRAPH_PDF_MAX_ATTEMPTS):
+            retry_delay = None
+            with download_client.stream("GET", validated_url) as download_response:
+                if download_response.is_redirect:
+                    raise TerminalDocumentError(
+                        "graph_pdf_conversion_unexpected_redirect"
+                    )
+                if (
+                    download_response.status_code == 429
+                    or download_response.status_code >= 500
+                ):
+                    retry_delay = _graph_pdf_retry_delay(download_response, attempt)
+                elif 400 <= download_response.status_code < 500:
+                    raise TerminalDocumentError(
+                        "graph_pdf_conversion_download_rejected"
+                    )
+                else:
+                    download_response.raise_for_status()
+                    return _validate_pdf_content(
+                        _read_bounded_sync(download_response, max_bytes)
+                    )
+            if retry_delay is not None:
+                time.sleep(retry_delay)
+    raise TimeoutError("graph_pdf_conversion_transient")
+
+
+def _graph_pdf_retry_delay(response: httpx.Response, attempt: int) -> float:
+    if attempt >= GRAPH_PDF_MAX_ATTEMPTS - 1:
+        raise TimeoutError("graph_pdf_conversion_transient")
+    retry_after = response.headers.get("Retry-After")
+    if retry_after is not None:
+        try:
+            delay_seconds = int(retry_after)
+        except ValueError:
+            delay_seconds = -1
+        if delay_seconds >= 0:
+            if delay_seconds > GRAPH_PDF_MAX_RETRY_DELAY_SECONDS:
+                raise TimeoutError("graph_pdf_conversion_transient")
+            return float(delay_seconds)
+    return min(
+        float(2**attempt),
+        GRAPH_PDF_MAX_RETRY_DELAY_SECONDS,
+    )
+
+
+def download_relative_content_sync(
+    client: httpx.Client,
+    drive_id: str,
+    parent_item_id: str,
+    relative_path: str,
+    max_bytes: int,
+    timeout_seconds: float,
+    *,
+    download_transport: httpx.BaseTransport | None = None,
+) -> bytes:
+    """Download one local path relative to a known folder drive item."""
+    if max_bytes < 1:
+        raise ValueError("max_bytes must be positive")
+    if timeout_seconds <= 0:
+        raise ValueError("timeout_seconds must be positive")
+    image = resolve_relative_markdown_image_sync(
+        client,
+        drive_id,
+        parent_item_id,
+        relative_path,
+        max_bytes,
+    )
+    url = (
+        f"{GRAPH_ROOT}/drives/{quote(drive_id, safe='')}/items/"
+        f"{quote(image.item_id, safe='')}/content"
+    )
+    with client.stream("GET", url, follow_redirects=False) as response:
+        if response.status_code in (301, 302, 303, 307, 308):
+            download_url = response.headers.get("location")
+            if not download_url:
+                raise TerminalDocumentError("graph_asset_redirect_missing")
+            validated_url = validate_download_url(download_url)
+        elif response.status_code == 429 or response.status_code >= 500:
+            raise TimeoutError("graph_asset_download_transient")
+        elif 400 <= response.status_code < 500:
+            raise TerminalDocumentError("graph_asset_download_rejected")
+        else:
+            response.raise_for_status()
+            return _read_bounded_sync(response, max_bytes)
+
+    with httpx.Client(
+        timeout=timeout_seconds,
+        follow_redirects=False,
+        transport=download_transport,
+    ) as download_client:
+        with download_client.stream("GET", validated_url) as download_response:
+            if download_response.is_redirect:
+                raise TerminalDocumentError("graph_asset_unexpected_redirect")
+            if download_response.status_code == 429 or download_response.status_code >= 500:
+                raise TimeoutError("graph_asset_download_transient")
+            if 400 <= download_response.status_code < 500:
+                raise TerminalDocumentError("graph_asset_download_rejected")
+            download_response.raise_for_status()
+            return _read_bounded_sync(download_response, max_bytes)
+
+
+def resolve_relative_markdown_image_sync(
+    client: httpx.Client,
+    drive_id: str,
+    parent_item_id: str,
+    relative_path: str,
+    max_bytes: int,
+) -> ResolvedMarkdownImage:
+    """Resolve and validate one parent-relative Markdown PNG without reading bytes."""
+    if max_bytes < 1:
+        raise ValueError("max_bytes must be positive")
+    encoded_path = _encode_relative_drive_path(relative_path)
+    item_url = (
+        f"{GRAPH_ROOT}/drives/{quote(drive_id, safe='')}/items/"
+        f"{quote(parent_item_id, safe='')}:/{encoded_path}:"
+    )
+    metadata_response = client.get(
+        item_url,
+        params={"$select": "id,name,eTag,size,file"},
+    )
+    if metadata_response.status_code == 429 or metadata_response.status_code >= 500:
+        raise TimeoutError("graph_asset_metadata_transient")
+    if 400 <= metadata_response.status_code < 500:
+        raise TerminalDocumentError("graph_asset_metadata_rejected")
+    metadata_response.raise_for_status()
+    try:
+        item = metadata_response.json()
+    except ValueError as error:
+        raise TerminalDocumentError("graph_asset_metadata_invalid") from error
+    return _validate_markdown_image_metadata(relative_path, item, max_bytes)
+
+
+def _encode_relative_drive_path(value: str) -> str:
+    if not isinstance(value, str) or not value or value != value.strip():
+        raise TerminalDocumentError("markdown_image_path_invalid")
+    parsed = urlsplit(value)
+    if parsed.scheme or parsed.netloc or parsed.query or parsed.fragment:
+        raise TerminalDocumentError("markdown_image_path_not_local")
+    try:
+        decoded = unquote_to_bytes(parsed.path).decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise TerminalDocumentError("markdown_image_path_invalid") from error
+    if decoded.startswith(("/", "\\")) or "\\" in decoded:
+        raise TerminalDocumentError("markdown_image_path_not_local")
+    segments = decoded.split("/")
+    if not segments or any(segment in {"", ".", ".."} for segment in segments):
+        raise TerminalDocumentError("markdown_image_path_not_local")
+    return "/".join(quote(segment, safe="!$&'()*+,;=@-._~") for segment in segments)
+
+
+def _validate_markdown_image_metadata(
+    relative_path: str,
+    item: Any,
+    max_bytes: int,
+) -> ResolvedMarkdownImage:
+    if not isinstance(item, dict):
+        raise TerminalDocumentError("graph_asset_metadata_invalid")
+    expected_name = unquote(urlsplit(relative_path).path).rsplit("/", 1)[-1]
+    item_id = item.get("id")
+    name = item.get("name")
+    e_tag = item.get("eTag")
+    size = item.get("size")
+    file_metadata = item.get("file")
+    mime_type = file_metadata.get("mimeType") if isinstance(file_metadata, dict) else None
+    if not isinstance(name, str) or name != expected_name or not name.lower().endswith(".png"):
+        raise TerminalDocumentError("markdown_image_extension_not_allowed")
+    if not isinstance(mime_type, str) or mime_type.lower() != MARKDOWN_IMAGE_MIME_TYPE:
+        raise TerminalDocumentError("markdown_image_mime_not_allowed")
+    if not isinstance(item_id, str) or not item_id or not isinstance(e_tag, str) or not e_tag:
+        raise TerminalDocumentError("graph_asset_metadata_invalid")
+    if isinstance(size, bool) or not isinstance(size, int) or size < 1:
+        raise TerminalDocumentError("markdown_image_size_invalid")
+    if size > max_bytes:
+        raise TerminalDocumentError("vision_image_too_large")
+    return ResolvedMarkdownImage(
+        item_id=item_id,
+        name=name,
+        e_tag=e_tag,
+        size_bytes=size,
+        mime_type=MARKDOWN_IMAGE_MIME_TYPE,
+    )
+
+
+def _validate_pdf_content(content: bytes) -> bytes:
+    if not content.startswith(PDF_SIGNATURE):
+        raise TerminalDocumentError("graph_pdf_conversion_invalid_content")
+    return content
 
 
 def _read_bounded_sync(response: httpx.Response, max_bytes: int) -> bytes:

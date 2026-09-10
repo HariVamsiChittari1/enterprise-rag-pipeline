@@ -34,10 +34,13 @@ param retrievalConfigContainerName string
 @description('Deployment instance partition key')
 param deploymentInstanceId string
 
-@description('Reviewed immutable catalog digest')
-@minLength(71)
+@description('Reviewed seed digest; used only for explicit initialization')
 @maxLength(71)
-param catalogDigest string
+param catalogDigest string = ''
+
+@description('Private catalog operation')
+@allowed(['publish-catalog', 'verify-catalog'])
+param catalogOperation string = 'verify-catalog'
 
 @description('Resource tags')
 param tags object = {}
@@ -76,7 +79,7 @@ resource job 'Microsoft.App/jobs@2024-03-01' = {
           name: 'catalog-publisher'
           image: imageReference
           command: ['python']
-          args: ['-m', 'retrieval.operations', 'publish-catalog']
+          args: ['-m', 'retrieval.operations', catalogOperation]
           resources: {
             cpu: json('0.25')
             memory: '0.5Gi'
@@ -86,7 +89,7 @@ resource job 'Microsoft.App/jobs@2024-03-01' = {
             { name: 'COSMOS_DATABASE', value: cosmosDatabaseName }
             { name: 'RETRIEVAL_CONFIG_CONTAINER', value: retrievalConfigContainerName }
             { name: 'DEPLOYMENT_INSTANCE_ID', value: deploymentInstanceId }
-            { name: 'EXPECTED_CATALOG_DIGEST', value: catalogDigest }
+            { name: 'EXPECTED_CATALOG_DIGEST', value: catalogOperation == 'publish-catalog' ? catalogDigest : '' }
             { name: 'MANAGED_IDENTITY_CLIENT_ID', value: managedIdentityClientId }
           ]
         }

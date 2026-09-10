@@ -12,11 +12,14 @@ import ingestion.repository as repository_module
 from azure.core import MatchConditions
 
 from ingestion.models import (
+    ContentModality,
     DocumentStage,
     DocumentStatus,
     IngestionRunRecord,
     EnrichmentStatuses,
     Entity,
+    ExtractionProvenance,
+    LocatorKind,
     ModuleStatus,
     ProfileSnapshot,
     RunCounters,
@@ -26,13 +29,20 @@ from ingestion.models import (
     SearchChunkRecord,
     SourceControlRecord,
     SourceDocumentRecord,
+    SourceLocator,
+    VisualDisposition,
+    VisualCoverageStatus,
+    VisualManifestEntry,
+    VisualRelevance,
     content_sha256,
     create_chunk_id,
     create_document_id,
     create_document_key,
     create_source_run_id,
+    create_visual_manifest_pages,
     run_record_id,
     serialized_size_bytes,
+    visual_manifest_hash,
 )
 from ingestion.repository import (
     IngestionRepository,
@@ -206,6 +216,7 @@ class StatefulContainer(PointReadContainer):
             ("documentKey", "@documentKey"),
             ("sourceRunId", "@sourceRunId"),
             ("status", "@status"),
+            ("recordType", "@recordType"),
         ):
             if parameter in parameter_values:
                 rows = [row for row in rows if row.get(field) == parameter_values[parameter]]
@@ -592,6 +603,51 @@ def test_ready_verification_rejects_missing_and_extra_chunks() -> None:
         repository.verify_and_mark_document_ready(ready, admitting.etag)
 
 
+def test_manifest_write_is_idempotent_and_required_for_admission() -> None:
+    documents = StatefulContainer("sourceRunId")
+    chunks = StatefulContainer("documentKey")
+    repository = IngestionRepository(StatefulContainer("sourceId"), documents, chunks)
+    processing = create_processing_document(repository)
+    pages = build_manifest_pages(processing.record)
+    bound_document = replace(
+        processing.record,
+        visual_manifest_page_count=len(pages),
+        visual_manifest_hash=visual_manifest_hash(pages),
+    )
+    bound = repository.update_processing_document(bound_document, processing.etag)
+
+    assert repository.write_visual_manifest_pages(pages) == len(pages)
+    assert repository.write_visual_manifest_pages(pages) == len(pages)
+
+    repository.write_chunks(build_chunks(1, is_retrievable=True))
+    admitting = begin_admission(repository, bound, 1)
+    ready = repository.verify_and_mark_document_ready(
+        build_ready_document(admitting.record, 1),
+        admitting.etag,
+    )
+
+    assert ready.record.status is DocumentStatus.READY
+
+
+def test_admission_rejects_missing_manifest_page() -> None:
+    repository = IngestionRepository(
+        StatefulContainer("sourceId"),
+        StatefulContainer("sourceRunId"),
+        StatefulContainer("documentKey"),
+    )
+    processing = create_processing_document(repository)
+    pages = build_manifest_pages(processing.record)
+    bound_document = replace(
+        processing.record,
+        visual_manifest_page_count=len(pages),
+        visual_manifest_hash=visual_manifest_hash(pages),
+    )
+    bound = repository.update_processing_document(bound_document, processing.etag)
+
+    with pytest.raises(RepositoryConflictError, match="missing manifest pages"):
+        begin_admission(repository, bound, 0)
+
+
 def test_ready_verification_consumes_every_projected_page_without_point_reads(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -918,6 +974,8 @@ def test_queries_are_projected_parameterized_partitioned_and_resumable() -> None
     repository.activate_run(build_run("run-a", UTC), build_control("run-a", UTC))
     for index in range(3):
         repository.create_discovered_document(build_document(item_id=f"item-{index}"))
+    manifest = build_manifest_pages(build_document(item_id="item-0"))[0]
+    documents._store(manifest.to_cosmos_item())
 
     first = repository.list_document_page("source:run-a", page_size=2)
     second = repository.list_document_page(
@@ -938,7 +996,8 @@ def test_queries_are_projected_parameterized_partitioned_and_resumable() -> None
         assert call["partition_key"] in ("source:run-a", "source")
         assert 0 < call["max_item_count"] <= 100
     assert documents.query_calls[0]["parameters"] == [
-        {"name": "@sourceRunId", "value": "source:run-a"}
+        {"name": "@sourceRunId", "value": "source:run-a"},
+        {"name": "@recordType", "value": "source_document"},
     ]
 
 
@@ -966,6 +1025,7 @@ def test_bounded_cleanup_never_deletes_the_current_run() -> None:
     old_document = build_document(run_id="run-a")
     repository.create_discovered_document(old_document)
     repository.write_chunks(build_chunks(3, document=old_document))
+    repository.write_visual_manifest_pages(build_manifest_pages(old_document))
     later = "2026-08-05T12:01:00Z"
     repository.activate_run(build_run("run-b", later), build_control("run-b", later))
 
@@ -1042,11 +1102,16 @@ def test_services_finalize_marks_completed_with_errors_when_documents_failed() -
         cosmos_source_documents_container="source-documents",
         cosmos_search_chunks_container="search-chunks",
         document_intelligence_endpoint="https://di.example",
+        content_understanding_endpoint="https://cu.example",
+        content_understanding_analyzer_id="rag-document-search-v1",
         language_endpoint="https://lang.example", openai_endpoint="https://openai.example",
+        vision_deployment="gpt-5.4",
         managed_identity_client_id="mi",
         chunk_max_tokens=800, chunk_overlap_tokens=100, acl_max_pages=10,
         download_timeout_seconds=120.0, delta_max_pages=200, embedding_batch_size=100,
-        max_pdf_pages=500, query_proxy_timeout_seconds=30.0,
+        max_pdf_pages=500, vision_max_output_tokens=400,
+        vision_max_image_bytes=2 * 1024 * 1024, vision_max_figures=60,
+        query_proxy_timeout_seconds=30.0,
         sharepoint_site_url="",
     )
 
@@ -1059,7 +1124,7 @@ def test_services_finalize_marks_completed_with_errors_when_documents_failed() -
 def test_repository_exposes_no_forbidden_api_or_terminology() -> None:
     source = inspect.getsource(repository_module).lower()
 
-    for forbidden in ("lease", "fence", "manifest", "delta", "checkpoint", "patch_item", "upsert_item"):
+    for forbidden in ("lease", "fence", "delta", "checkpoint", "patch_item", "upsert_item"):
         assert forbidden not in source
 
 
@@ -1176,9 +1241,35 @@ def begin_admission(
             stage=DocumentStage.VERIFYING,
             expected_chunk_count=count,
             written_chunk_count=count,
+            visual_manifest_page_count=(
+                processing.record.visual_manifest_page_count
+                if processing.record.visual_manifest_page_count is not None
+                else 0
+            ),
+            visual_manifest_hash=(
+                processing.record.visual_manifest_hash
+                if processing.record.visual_manifest_hash is not None
+                else visual_manifest_hash(())
+            ),
         ),
         processing.etag,
     )
+
+
+def build_manifest_pages(document: SourceDocumentRecord) -> tuple[Any, ...]:
+    entries = (
+        VisualManifestEntry(
+            ordinal=0,
+            visual_id="figure-1",
+            object_type="figure",
+            source_locator=SourceLocator(LocatorKind.PAGE, "Page 1", 1, 1),
+            relevance=VisualRelevance.REQUIRED,
+            disposition=VisualDisposition.DESCRIBED,
+            description="A chart with a rising series.",
+            provenance=(ExtractionProvenance.DIRECT,),
+        ),
+    )
+    return create_visual_manifest_pages(document, entries)
 
 
 def build_chunks(
@@ -1203,6 +1294,13 @@ def build_chunks(
                 page_start=1,
                 page_end=1,
                 section_path=("Heading",),
+                locator_kind=LocatorKind.PAGE,
+                locator_label="Page 1",
+                locator_ordinal_start=1,
+                locator_ordinal_end=1,
+                modalities=(ContentModality.TEXT,),
+                provenance=(ExtractionProvenance.DIRECT,),
+                visual_coverage=VisualCoverageStatus.NOT_REQUIRED,
                 chunk_index=index,
                 created_at=UTC,
                 content=content,

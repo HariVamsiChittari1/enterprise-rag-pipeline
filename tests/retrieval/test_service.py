@@ -1,25 +1,104 @@
 from __future__ import annotations
 
+from dataclasses import replace
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 
 from retrieval.auth import Principal
-from retrieval.cosmos import RetrievalMode, RetrievedChunk
+from retrieval.catalog import RuntimeCatalogSnapshot, load_catalog_item
+from retrieval.cosmos import (
+    RetrievalLocatorKind,
+    RetrievalMode,
+    RetrievedChunk as _RetrievedChunk,
+    SecureCosmosRetriever,
+)
 from retrieval.cosmos_registry import CosmosRegistry
 from retrieval.pipeline import RetrievalDependencyError
 from retrieval.service import RagService
+
+
+def RetrievedChunk(
+    chunk_id: str,
+    document_id: str,
+    content: str,
+    source_name: str,
+    source_url: str,
+    page_number: int,
+    source_modified_at: str | None = None,
+) -> _RetrievedChunk:
+    return _RetrievedChunk(
+        chunk_id=chunk_id,
+        document_id=document_id,
+        content=content,
+        source_name=source_name,
+        source_url=source_url,
+        locator_kind=RetrievalLocatorKind.PAGE,
+        locator_label=f"Page {page_number}",
+        locator_ordinal_start=page_number,
+        locator_ordinal_end=page_number,
+        source_modified_at=source_modified_at,
+    )
 
 
 def _registry(retriever) -> CosmosRegistry:
     return CosmosRegistry({"source": retriever})
 
 
+def _provider(**values) -> SimpleNamespace:
+    snapshot = RuntimeCatalogSnapshot(
+        deployment_instance_id="test", catalog_id="runtime-catalog", etag="etag-a",
+        digest="sha256:" + "a" * 64, operation_id="operation-a",
+        changed_at="2026-09-08T00:00:00Z", accepted_at=datetime(2026, 9, 8, tzinfo=timezone.utc),
+        over_fetch_factor=1, hybrid_weights=(1, 1), full_text_score_scope="Global",
+        default_profile=None, profiles={}, synonym_maps={}, synonym_expanders={},
+    )
+    return SimpleNamespace(snapshot=replace(snapshot, **values))
+
+
 def completion(content: str) -> SimpleNamespace:
     return SimpleNamespace(
         choices=[SimpleNamespace(message=SimpleNamespace(content=content))]
     )
+
+
+def test_given_raw_integral_float_catalog_when_searching_then_integer_budget_is_used() -> None:
+    item = {
+        "id": "runtime-catalog", "type": "retrieval-runtime-catalog",
+        "deploymentInstanceId": "test", "_etag": "etag-a",
+        "change": {
+            "operationId": "b14c1a67-9fc4-4e78-a818-e5951473d15b",
+            "changedAt": "2026-09-08T00:00:00Z", "reason": "Numeric regression",
+        },
+        "config": {
+            "retrieval": {
+                "overFetchFactor": 3.0, "hybridWeights": {"vector": 1, "text": 1},
+                "fullTextScoreScope": "Global",
+            },
+            "defaultProfile": "plain", "profiles": [{"name": "plain"}], "synonymMaps": [],
+        },
+    }
+    snapshot = load_catalog_item(item)
+    chunks = Mock()
+    chunks.query_items.return_value = []
+    retriever = SecureCosmosRetriever(chunks, Mock())
+    service = RagService(
+        Mock(), _registry(retriever), "embedding", "chat",
+        catalog_provider=SimpleNamespace(snapshot=snapshot),
+    )
+    try:
+        result = service.search(
+            "question", ["question"], Principal("user", "tenant", frozenset({"group"})),
+            mode=RetrievalMode.FULL_TEXT,
+        )
+        assert result.chunks == ()
+        assert type(snapshot.over_fetch_factor) is int
+        assert type(chunks.query_items.call_args.kwargs["parameters"][0]["value"]) is int
+        assert type(item["config"]["retrieval"]["overFetchFactor"]) is float
+    finally:
+        service.close()
 
 
 def test_service_bounds_planned_queries_and_evidence() -> None:
@@ -37,7 +116,7 @@ def test_service_bounds_planned_queries_and_evidence() -> None:
         [RetrievedChunk("1", "doc", "a", "a.pdf", "https://sp.com/a.pdf", 1), RetrievedChunk("2", "doc", "b", "b.pdf", "https://sp.com/b.pdf", 2)],
         [],
     ]
-    service = RagService(client, _registry(retriever), "embedding", "chat")
+    service = RagService(client, _registry(retriever), "embedding", "chat", catalog_provider=_provider())
 
     result = service.answer(
         "follow up",
@@ -50,6 +129,68 @@ def test_service_bounds_planned_queries_and_evidence() -> None:
     assert len(result["citations"]) == 2
 
 
+def test_given_reload_during_planning_when_answered_then_original_policy_is_used() -> None:
+    provider = _provider()
+    original = provider.snapshot
+    client = Mock()
+
+    def plan(**kwargs):
+        provider.snapshot = replace(
+            original, etag="etag-b", operation_id="operation-b",
+            hybrid_weights=(7, 3), full_text_score_scope="Local",
+        )
+        return completion('{"queries":["question"]}')
+
+    client.chat.completions.create.side_effect = plan
+    client.embeddings.create.return_value = SimpleNamespace(
+        data=[SimpleNamespace(embedding=[0.0] * 3072)],
+    )
+    retriever = Mock()
+    retriever.retrieve.return_value = []
+    service = RagService(client, _registry(retriever), "embedding", "chat", catalog_provider=provider)
+    try:
+        result = service.answer("question", Principal("user", "tenant", frozenset({"group"})))
+        assert provider.snapshot.etag == "etag-b"
+        assert retriever.retrieve.call_args.kwargs["rrf_weights"] == original.hybrid_weights
+        assert retriever.retrieve.call_args.kwargs["full_text_score_scope"] == original.full_text_score_scope
+        assert result["policy"]["catalog_etag"] == "etag-a"
+        assert result["policy"]["catalog_operation_id"] == "operation-a"
+    finally:
+        service.close()
+
+
+def test_service_uses_typed_office_locator_in_answer_evidence() -> None:
+    client = Mock()
+    client.chat.completions.create.return_value = completion("Grounded [S1].")
+    client.embeddings.create.return_value = SimpleNamespace(
+        data=[SimpleNamespace(embedding=[0.0] * 3072)]
+    )
+    retriever = Mock()
+    retriever.retrieve.return_value = [
+        _RetrievedChunk(
+            "1",
+            "doc",
+            "Quarterly revenue increased.",
+            "results.pptx",
+            "https://sp.com/results.pptx",
+            RetrievalLocatorKind.SLIDE,
+            "Slide 7",
+            7,
+            7,
+        )
+    ]
+
+    RagService(client, _registry(retriever), "embedding", "chat", catalog_provider=_provider()).answer_with_queries(
+        "What changed?",
+        ["quarterly change"],
+        Principal("user", "tenant", frozenset({"group"})),
+    )
+
+    evidence_prompt = client.chat.completions.create.call_args.kwargs["messages"][1]["content"]
+    assert "[S1] results.pptx, Slide 7" in evidence_prompt
+    assert "page 7" not in evidence_prompt
+
+
 def test_service_does_not_call_answer_model_without_evidence() -> None:
     client = Mock()
     client.chat.completions.create.return_value = completion('{"queries":["question"]}')
@@ -59,7 +200,7 @@ def test_service_does_not_call_answer_model_without_evidence() -> None:
     retriever = Mock()
     retriever.retrieve.return_value = []
 
-    result = RagService(client, _registry(retriever), "embedding", "chat").answer(
+    result = RagService(client, _registry(retriever), "embedding", "chat", catalog_provider=_provider()).answer(
         "question",
         Principal("user", "tenant", frozenset({"group"})),
     )
@@ -78,7 +219,7 @@ def test_service_raises_dependency_error_when_every_retrieval_task_fails() -> No
     retriever.retrieve.side_effect = RuntimeError("cosmos unavailable")
 
     with pytest.raises(RetrievalDependencyError, match="retrieval_dependency_unavailable"):
-        RagService(client, _registry(retriever), "embedding", "chat").answer(
+        RagService(client, _registry(retriever), "embedding", "chat", catalog_provider=_provider()).answer(
             "question", Principal("user", "tenant", frozenset({"group"})),
         )
 
@@ -89,7 +230,7 @@ def test_full_text_mode_does_not_create_embedding() -> None:
     retriever = Mock()
     retriever.retrieve.return_value = []
 
-    RagService(client, _registry(retriever), "embedding", "chat").answer(
+    RagService(client, _registry(retriever), "embedding", "chat", catalog_provider=_provider()).answer(
         "question",
         Principal("user", "tenant", frozenset({"group"})),
         mode=RetrievalMode.FULL_TEXT,
@@ -112,7 +253,7 @@ def test_usage_is_tracked_for_embedding_and_generation_calls() -> None:
     retriever = Mock()
     retriever.retrieve.return_value = [RetrievedChunk("1", "doc", "a", "a.pdf", "https://sp.com/a.pdf", 1)]
 
-    result = RagService(client, _registry(retriever), "embedding", "chat").answer(
+    result = RagService(client, _registry(retriever), "embedding", "chat", catalog_provider=_provider()).answer(
         "question",
         Principal("user", "tenant", frozenset({"group"})),
     )
@@ -137,7 +278,7 @@ def test_usage_is_returned_even_without_evidence() -> None:
     retriever = Mock()
     retriever.retrieve.return_value = []
 
-    result = RagService(client, _registry(retriever), "embedding", "chat").answer(
+    result = RagService(client, _registry(retriever), "embedding", "chat", catalog_provider=_provider()).answer(
         "question",
         Principal("user", "tenant", frozenset({"group"})),
     )
@@ -172,6 +313,7 @@ def test_slow_retrieval_query_is_dropped_after_timeout_budget() -> None:
         client, _registry(retriever), "embedding", "chat",
         retrieval_timeout_seconds=0.05,
         generation_timeout_seconds=1.0,
+        catalog_provider=_provider(),
     )
 
     result = service.answer(
@@ -190,7 +332,7 @@ def test_plan_queries_returns_single_for_simple_question() -> None:
     client = Mock()
     client.chat.completions.create.return_value = completion('{"queries":["What is RAG?"]}')
     retriever = Mock()
-    service = RagService(client, _registry(retriever), "embedding", "chat")
+    service = RagService(client, _registry(retriever), "embedding", "chat", catalog_provider=_provider())
 
     queries, usage = service.plan_queries("What is RAG?")
 
@@ -204,7 +346,7 @@ def test_plan_queries_decomposes_complex_question() -> None:
         '{"queries":["security policy details","data governance policy details"]}'
     )
     retriever = Mock()
-    service = RagService(client, _registry(retriever), "embedding", "chat")
+    service = RagService(client, _registry(retriever), "embedding", "chat", catalog_provider=_provider())
 
     queries, usage = service.plan_queries(
         "Compare our security policy with our data governance policy"
@@ -218,7 +360,7 @@ def test_plan_queries_uses_history_as_context() -> None:
     client = Mock()
     client.chat.completions.create.return_value = completion('{"queries":["standalone question"]}')
     retriever = Mock()
-    service = RagService(client, _registry(retriever), "embedding", "chat")
+    service = RagService(client, _registry(retriever), "embedding", "chat", catalog_provider=_provider())
 
     queries, _ = service.plan_queries(
         "Tell me more about that",
@@ -268,7 +410,7 @@ def test_service_omitting_scoring_profile_preserves_current_top_k_order() -> Non
         RetrievedChunk("b", "doc2", "b", "b.pdf", "https://sp.com/b.pdf", 2),
     ]
 
-    result = RagService(client, _registry(retriever), "embedding", "chat").answer(
+    result = RagService(client, _registry(retriever), "embedding", "chat", catalog_provider=_provider()).answer(
         "q", Principal("user", "tenant", frozenset({"group"}))
     )
 
@@ -314,8 +456,7 @@ def test_service_with_scoring_profile_uses_over_fetch_and_reranks_by_freshness()
     )
     service = RagService(
         client, _registry(retriever), "embedding", "chat",
-        scoring_profiles={"fresh": profile},
-        over_fetch_factor=5,
+        catalog_provider=_provider(profiles={"fresh": profile}, over_fetch_factor=5),
     )
 
     result = service.answer(
@@ -337,7 +478,7 @@ def test_service_rejects_unknown_scoring_profile_name() -> None:
     retriever = Mock()
     service = RagService(
         client, _registry(retriever), "embedding", "chat",
-        scoring_profiles={"fresh": ScoringProfile(name="fresh")},
+        catalog_provider=_provider(profiles={"fresh": ScoringProfile(name="fresh")}),
     )
     with pytest.raises(UnknownScoringProfileError, match="unknown_scoring_profile"):
         service.answer(
@@ -370,7 +511,7 @@ def test_service_bounds_candidate_pool_across_sub_queries() -> None:
     profile = ScoringProfile(name="p")
     service = RagService(
         client, _registry(retriever), "embedding", "chat",
-        scoring_profiles={"p": profile}, over_fetch_factor=5,
+        catalog_provider=_provider(profiles={"p": profile}, over_fetch_factor=5),
     )
 
     result = service.answer(
@@ -413,7 +554,7 @@ def test_service_keeps_same_chunk_ordinal_from_different_documents() -> None:
         _registry(retriever),
         "embedding",
         "chat",
-        scoring_profiles={"p": ScoringProfile(name="p")},
+        catalog_provider=_provider(profiles={"p": ScoringProfile(name="p")}),
     ).answer(
         "q", Principal("user", "tenant", frozenset({"group"})), scoring_profile="p",
     )
@@ -437,8 +578,7 @@ def test_service_passes_rrf_weights_and_score_scope_from_config() -> None:
 
     RagService(
         client, _registry(retriever), "embedding", "chat",
-        full_text_score_scope="Local",
-        hybrid_rrf_weights=(3.0, 1.0),
+        catalog_provider=_provider(full_text_score_scope="Local", hybrid_weights=(3.0, 1.0)),
     ).answer("q", Principal("user", "tenant", frozenset({"group"})))
 
     kwargs = retriever.retrieve.call_args.kwargs
@@ -446,7 +586,7 @@ def test_service_passes_rrf_weights_and_score_scope_from_config() -> None:
     assert kwargs["rrf_weights"] == (3.0, 1.0)
 
 
-# --- Phase 2b: 3-level synonym enablement truth table ----------------------------
+# --- Profile-referenced synonym selection -------------------------------------
 
 from retrieval.synonyms import SynonymExpander, SynonymMap
 
@@ -508,7 +648,7 @@ def test_retrieve_rankings_returns_reranked_chunks_without_answer_generation() -
     )
     service = RagService(
         client, _registry(retriever), "embedding", "chat",
-        scoring_profiles={"fresh": profile},
+        catalog_provider=_provider(profiles={"fresh": profile}),
     )
 
     chunks = service.retrieve_rankings(
@@ -528,7 +668,7 @@ def test_retrieve_rankings_rejects_naive_evaluation_as_of() -> None:
     retriever = Mock()
     service = RagService(
         client, _registry(retriever), "embedding", "chat",
-        scoring_profiles={"p": ScoringProfile(name="p")},
+        catalog_provider=_provider(profiles={"p": ScoringProfile(name="p")}),
     )
     with pytest.raises(ValueError, match="timezone_aware"):
         service.retrieve_rankings(
@@ -584,7 +724,7 @@ def test_retrieve_evaluation_pool_reuses_pool_across_multiple_profiles() -> None
     )
     service = RagService(
         client, _registry(retriever), "embedding", "chat",
-        scoring_profiles={"baseline": baseline, "candidate": candidate_profile},
+        catalog_provider=_provider(profiles={"baseline": baseline, "candidate": candidate_profile}),
     )
 
     pool = service.retrieve_evaluation_pool(
@@ -604,7 +744,7 @@ def test_retrieve_evaluation_pool_reuses_pool_across_multiple_profiles() -> None
 def test_retrieve_evaluation_pool_requires_explicit_profile_name() -> None:
     client = Mock()
     retriever = Mock()
-    service = RagService(client, _registry(retriever), "embedding", "chat")
+    service = RagService(client, _registry(retriever), "embedding", "chat", catalog_provider=_provider())
     with pytest.raises(UnknownScoringProfileError):
         service.retrieve_evaluation_pool(
             "q", ["q"], Principal("user", "tenant", frozenset({"group"})),
@@ -625,7 +765,7 @@ def test_retrieve_evaluation_pool_fails_closed_when_all_retrievals_fail() -> Non
     profile = ScoringProfile(name="p")
     service = RagService(
         client, _registry(retriever), "embedding", "chat",
-        scoring_profiles={"p": profile},
+        catalog_provider=_provider(profiles={"p": profile}),
     )
     with pytest.raises(RetrievalDependencyError):
         service.retrieve_evaluation_pool(
@@ -645,7 +785,7 @@ def test_retrieve_evaluation_pool_passes_acl_ids_unchanged() -> None:
     profile = ScoringProfile(name="p")
     service = RagService(
         client, _registry(retriever), "embedding", "chat",
-        scoring_profiles={"p": profile},
+        catalog_provider=_provider(profiles={"p": profile}),
     )
     principal = Principal("user", "tenant", frozenset({"g1", "g2", "g3"}))
     service.retrieve_evaluation_pool(
@@ -680,7 +820,7 @@ def test_evaluation_pool_snapshot_is_independent_of_source_mutations() -> None:
     profile = ScoringProfile(name="p")
     service = RagService(
         client, _registry(retriever), "embedding", "chat",
-        scoring_profiles={"p": profile},
+        catalog_provider=_provider(profiles={"p": profile}),
     )
     pool = service.retrieve_evaluation_pool(
         "q", ["q"], Principal("u", "t", frozenset({"g"})),
@@ -702,16 +842,13 @@ def _service_with_expander(
     client,
     *,
     profile: ScoringProfile | None = None,
-    synonyms_enabled: bool = True,
     map_registered: bool = True,
 ) -> RagService:
     profiles = {profile.name: profile} if profile else {}
     expanders = {"geo": _fresh_expander()} if map_registered else {}
     return RagService(
         client, _registry(retriever), "embedding", "chat",
-        scoring_profiles=profiles,
-        synonym_expanders=expanders,
-        synonyms_enabled=synonyms_enabled,
+        catalog_provider=_provider(profiles=profiles, synonym_expanders=expanders),
     )
 
 
@@ -727,13 +864,13 @@ def _mock_openai(retriever_returns) -> Mock:
     return client
 
 
-def test_synonym_disabled_at_deploy_never_calls_expander() -> None:
+def test_given_removed_map_reference_when_request_opts_in_then_expansion_stays_off() -> None:
     retriever = _make_retriever_for_profile_path()
     client = _mock_openai(retriever.retrieve.return_value)
 
-    profile = _profile_with_synonym_map("p", "geo")
+    profile = _profile_with_synonym_map("p", None)
     _service_with_expander(
-        retriever, client, profile=profile, synonyms_enabled=False,
+        retriever, client, profile=profile,
     ).answer(
         "dog policy",
         Principal("u", "t", frozenset({"g"})),

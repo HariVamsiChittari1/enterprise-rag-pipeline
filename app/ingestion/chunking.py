@@ -7,7 +7,7 @@ import re
 import tiktoken
 
 from ingestion.errors import TerminalDocumentError
-from ingestion.models import Chunk, Page
+from ingestion.models import Chunk, LocatorKind, Page, SourceLocator
 
 DEFAULT_MAX_TOKENS = 800
 DEFAULT_OVERLAP_TOKENS = 100
@@ -33,6 +33,12 @@ def chunk_pages(
     step = max_tokens - overlap_tokens
 
     for page in pages:
+        locator = page.locator or SourceLocator(
+            kind=LocatorKind.PAGE,
+            label=f"Page {page.number}",
+            ordinal_start=page.number,
+            ordinal_end=page.number,
+        )
         segments = _page_segments(page.text)
         merged = _merge_small_segments(segments, encoding)
         for segment in merged:
@@ -43,7 +49,17 @@ def chunk_pages(
                     break
                 text = encoding.decode(token_slice).strip()
                 if text:
-                    chunks.append(Chunk(ordinal=len(chunks), page_number=page.number, content=text))
+                    chunks.append(
+                        Chunk(
+                            ordinal=len(chunks),
+                            page_number=page.number,
+                            content=text,
+                            locator=locator,
+                            modalities=page.modalities,
+                            provenance=page.provenance,
+                            visual_coverage=page.visual_coverage,
+                        )
+                    )
                     if len(chunks) > MAX_CHUNKS_PER_DOCUMENT:
                         raise TerminalDocumentError("chunking_limit_exceeded")
                 if offset + max_tokens >= len(tokens):

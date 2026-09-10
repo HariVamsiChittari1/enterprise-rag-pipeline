@@ -6,7 +6,6 @@ from retrieval.config_loader import (
     ConfigLoaderError,
     load_scoring_profiles,
     load_synonym_maps,
-    redact_catalog,
     validate_profile_synonym_map_references,
 )
 from retrieval.synonyms import SynonymMap
@@ -49,15 +48,12 @@ def _valid_synonym_payload() -> dict:
     }
 
 
-def test_valid_scoring_profile_config_loads_and_redacts_safely() -> None:
+def test_valid_scoring_profile_config_loads() -> None:
     profiles = load_scoring_profiles(_valid_profile_payload())
     assert set(profiles.keys()) == {"fresh"}
     fresh = profiles["fresh"]
     assert fresh.text_weights == {"sourceName": 2.0}
     assert fresh.functions[0].type == "freshness"
-    assert redact_catalog(profiles) == [
-        {"name": "fresh", "weights": ["sourceName"], "functions": ["freshness"]}
-    ]
 
 
 def test_scoring_profile_loader_rejects_unknown_function_type() -> None:

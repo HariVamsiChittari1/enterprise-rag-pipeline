@@ -8,9 +8,12 @@ from datetime import datetime
 from typing import Annotated, Any
 
 from retrieval.auth import Principal
+from retrieval.catalog import RequestPolicy
 from retrieval.cosmos import RetrievalMode, RetrievedChunk
 from retrieval.pipeline import (
     citation_label,
+    citation_source,
+    citation_url,
     evidence_identity,
 )
 from retrieval.service import RagService, _sanitize_chunk
@@ -28,12 +31,14 @@ def make_search_tool(
     forced_mode: RetrievalMode | None = None,
     now: datetime | None = None,
     deadline_monotonic: float | None = None,
+    policy: RequestPolicy | None = None,
 ):
     """Create a search tool closure bound to the caller's ACL.
 
     RagService owns retrieval behavior. This adapter only applies the agent's cumulative
     evidence cap, stable citation labels, usage forwarding, and tool-text formatting.
     """
+    policy = policy or rag_service.capture_policy(scoring_profile, expand_synonyms)
 
     async def search_knowledge_base(
         query: Annotated[str, "Search query describing what information to find"],
@@ -66,6 +71,7 @@ def make_search_tool(
             scoring_profile=scoring_profile,
             expand_synonyms=expand_synonyms,
             now=now,
+            policy=policy,
         )
         result = (
             await asyncio.wait_for(operation, timeout=remaining)
@@ -100,7 +106,7 @@ def make_search_tool(
                 "prompt_tokens": 0,
                 "completion_tokens": 0,
                 "chunks_returned": len(chunks),
-                "scoring_profile": scoring_profile,
+                "scoring_profile": policy.profile.name if policy.profile is not None else None,
                 "latency_ms": int((time.perf_counter() - tool_start) * 1000),
             })
 
@@ -108,7 +114,7 @@ def make_search_tool(
             return "No authorized documents found matching this query."
 
         return "\n\n".join(
-            f"{label} {chunk.source_name}, page {chunk.page_number} ({chunk.source_url})\n{_sanitize_chunk(chunk.content)}"
+            f"{label} {citation_source(chunk)} ({citation_url(chunk)})\n{_sanitize_chunk(chunk.content)}"
             for label, chunk in labeled_chunks
         )
 

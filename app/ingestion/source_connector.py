@@ -19,14 +19,18 @@ from ingestion.graph import (
     DiscoveryState,
     DiscoveryStep,
     DriveDelta,
+    ResolvedMarkdownImage,
     ScaleLimits,
     VerifiedAcl,
     bootstrap_delta_cursor,
     discover_next_page,
+    download_content_as_pdf_sync,
+    download_relative_content_sync,
     download_content_sync,
     read_drive_delta,
     read_drive_item,
     read_verified_acl,
+    resolve_relative_markdown_image_sync,
 )
 
 
@@ -45,6 +49,25 @@ class SourceConnector(Protocol):
     def read_item(self, item_id: str) -> dict | None: ...
 
     def download_content_sync(self, item_id: str, max_bytes: int, timeout_seconds: float) -> bytes: ...
+
+    def download_content_as_pdf_sync(
+        self, item_id: str, max_bytes: int, timeout_seconds: float
+    ) -> bytes: ...
+
+    def download_relative_content_sync(
+        self,
+        parent_item_id: str,
+        relative_path: str,
+        max_bytes: int,
+        timeout_seconds: float,
+    ) -> bytes: ...
+
+    def resolve_relative_markdown_image_sync(
+        self,
+        parent_item_id: str,
+        relative_path: str,
+        max_bytes: int,
+    ) -> ResolvedMarkdownImage: ...
 
     def read_drive_delta(self, max_pages: int, delta_link: str | None = None) -> DriveDelta: ...
 
@@ -76,6 +99,43 @@ class SharePointConnector:
 
     def download_content_sync(self, item_id: str, max_bytes: int, timeout_seconds: float) -> bytes:
         return download_content_sync(self.client, self.drive_id, item_id, max_bytes, timeout_seconds)
+
+    def download_content_as_pdf_sync(
+        self, item_id: str, max_bytes: int, timeout_seconds: float
+    ) -> bytes:
+        return download_content_as_pdf_sync(
+            self.client, self.drive_id, item_id, max_bytes, timeout_seconds
+        )
+
+    def download_relative_content_sync(
+        self,
+        parent_item_id: str,
+        relative_path: str,
+        max_bytes: int,
+        timeout_seconds: float,
+    ) -> bytes:
+        return download_relative_content_sync(
+            self.client,
+            self.drive_id,
+            parent_item_id,
+            relative_path,
+            max_bytes,
+            timeout_seconds,
+        )
+
+    def resolve_relative_markdown_image_sync(
+        self,
+        parent_item_id: str,
+        relative_path: str,
+        max_bytes: int,
+    ) -> ResolvedMarkdownImage:
+        return resolve_relative_markdown_image_sync(
+            self.client,
+            self.drive_id,
+            parent_item_id,
+            relative_path,
+            max_bytes,
+        )
 
     def read_drive_delta(self, max_pages: int, delta_link: str | None = None) -> DriveDelta:
         return read_drive_delta(self.client, self.drive_id, max_pages, delta_link=delta_link)

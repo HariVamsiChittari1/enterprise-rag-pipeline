@@ -12,9 +12,21 @@ from typing import Any, Mapping
 
 SCHEMA_VERSION = 1
 SOURCE_CONTROL_ID = "source-control"
+SOURCE_DOCUMENT_RECORD_TYPE = "source_document"
+VISUAL_MANIFEST_PAGE_RECORD_TYPE = "visual_manifest_page"
 MAX_DOCUMENT_ITEM_BYTES = 128 * 1024
 MAX_CHUNK_ITEM_BYTES = 256 * 1024
 ENRICHMENT_MODULES = ("summary", "key_phrases", "entities")
+SUPPORTED_SOURCE_MIME_TYPES = frozenset(
+    {
+        "application/pdf",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "text/markdown",
+        "text/plain",
+    }
+)
 
 
 class RunStatus(str, Enum):
@@ -77,6 +89,211 @@ class ActivityStatus(str, Enum):
     SKIPPED = "skipped"
 
 
+class LocatorKind(str, Enum):
+    PAGE = "page"
+    SECTION = "section"
+    SLIDE = "slide"
+    WORKSHEET = "worksheet"
+
+
+class ContentModality(str, Enum):
+    TEXT = "text"
+    VISUAL_DESCRIPTION = "visual_description"
+
+
+class ExtractionProvenance(str, Enum):
+    DIRECT = "direct"
+    RENDERED = "rendered"
+
+
+class VisualCoverageStatus(str, Enum):
+    NOT_REQUIRED = "not_required"
+    COMPLETE = "complete"
+    INCOMPLETE = "incomplete"
+
+
+class VisualRelevance(str, Enum):
+    REQUIRED = "required"
+    DECORATIVE = "decorative"
+    UNRESOLVED = "unresolved"
+
+
+class VisualDisposition(str, Enum):
+    DESCRIBED = "described"
+    EXCLUDED = "excluded"
+    UNSUPPORTED = "unsupported"
+    AMBIGUOUS = "ambiguous"
+    FAILED = "failed"
+
+
+@dataclass(frozen=True)
+class SourceLocator:
+    kind: LocatorKind
+    label: str
+    ordinal_start: int
+    ordinal_end: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.kind, LocatorKind):
+            raise ValueError("locator kind is invalid")
+        _require_text("locator label", self.label, 200)
+        if self.ordinal_start < 1 or self.ordinal_end < self.ordinal_start:
+            raise ValueError("locator ordinal range is invalid")
+
+
+@dataclass(frozen=True)
+class VisualCoverage:
+    status: VisualCoverageStatus
+    inventory_count: int
+    required_count: int
+    described_count: int
+    excluded_count: int
+    unsupported_count: int
+    uncovered_count: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.status, VisualCoverageStatus):
+            raise ValueError("visual coverage status is invalid")
+        counts = (
+            self.inventory_count,
+            self.required_count,
+            self.described_count,
+            self.excluded_count,
+            self.unsupported_count,
+            self.uncovered_count,
+        )
+        if any(isinstance(count, bool) or not isinstance(count, int) or count < 0 for count in counts):
+            raise ValueError("visual coverage counts must be non-negative integers")
+        if self.inventory_count != self.required_count + self.excluded_count + self.unsupported_count:
+            raise ValueError("visual inventory accounting is inconsistent")
+        if self.required_count != self.described_count + self.uncovered_count:
+            raise ValueError("required visual accounting is inconsistent")
+        if self.status is VisualCoverageStatus.NOT_REQUIRED and self.required_count != 0:
+            raise ValueError("not-required visual coverage cannot contain required visuals")
+        if self.status is VisualCoverageStatus.COMPLETE and self.uncovered_count != 0:
+            raise ValueError("complete visual coverage cannot contain uncovered visuals")
+        if self.status is VisualCoverageStatus.INCOMPLETE and self.uncovered_count == 0:
+            raise ValueError("incomplete visual coverage requires uncovered visuals")
+
+
+@dataclass(frozen=True)
+class CanonicalSegment:
+    ordinal: int
+    text: str
+    locator: SourceLocator
+    modalities: tuple[ContentModality, ...]
+    provenance: tuple[ExtractionProvenance, ...]
+
+    def __post_init__(self) -> None:
+        if self.ordinal < 0:
+            raise ValueError("segment ordinal cannot be negative")
+        _require_text("segment text", self.text, 8_000_000)
+        _validate_enum_tuple(
+            "segment modalities",
+            self.modalities,
+            ContentModality,
+            required=ContentModality.TEXT,
+        )
+        _validate_enum_tuple(
+            "segment provenance",
+            self.provenance,
+            ExtractionProvenance,
+        )
+
+
+@dataclass(frozen=True)
+class CanonicalExtractionResult:
+    segments: tuple[CanonicalSegment, ...]
+    visual_coverage: VisualCoverage
+    visual_manifest_entries: tuple[VisualManifestEntry, ...] = ()
+
+    def __post_init__(self) -> None:
+        if tuple(segment.ordinal for segment in self.segments) != tuple(range(len(self.segments))):
+            raise ValueError("canonical segment ordinals must be contiguous")
+        has_visual_descriptions = any(
+            ContentModality.VISUAL_DESCRIPTION in segment.modalities
+            for segment in self.segments
+        )
+        if has_visual_descriptions != (self.visual_coverage.described_count > 0):
+            raise ValueError("canonical visual descriptions do not match coverage")
+        if self.visual_manifest_entries:
+            ordinals = tuple(entry.ordinal for entry in self.visual_manifest_entries)
+            if ordinals != tuple(range(len(self.visual_manifest_entries))):
+                raise ValueError("canonical visual manifest ordinals must be contiguous")
+            if len(self.visual_manifest_entries) != self.visual_coverage.inventory_count:
+                raise ValueError("canonical visual manifest does not match inventory coverage")
+            required_count = sum(
+                entry.relevance is VisualRelevance.REQUIRED
+                for entry in self.visual_manifest_entries
+            )
+            described_count = sum(
+                entry.disposition is VisualDisposition.DESCRIBED
+                for entry in self.visual_manifest_entries
+            )
+            excluded_count = sum(
+                entry.disposition is VisualDisposition.EXCLUDED
+                for entry in self.visual_manifest_entries
+            )
+            unsupported_count = sum(
+                entry.disposition is VisualDisposition.UNSUPPORTED
+                for entry in self.visual_manifest_entries
+            )
+            if (
+                required_count != self.visual_coverage.required_count
+                or described_count != self.visual_coverage.described_count
+                or excluded_count != self.visual_coverage.excluded_count
+                or unsupported_count != self.visual_coverage.unsupported_count
+            ):
+                raise ValueError("canonical visual manifest dispositions do not match coverage")
+
+
+@dataclass(frozen=True)
+class VisualManifestEntry:
+    ordinal: int
+    visual_id: str
+    object_type: str
+    source_locator: SourceLocator
+    relevance: VisualRelevance
+    disposition: VisualDisposition
+    description: str | None = None
+    reason: str | None = None
+    provenance: tuple[ExtractionProvenance, ...] = ()
+    derivative_locator: SourceLocator | None = None
+    source_reference: str | None = None
+
+    def __post_init__(self) -> None:
+        if isinstance(self.ordinal, bool) or not isinstance(self.ordinal, int) or self.ordinal < 0:
+            raise ValueError("visual manifest ordinal must be a non-negative integer")
+        _require_text("visual id", self.visual_id, 500)
+        _require_text("visual object type", self.object_type, 100)
+        if not isinstance(self.relevance, VisualRelevance):
+            raise ValueError("visual relevance is invalid")
+        if not isinstance(self.disposition, VisualDisposition):
+            raise ValueError("visual disposition is invalid")
+        if len(self.provenance) != len(set(self.provenance)) or any(
+            not isinstance(value, ExtractionProvenance) for value in self.provenance
+        ):
+            raise ValueError("visual provenance contains an invalid or duplicate value")
+        if self.disposition is VisualDisposition.DESCRIBED:
+            if self.description is None or not self.provenance:
+                raise ValueError("described visuals require a description and provenance")
+            _require_text("visual description", self.description, 8_000)
+            if self.reason is not None:
+                raise ValueError("described visuals cannot contain a disposition reason")
+        else:
+            if self.description is not None:
+                raise ValueError("non-described visuals cannot contain a description")
+            if self.reason is None:
+                raise ValueError("non-described visuals require a disposition reason")
+            _require_text("visual disposition reason", self.reason, 500)
+        if self.relevance is VisualRelevance.REQUIRED and self.disposition is VisualDisposition.EXCLUDED:
+            raise ValueError("required visuals cannot be excluded")
+        if self.derivative_locator is not None and ExtractionProvenance.RENDERED not in self.provenance:
+            raise ValueError("derivative locators require rendered provenance")
+        if self.source_reference is not None:
+            _require_text("visual source reference", self.source_reference, 1_000)
+
+
 @dataclass(frozen=True)
 class SafeError:
     code: str
@@ -95,14 +312,25 @@ class ScaleLimits:
     max_folders: int = 10_000
     max_folder_depth: int = 32
     max_graph_pages: int = 20_000
-    max_pdf_bytes: int = 25 * 1024 * 1024
-    max_pdf_pages: int = 500
+    max_source_bytes: int = 100 * 1024 * 1024
+    max_rendered_pdf_bytes: int = 200 * 1024 * 1024
+    max_document_units: int = 300
+    max_office_characters: int = 8_000_000
+    max_visual_descriptions: int = 60
     max_chunks_per_pdf: int = 2_000
 
     def __post_init__(self) -> None:
         for field in fields(self):
             if getattr(self, field.name) <= 0:
                 raise ValueError(f"{field.name} must be positive")
+
+    @property
+    def max_pdf_bytes(self) -> int:
+        return self.max_source_bytes
+
+    @property
+    def max_pdf_pages(self) -> int:
+        return self.max_document_units
 
 
 @dataclass(frozen=True)
@@ -310,6 +538,8 @@ class SourceDocumentRecord:
     page_count: int | None = None
     expected_chunk_count: int | None = None
     written_chunk_count: int | None = None
+    visual_manifest_page_count: int | None = None
+    visual_manifest_hash: str | None = None
     content_hash: str | None = None
     extraction_mode: str | None = None
     processing_started_at: str | None = None
@@ -326,6 +556,7 @@ class SourceDocumentRecord:
     document_id: str = ""
     source_run_id: str = ""
     document_key: str = ""
+    record_type: str = SOURCE_DOCUMENT_RECORD_TYPE
     schema_version: int = SCHEMA_VERSION
 
     def __post_init__(self) -> None:
@@ -336,16 +567,70 @@ class SourceDocumentRecord:
             raise ValueError("document identifiers do not match their deterministic value")
         if self.source_run_id != expected_source_run_id or self.document_key != expected_document_key:
             raise ValueError("document run keys do not match their deterministic value")
+        if self.record_type != SOURCE_DOCUMENT_RECORD_TYPE:
+            raise ValueError("invalid source-document record type")
         _require_schema_version(self.schema_version)
         _validate_document_fields(self)
         _validate_sorted_unique("allowed_group_ids", self.allowed_group_ids, require_nonempty=True)
         _require_sha256("acl_hash", self.acl_hash)
         if self.content_hash is not None:
             _require_sha256("content_hash", self.content_hash)
+        has_manifest_count = self.visual_manifest_page_count is not None
+        has_manifest_hash = self.visual_manifest_hash is not None
+        if has_manifest_count != has_manifest_hash:
+            raise ValueError("manifest page count and hash must be set together")
+        if self.visual_manifest_page_count is not None:
+            if self.visual_manifest_page_count < 0:
+                raise ValueError("visual_manifest_page_count cannot be negative")
+            _require_sha256("visual_manifest_hash", self.visual_manifest_hash or "")
         _validate_optional_utc_fields(self)
         _validate_retirement(self)
         if serialized_size_bytes(self.to_cosmos_item()) > MAX_DOCUMENT_ITEM_BYTES:
             raise ValueError("document item exceeds 128 KiB")
+
+    def to_cosmos_item(self) -> dict[str, Any]:
+        return _serialize_dataclass(self)
+
+
+@dataclass(frozen=True)
+class VisualManifestPage:
+    source_id: str
+    run_id: str
+    source_run_id: str
+    document_id: str
+    document_key: str
+    source_version: str
+    page_index: int
+    page_count: int
+    entries: tuple[VisualManifestEntry, ...]
+    page_hash: str
+    id: str
+    record_type: str = VISUAL_MANIFEST_PAGE_RECORD_TYPE
+    schema_version: int = SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        expected_source_run_id = create_source_run_id(self.source_id, self.run_id)
+        expected_document_key = create_document_key(self.source_id, self.run_id, self.document_id)
+        expected_id = create_visual_manifest_page_id(self.document_id, self.page_index)
+        if self.source_run_id != expected_source_run_id or self.document_key != expected_document_key:
+            raise ValueError("visual manifest run keys do not match their deterministic value")
+        if self.id != expected_id:
+            raise ValueError("visual manifest page id does not match its deterministic value")
+        if self.record_type != VISUAL_MANIFEST_PAGE_RECORD_TYPE:
+            raise ValueError("invalid visual-manifest record type")
+        _require_schema_version(self.schema_version)
+        _require_text("manifest source version", self.source_version, 500)
+        if self.page_index < 0 or self.page_count < 1 or self.page_index >= self.page_count:
+            raise ValueError("visual manifest page position is invalid")
+        if not self.entries:
+            raise ValueError("visual manifest pages cannot be empty")
+        ordinals = tuple(entry.ordinal for entry in self.entries)
+        if ordinals != tuple(sorted(set(ordinals))):
+            raise ValueError("visual manifest entry ordinals must be sorted and unique")
+        if self.page_hash != _visual_manifest_page_hash(self.entries):
+            raise ValueError("visual manifest page hash does not match its entries")
+        if serialized_size_bytes(self.to_cosmos_item()) > MAX_DOCUMENT_ITEM_BYTES:
+            raise ValueError("visual manifest page exceeds 128 KiB")
 
     def to_cosmos_item(self) -> dict[str, Any]:
         return _serialize_dataclass(self)
@@ -386,6 +671,13 @@ class SearchChunkRecord:
     page_start: int
     page_end: int
     section_path: tuple[str, ...]
+    locator_kind: LocatorKind
+    locator_label: str
+    locator_ordinal_start: int
+    locator_ordinal_end: int
+    modalities: tuple[ContentModality, ...]
+    provenance: tuple[ExtractionProvenance, ...]
+    visual_coverage: VisualCoverageStatus
     chunk_index: int
     created_at: str
     content: str
@@ -487,6 +779,113 @@ def create_chunk_id(chunk_index: int) -> str:
     return f"chunk:{chunk_index:06d}"
 
 
+def create_visual_manifest_page_id(document_id: str, page_index: int) -> str:
+    _require_sha256("document_id", document_id)
+    if page_index < 0 or page_index > 999_999:
+        raise ValueError("page_index must be between 0 and 999999")
+    return f"visual-manifest:{document_id}:{page_index:06d}"
+
+
+def create_visual_manifest_pages(
+    document: SourceDocumentRecord,
+    entries: tuple[VisualManifestEntry, ...],
+) -> tuple[VisualManifestPage, ...]:
+    if tuple(entry.ordinal for entry in entries) != tuple(range(len(entries))):
+        raise ValueError("visual manifest entry ordinals must be contiguous from zero")
+    if not entries:
+        return ()
+
+    grouped_entries: list[tuple[VisualManifestEntry, ...]] = []
+    current_entries: tuple[VisualManifestEntry, ...] = ()
+    for entry in entries:
+        candidate = current_entries + (entry,)
+        try:
+            _create_visual_manifest_page(
+                document,
+                candidate,
+                page_index=len(grouped_entries),
+                page_count=999_999,
+            )
+            current_entries = candidate
+            continue
+        except ValueError as error:
+            if str(error) != "visual manifest page exceeds 128 KiB":
+                raise
+        if not current_entries:
+            raise ValueError("visual manifest entry exceeds the page size limit")
+        grouped_entries.append(current_entries)
+        current_entries = (entry,)
+        _create_visual_manifest_page(
+            document,
+            current_entries,
+            page_index=len(grouped_entries),
+            page_count=999_999,
+        )
+    grouped_entries.append(current_entries)
+
+    page_count = len(grouped_entries)
+    return tuple(
+        _create_visual_manifest_page(
+            document,
+            page_entries,
+            page_index=page_index,
+            page_count=page_count,
+        )
+        for page_index, page_entries in enumerate(grouped_entries)
+    )
+
+
+def visual_manifest_hash(pages: tuple[VisualManifestPage, ...]) -> str:
+    if pages:
+        identity = (pages[0].source_run_id, pages[0].document_id, pages[0].document_key)
+        if tuple(page.page_index for page in pages) != tuple(range(len(pages))):
+            raise ValueError("visual manifest page indices must be contiguous from zero")
+        if any(page.page_count != len(pages) for page in pages):
+            raise ValueError("visual manifest page count is inconsistent")
+        if any(
+            (page.source_run_id, page.document_id, page.document_key) != identity
+            for page in pages
+        ):
+            raise ValueError("visual manifest pages must belong to one document and run")
+    binding = json.dumps(
+        [{"id": page.id, "pageHash": page.page_hash} for page in pages],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return content_sha256(binding)
+
+
+def _create_visual_manifest_page(
+    document: SourceDocumentRecord,
+    entries: tuple[VisualManifestEntry, ...],
+    *,
+    page_index: int,
+    page_count: int,
+) -> VisualManifestPage:
+    return VisualManifestPage(
+        source_id=document.source_id,
+        run_id=document.run_id,
+        source_run_id=document.source_run_id,
+        document_id=document.document_id,
+        document_key=document.document_key,
+        source_version=document.e_tag,
+        page_index=page_index,
+        page_count=page_count,
+        entries=entries,
+        page_hash=_visual_manifest_page_hash(entries),
+        id=create_visual_manifest_page_id(document.document_id, page_index),
+    )
+
+
+def _visual_manifest_page_hash(entries: tuple[VisualManifestEntry, ...]) -> str:
+    payload = json.dumps(
+        _serialize_dataclass(entries),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return content_sha256(payload)
+
+
 def canonical_group_ids(group_ids: list[str] | tuple[str, ...]) -> tuple[str, ...]:
     canonical = tuple(sorted({_require_text("group id", group_id, 100) for group_id in group_ids}))
     if not canonical:
@@ -577,6 +976,23 @@ def _validate_sorted_unique(name: str, values: tuple[str, ...], require_nonempty
         _require_text(name, value, 500)
 
 
+def _validate_enum_tuple(
+    name: str,
+    values: tuple[Any, ...],
+    enum_type: type[Enum],
+    *,
+    required: Enum | None = None,
+) -> None:
+    if not values:
+        raise ValueError(f"{name} cannot be empty")
+    if any(not isinstance(value, enum_type) for value in values):
+        raise ValueError(f"{name} contains an invalid value")
+    if len(values) != len(set(values)):
+        raise ValueError(f"{name} must be unique")
+    if required is not None and required not in values:
+        raise ValueError(f"{name} must include {required.value}")
+
+
 def _validate_document_fields(record: SourceDocumentRecord) -> None:
     for name, value, maximum in (
         ("source_id", record.source_id, 200),
@@ -587,8 +1003,8 @@ def _validate_document_fields(record: SourceDocumentRecord) -> None:
         ("mime_type", record.mime_type, 200),
     ):
         _require_text(name, value, maximum)
-    if record.mime_type != "application/pdf":
-        raise ValueError("only PDF documents are supported")
+    if record.mime_type not in SUPPORTED_SOURCE_MIME_TYPES:
+        raise ValueError("document MIME type is not supported")
     if record.size_bytes < 0 or record.discovery_ordinal < 0 or record.attempt_count < 0:
         raise ValueError("document counters cannot be negative")
     if isinstance(record.lifecycle_generation, bool) or not isinstance(
@@ -635,6 +1051,26 @@ def _validate_chunk_fields(record: SearchChunkRecord) -> None:
         raise ValueError("lifecycle_generation must be a non-negative integer")
     if record.page_start < 1 or record.page_end < record.page_start:
         raise ValueError("chunk page range is invalid")
+    if not isinstance(record.locator_kind, LocatorKind):
+        raise ValueError("chunk locator kind is invalid")
+    _require_text("chunk locator label", record.locator_label, 200)
+    if record.locator_ordinal_start < 1 or record.locator_ordinal_end < record.locator_ordinal_start:
+        raise ValueError("chunk locator ordinal range is invalid")
+    _validate_enum_tuple(
+        "chunk modalities",
+        record.modalities,
+        ContentModality,
+        required=ContentModality.TEXT,
+    )
+    _validate_enum_tuple(
+        "chunk provenance",
+        record.provenance,
+        ExtractionProvenance,
+    )
+    if not isinstance(record.visual_coverage, VisualCoverageStatus):
+        raise ValueError("chunk visual coverage is invalid")
+    if record.visual_coverage is VisualCoverageStatus.INCOMPLETE:
+        raise ValueError("incomplete visual coverage cannot be persisted")
     if record.token_count <= 0:
         raise ValueError("chunk token count must be positive")
     if len(record.embedding) != 3072:
@@ -663,6 +1099,24 @@ def _validate_chunk_fields(record: SearchChunkRecord) -> None:
 class Page:
     number: int
     text: str
+    locator: SourceLocator | None = None
+    modalities: tuple[ContentModality, ...] = (ContentModality.TEXT,)
+    provenance: tuple[ExtractionProvenance, ...] = (ExtractionProvenance.DIRECT,)
+    visual_coverage: VisualCoverageStatus = VisualCoverageStatus.NOT_REQUIRED
+
+    def __post_init__(self) -> None:
+        if self.number < 1:
+            raise ValueError("page number must be positive")
+        _require_text("page text", self.text, 8_000_000)
+        _validate_enum_tuple(
+            "page modalities",
+            self.modalities,
+            ContentModality,
+            required=ContentModality.TEXT,
+        )
+        _validate_enum_tuple("page provenance", self.provenance, ExtractionProvenance)
+        if not isinstance(self.visual_coverage, VisualCoverageStatus):
+            raise ValueError("page visual coverage is invalid")
 
 
 @dataclass(frozen=True)
@@ -670,3 +1124,7 @@ class Chunk:
     ordinal: int
     page_number: int
     content: str
+    locator: SourceLocator
+    modalities: tuple[ContentModality, ...]
+    provenance: tuple[ExtractionProvenance, ...]
+    visual_coverage: VisualCoverageStatus

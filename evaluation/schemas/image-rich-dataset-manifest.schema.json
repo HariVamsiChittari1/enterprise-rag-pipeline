@@ -1,0 +1,363 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://bfl.example/schemas/rag/image-rich-dataset-manifest.schema.json",
+  "title": "Protected Image-Rich Dataset Manifest",
+  "description": "Five-format dataset contract carrying Graph and deterministic Cosmos identities, selected production extraction routes, exact schema-v1 visual manifest bindings, and per-format and per-visual-type coverage counts.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "datasetVersion",
+    "domain",
+    "useCase",
+    "source",
+    "classifications",
+    "contentVariants",
+    "documents",
+    "coverage",
+    "createdAt"
+  ],
+  "properties": {
+    "datasetVersion": { "type": "string", "minLength": 1, "maxLength": 64 },
+    "domain": { "type": "string", "minLength": 1, "maxLength": 200 },
+    "useCase": { "type": "string", "minLength": 1, "maxLength": 500 },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sourceId", "driveId", "libraryFingerprint"],
+      "properties": {
+        "sourceId": { "type": "string", "minLength": 1, "maxLength": 200 },
+        "driveId": { "type": "string", "minLength": 1, "maxLength": 500 },
+        "libraryFingerprint": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "classifications": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1, "maxLength": 100 }
+    },
+    "contentVariants": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1, "maxLength": 100 }
+    },
+    "documents": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/document" }
+    },
+    "coverage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "documentCount",
+        "queryTargetCount",
+        "classificationCounts",
+        "variantCounts",
+        "formatCounts",
+        "visualTypeCounts"
+      ],
+      "properties": {
+        "documentCount": { "type": "integer", "minimum": 1 },
+        "queryTargetCount": { "type": "integer", "minimum": 1 },
+        "classificationCounts": { "$ref": "#/$defs/countMap" },
+        "variantCounts": { "$ref": "#/$defs/countMap" },
+        "formatCounts": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["md", "docx", "xlsx", "pdf", "pptx"],
+          "properties": {
+            "md": { "type": "integer", "minimum": 1 },
+            "docx": { "type": "integer", "minimum": 1 },
+            "xlsx": { "type": "integer", "minimum": 1 },
+            "pdf": { "type": "integer", "minimum": 1 },
+            "pptx": { "type": "integer", "minimum": 1 }
+          }
+        },
+        "visualTypeCounts": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "flow-diagram",
+            "rich-image-diagram",
+            "workflow-screenshot",
+            "chart",
+            "smartart-shape",
+            "scan"
+          ],
+          "properties": {
+            "flow-diagram": { "type": "integer", "minimum": 1 },
+            "rich-image-diagram": { "type": "integer", "minimum": 1 },
+            "workflow-screenshot": { "type": "integer", "minimum": 1 },
+            "chart": { "type": "integer", "minimum": 1 },
+            "smartart-shape": { "type": "integer", "minimum": 1 },
+            "scan": { "type": "integer", "minimum": 1 }
+          }
+        }
+      }
+    },
+    "createdAt": { "$ref": "#/$defs/dateTime" }
+  },
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "dateTime": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$"
+    },
+    "countMap": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": { "type": "integer", "minimum": 0 }
+    },
+    "format": {
+      "enum": ["md", "pdf", "docx", "pptx", "xlsx"]
+    },
+    "visualType": {
+      "enum": [
+        "flow-diagram",
+        "rich-image-diagram",
+        "workflow-screenshot",
+        "chart",
+        "smartart-shape",
+        "scan"
+      ]
+    },
+    "document": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sourceItemId",
+        "documentId",
+        "sourceRunId",
+        "eTag",
+        "sourceContentHash",
+        "sourceSizeBytes",
+        "sourceMimeType",
+        "expectedNormalizedContentHash",
+        "expectedNormalizedSizeBytes",
+        "classification",
+        "format",
+        "extractionProvider",
+        "extractionRoute",
+        "visualStructures",
+        "visualCoverage",
+        "visualManifestPageCount",
+        "visualManifestHash",
+        "visualManifestPages",
+        "visualManifestEntries",
+        "securityClass"
+      ],
+      "properties": {
+        "sourceItemId": { "type": "string", "minLength": 1, "maxLength": 500 },
+        "documentId": { "$ref": "#/$defs/sha256" },
+        "sourceRunId": { "type": "string", "minLength": 1, "maxLength": 301 },
+        "eTag": { "type": "string", "minLength": 1, "maxLength": 500 },
+        "sourceContentHash": { "$ref": "#/$defs/sha256" },
+        "sourceSizeBytes": { "type": "integer", "minimum": 1 },
+        "sourceMimeType": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "expectedNormalizedContentHash": { "$ref": "#/$defs/sha256" },
+        "expectedNormalizedSizeBytes": { "type": "integer", "minimum": 1 },
+        "classification": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "format": { "$ref": "#/$defs/format" },
+        "extractionProvider": {
+          "enum": ["direct", "document-intelligence", "content-understanding"]
+        },
+        "extractionRoute": {
+          "enum": [
+            "markdown-direct",
+            "di-pdf-layout-vision",
+            "di-office-native-vision",
+            "cu-pdf-document-search",
+            "cu-office-native",
+            "cu-office-rendered-pdf"
+          ]
+        },
+        "visualStructures": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/visualType" }
+        },
+        "visualCoverage": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "status",
+            "inventoryCount",
+            "requiredCount",
+            "describedCount",
+            "excludedCount",
+            "unsupportedCount",
+            "uncoveredCount"
+          ],
+          "properties": {
+            "status": { "enum": ["not_required", "complete"] },
+            "inventoryCount": { "type": "integer", "minimum": 0 },
+            "requiredCount": { "type": "integer", "minimum": 0 },
+            "describedCount": { "type": "integer", "minimum": 0 },
+            "excludedCount": { "type": "integer", "minimum": 0 },
+            "unsupportedCount": { "type": "integer", "minimum": 0 },
+            "uncoveredCount": { "const": 0 }
+          }
+        },
+        "visualManifestPageCount": { "type": "integer", "minimum": 0 },
+        "visualManifestHash": { "$ref": "#/$defs/sha256" },
+        "visualManifestPages": {
+          "type": "array",
+          "maxItems": 300,
+          "items": { "$ref": "#/$defs/visualManifestPage" }
+        },
+        "visualManifestEntries": {
+          "type": "array",
+          "maxItems": 300,
+          "items": { "$ref": "#/$defs/visualManifestEntry" }
+        },
+        "securityClass": { "type": "string", "minLength": 1, "maxLength": 100 }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "format": { "const": "md" } } },
+          "then": {
+            "properties": {
+              "extractionProvider": { "const": "direct" },
+              "extractionRoute": { "const": "markdown-direct" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "format": { "const": "pdf" },
+              "extractionProvider": { "const": "document-intelligence" }
+            },
+            "required": ["format", "extractionProvider"]
+          },
+          "then": {
+            "properties": {
+              "extractionRoute": { "const": "di-pdf-layout-vision" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "format": { "const": "pdf" },
+              "extractionProvider": { "const": "content-understanding" }
+            },
+            "required": ["format", "extractionProvider"]
+          },
+          "then": {
+            "properties": {
+              "extractionRoute": { "const": "cu-pdf-document-search" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "format": { "enum": ["docx", "pptx", "xlsx"] } }
+          },
+          "then": {
+            "oneOf": [
+              {
+                "properties": {
+                  "extractionProvider": { "const": "document-intelligence" },
+                  "extractionRoute": { "const": "di-office-native-vision" }
+                }
+              },
+              {
+                "properties": {
+                  "extractionProvider": { "const": "content-understanding" },
+                  "extractionRoute": {
+                    "enum": ["cu-office-native", "cu-office-rendered-pdf"]
+                  }
+                }
+              }
+            ]
+          }
+        }
+      ]
+    },
+    "locator": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "label", "ordinalStart", "ordinalEnd"],
+      "properties": {
+        "kind": { "enum": ["page", "section", "slide", "worksheet"] },
+        "label": { "type": "string", "minLength": 1, "maxLength": 200 },
+        "ordinalStart": { "type": "integer", "minimum": 1 },
+        "ordinalEnd": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "visualManifestEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ordinal",
+        "visualIdHash",
+        "objectType",
+        "sourceLocator",
+        "relevance",
+        "disposition",
+        "provenance"
+      ],
+      "properties": {
+        "ordinal": { "type": "integer", "minimum": 0 },
+        "visualIdHash": { "$ref": "#/$defs/sha256" },
+        "objectType": { "type": "string", "minLength": 1, "maxLength": 100 },
+        "sourceLocator": { "$ref": "#/$defs/locator" },
+        "derivativeLocator": { "$ref": "#/$defs/locator" },
+        "relevance": { "enum": ["required", "decorative", "unresolved"] },
+        "disposition": {
+          "enum": [
+            "described",
+            "excluded",
+            "unsupported",
+            "ambiguous",
+            "failed"
+          ]
+        },
+        "provenance": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "enum": ["direct", "rendered"] }
+        }
+      },
+      "allOf": [
+        {
+          "if": { "required": ["derivativeLocator"] },
+          "then": {
+            "properties": {
+              "derivativeLocator": {
+                "properties": { "kind": { "const": "page" } }
+              },
+              "provenance": { "contains": { "const": "rendered" } }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "disposition": { "const": "described" } } },
+          "then": { "properties": { "provenance": { "minItems": 1 } } }
+        }
+      ]
+    },
+    "visualManifestPage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "pageIndex", "pageHash"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 200 },
+        "pageIndex": { "type": "integer", "minimum": 0 },
+        "pageHash": { "$ref": "#/$defs/sha256" }
+      }
+    }
+  }
+}
