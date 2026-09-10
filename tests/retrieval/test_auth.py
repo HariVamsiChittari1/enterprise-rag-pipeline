@@ -11,7 +11,6 @@ from retrieval.auth import (
     GatewayContext,
     gateway_context_from_easy_auth_user,
     parse_gateway_context,
-    principal_from_easy_auth,
     principal_from_gateway,
     require_easy_auth_role,
 )
@@ -30,123 +29,122 @@ def encode(claims: list[dict[str, str]]) -> str:
     return base64.b64encode(payload).decode()
 
 
-def test_principal_reverifies_token_groups_with_graph() -> None:
+@pytest.mark.parametrize(
+    "group_claims",
+    [
+        [{"typ": "groups", "val": "group-2"}, {"typ": "groups", "val": "group-1"}],
+        [{"typ": "hasgroups", "val": "true"}],
+    ],
+    ids=["token-groups", "group-overage"],
+)
+def test_gateway_resolves_user_groups_with_graph(
+    group_claims: list[dict[str, str]],
+) -> None:
     resolver = Mock()
     resolver.resolve_transitive_security_groups.return_value = {"security-group"}
-    principal = principal_from_easy_auth(
-        encode(
-            [
-                {"typ": "oid", "val": "user"},
-                {"typ": "tid", "val": "tenant"},
-                {"typ": "groups", "val": "group-2"},
-                {"typ": "groups", "val": "group-1"},
-            ]
-        ),
-        "tenant",
-        resolver,
+    context = gateway_context_from_easy_auth_user(
+        encode(_user_claims() + group_claims),
+        expected_tenant_id=TENANT_ID,
+        expected_audience=FUNCTION_AUDIENCE,
+    )
+
+    principal = principal_from_gateway(
+        encode(_service_claims()),
+        context.encode(),
+        expected_tenant_id=TENANT_ID,
+        expected_audience=RETRIEVAL_AUDIENCE,
+        expected_gateway_client_id=GATEWAY_CLIENT_ID,
+        expected_gateway_principal_id=GATEWAY_PRINCIPAL_ID,
+        group_resolver=resolver,
     )
 
     assert principal.acl_ids == ["security-group"]
-    resolver.resolve_transitive_security_groups.assert_called_once_with("user")
-
-
-def test_principal_uses_fallback_for_group_overage() -> None:
-    resolver = Mock()
-    resolver.resolve_transitive_security_groups.return_value = {"security-group"}
-    principal = principal_from_easy_auth(
-        encode(
-            [
-                {"typ": "oid", "val": "user"},
-                {"typ": "tid", "val": "tenant"},
-                {"typ": "hasgroups", "val": "true"},
-            ]
-        ),
-        "tenant",
-        resolver,
-    )
-
-    assert principal.acl_ids == ["security-group"]
-    resolver.resolve_transitive_security_groups.assert_called_once_with("user")
+    resolver.resolve_transitive_security_groups.assert_called_once_with(USER_ID)
 
 
 def test_easy_auth_uri_claim_names_are_normalized() -> None:
     resolver = Mock()
     resolver.resolve_transitive_security_groups.return_value = {"security-group"}
+    aliases = {
+        "oid": "http://schemas.microsoft.com/identity/claims/objectidentifier",
+        "tid": "http://schemas.microsoft.com/identity/claims/tenantid",
+        "roles": "http://schemas.microsoft.com/ws/2008/06/identity/claims/role",
+    }
     encoded = encode(
         [
-            {
-                "typ": "http://schemas.microsoft.com/identity/claims/objectidentifier",
-                "val": "user",
-            },
-            {
-                "typ": "http://schemas.microsoft.com/identity/claims/tenantid",
-                "val": "tenant",
-            },
-            {
-                "typ": "http://schemas.microsoft.com/ws/2008/06/identity/claims/role",
-                "val": "Rag.Reconcile",
-            },
+            {"typ": aliases.get(claim["typ"], claim["typ"]), "val": claim["val"]}
+            for claim in _service_claims()
         ]
     )
 
-    principal = principal_from_easy_auth(encoded, "tenant", resolver)
-    require_easy_auth_role(encoded, "tenant", "Rag.Reconcile")
+    principal = principal_from_gateway(
+        encoded,
+        GatewayContext(USER_ID, TENANT_ID).encode(),
+        expected_tenant_id=TENANT_ID,
+        expected_audience=RETRIEVAL_AUDIENCE,
+        expected_gateway_client_id=GATEWAY_CLIENT_ID,
+        expected_gateway_principal_id=GATEWAY_PRINCIPAL_ID,
+        group_resolver=resolver,
+    )
+    require_easy_auth_role(encoded, TENANT_ID, "Retrieval.Gateway")
 
-    assert principal.user_id == "user"
+    assert principal.user_id == USER_ID
+    assert principal.acl_ids == ["security-group"]
 
 
 @pytest.mark.parametrize(
-    "encoded,tenant",
+    "encoded",
     [
-        (None, "tenant"),
-        ("not-base64", "tenant"),
-        (encode([{"typ": "oid", "val": "user"}]), "tenant"),
-        (
-            encode(
-                [
-                    {"typ": "oid", "val": "user"},
-                    {"typ": "tid", "val": "other"},
-                ]
-            ),
-            "tenant",
-        ),
+        None,
+        "not-base64",
+        encode([{"typ": "oid", "val": GATEWAY_PRINCIPAL_ID}]),
     ],
 )
-def test_principal_fails_closed(encoded: str | None, tenant: str) -> None:
-    with pytest.raises(AuthorizationError):
-        principal_from_easy_auth(encoded, tenant)
-
-
-def test_principal_skips_group_resolution_when_acl_disabled() -> None:
+def test_gateway_principal_fails_closed(encoded: str | None) -> None:
     resolver = Mock()
-    principal = principal_from_easy_auth(
-        encode(
-            [
-                {"typ": "oid", "val": "user"},
-                {"typ": "tid", "val": "tenant"},
-            ]
-        ),
-        "tenant",
-        resolver,
+
+    with pytest.raises(AuthorizationError):
+        principal_from_gateway(
+            encoded,
+            GatewayContext(USER_ID, TENANT_ID).encode(),
+            expected_tenant_id=TENANT_ID,
+            expected_audience=RETRIEVAL_AUDIENCE,
+            expected_gateway_client_id=GATEWAY_CLIENT_ID,
+            expected_gateway_principal_id=GATEWAY_PRINCIPAL_ID,
+            group_resolver=resolver,
+        )
+
+    resolver.resolve_transitive_security_groups.assert_not_called()
+
+
+def test_gateway_skips_group_resolution_when_acl_disabled() -> None:
+    resolver = Mock()
+    principal = principal_from_gateway(
+        encode(_service_claims()),
+        GatewayContext(USER_ID, TENANT_ID).encode(),
+        expected_tenant_id=TENANT_ID,
+        expected_audience=RETRIEVAL_AUDIENCE,
+        expected_gateway_client_id=GATEWAY_CLIENT_ID,
+        expected_gateway_principal_id=GATEWAY_PRINCIPAL_ID,
+        group_resolver=resolver,
         acl_enabled=False,
     )
-    assert principal.user_id == "user"
-    assert principal.tenant_id == "tenant"
+    assert principal.user_id == USER_ID
+    assert principal.tenant_id == TENANT_ID
     assert principal.security_group_ids == frozenset()
     resolver.resolve_transitive_security_groups.assert_not_called()
 
 
-def test_principal_still_validates_tenant_when_acl_disabled() -> None:
+def test_gateway_still_validates_tenant_when_acl_disabled() -> None:
     with pytest.raises(AuthorizationError, match="unexpected_tenant"):
-        principal_from_easy_auth(
-            encode(
-                [
-                    {"typ": "oid", "val": "user"},
-                    {"typ": "tid", "val": "wrong-tenant"},
-                ]
-            ),
-            "tenant",
-            None,
+        principal_from_gateway(
+            encode(_service_claims(tid="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")),
+            GatewayContext(USER_ID, TENANT_ID).encode(),
+            expected_tenant_id=TENANT_ID,
+            expected_audience=RETRIEVAL_AUDIENCE,
+            expected_gateway_client_id=GATEWAY_CLIENT_ID,
+            expected_gateway_principal_id=GATEWAY_PRINCIPAL_ID,
+            group_resolver=None,
             acl_enabled=False,
         )
 

@@ -181,12 +181,21 @@ def inspect_data(req: func.HttpRequest) -> func.HttpResponse:
     from azure.identity import DefaultAzureCredential
 
     container_name = (req.params.get("container") or "").strip()
-    allowed = {"ingestion-runs", "source-documents", "search-chunks", "service-audit"}
+    allowed = {"ingestion-runs", "source-documents", "search-chunks", "service-audit", "retrieval-config"}
     if container_name not in allowed:
         return _json_response({"error": "invalid_container", "allowed": sorted(allowed)}, 400)
 
     limit = min(int(req.params.get("limit", "10")), 200)
     run_id = (req.params.get("runId") or "").strip()
+    deployment_instance = (req.params.get("deploymentInstanceId") or "").strip()
+
+    # retrieval-config is partitioned by deploymentInstanceId; the same catalog id can exist
+    # in multiple deployment partitions, so require an explicit partition and reject runId.
+    if container_name == "retrieval-config":
+        if not deployment_instance:
+            return _json_response({"error": "deploymentInstanceId required for retrieval-config"}, 400)
+        if run_id:
+            return _json_response({"error": "runId is not valid for retrieval-config"}, 400)
 
     try:
         credential = DefaultAzureCredential(managed_identity_client_id=os.getenv("AZURE_CLIENT_ID", ""))
@@ -194,7 +203,13 @@ def inspect_data(req: func.HttpRequest) -> func.HttpResponse:
         db = cosmos.get_database_client(os.getenv("COSMOS_DATABASE_NAME", ""))
         container = db.get_container_client(container_name)
 
-        if run_id:
+        if container_name == "retrieval-config":
+            rows = list(container.query_items(
+                query="SELECT TOP @limit * FROM c",
+                parameters=[{"name": "@limit", "value": limit}],
+                partition_key=deployment_instance,
+            ))
+        elif run_id:
             source_id = os.getenv("INGESTION_SOURCE_ID", "").strip()
             rows = list(container.query_items(
                 query="SELECT TOP @limit * FROM c",
@@ -223,6 +238,7 @@ _PARTITION_KEY_FIELD = {
     "source-documents": "sourceRunId",
     "search-chunks": "documentKey",
     "service-audit": "id",
+    "retrieval-config": "deploymentInstanceId",
 }
 
 
@@ -239,13 +255,14 @@ def purge_data(req: func.HttpRequest) -> func.HttpResponse:
         return _json_response({"error": "invalid_json"}, 400)
 
     container_name = (body.get("container") or "").strip()
-    purgeable = {"ingestion-runs", "source-documents", "search-chunks"}
+    purgeable = {"ingestion-runs", "source-documents", "search-chunks", "retrieval-config"}
     if container_name not in purgeable:
         return _json_response({"error": "invalid_container", "allowed": sorted(purgeable)}, 400)
 
     ids = body.get("ids")
     purge_all = body.get("purgeAll", False)
     confirm = body.get("confirm", "")
+    deployment_instance = (body.get("deploymentInstanceId") or "").strip()
 
     if not ids and not purge_all:
         return _json_response({"error": "provide 'ids' (list) or 'purgeAll':true"}, 400)
@@ -253,6 +270,16 @@ def purge_data(req: func.HttpRequest) -> func.HttpResponse:
         return _json_response({"error": "purgeAll requires 'confirm':'yes'"}, 400)
     if ids and (not isinstance(ids, list) or len(ids) > 100):
         return _json_response({"error": "ids must be a list with max 100 items"}, 400)
+
+    # retrieval-config holds runtime catalog config shared across deployments; require an
+    # explicit partition and confirmation, and never allow a catalog-wide purgeAll.
+    if container_name == "retrieval-config":
+        if purge_all:
+            return _json_response({"error": "purgeAll is not permitted for retrieval-config"}, 400)
+        if not deployment_instance:
+            return _json_response({"error": "deploymentInstanceId required for retrieval-config"}, 400)
+        if confirm != "yes":
+            return _json_response({"error": "retrieval-config purge requires 'confirm':'yes'"}, 400)
 
     operator = req.headers.get("X-MS-CLIENT-PRINCIPAL-NAME", "unknown")
     pk_field = _PARTITION_KEY_FIELD[container_name]
@@ -271,6 +298,10 @@ def purge_data(req: func.HttpRequest) -> func.HttpResponse:
             # Read each item to get its partition key, then delete
             for item_id in ids:
                 try:
+                    if container_name == "retrieval-config":
+                        container.delete_item(item=item_id, partition_key=deployment_instance)
+                        deleted_ids.append(item_id)
+                        continue
                     items = list(container.query_items(
                         query="SELECT c.id, c[@pk] as pk FROM c WHERE c.id = @id",
                         parameters=[{"name": "@id", "value": item_id}, {"name": "@pk", "value": pk_field}],
@@ -478,7 +509,14 @@ async def _start_if_not_running(client, lifecycle_repository, source_id: str, co
         ):
             return None
     instance_id = f"{control_id}-{uuid.uuid4().hex}"
-    lifecycle_repository.save_trigger_instance_id(source_id, control_id, instance_id)
+    claimed = lifecycle_repository.try_claim_trigger_instance_id(
+        source_id,
+        control_id,
+        existing_id,
+        instance_id,
+    )
+    if not claimed:
+        return None
     await client.start_new(orchestrator_name, instance_id=instance_id)
     return instance_id
 
@@ -697,16 +735,32 @@ def full_sync_orchestrator(context: df.DurableOrchestrationContext):
         try:
             winner = yield context.task_any([wave_task, timer])
         except Exception:
-            # One or more activities exhausted all retries (e.g. sustained 429s).
-            # task_all fails fast in Python, so sweep this run for any docs still
-            # stuck non-terminal rather than guessing which ones completed.
             timer.cancel()
-            swept = yield context.call_activity(
-                "fail_wave_documents_activity", {"runId": run_id, "reason": "wave_retry_exhausted"},
+            interrupted = yield context.call_activity(
+                "timeout_wave_documents_activity",
+                {"documents": wave, "errorCode": "wave_retry_exhausted"},
             )
-            total_failed += swept.get("failedCount", len(wave))
+            if interrupted.get("error"):
+                return {
+                    "status": "failed",
+                    "phase": "timeout_fence",
+                    "runId": run_id,
+                    "error": interrupted["error"],
+                }
+            total_failed += len(wave)
             continue
         if winner == timer:
+            timed_out = yield context.call_activity(
+                "timeout_wave_documents_activity",
+                {"documents": wave, "errorCode": "wave_timeout"},
+            )
+            if timed_out.get("error"):
+                return {
+                    "status": "failed",
+                    "phase": "timeout_fence",
+                    "runId": run_id,
+                    "error": timed_out["error"],
+                }
             total_failed += len(wave)
         else:
             timer.cancel()
@@ -844,12 +898,29 @@ def retry_failed_orchestrator(context: df.DurableOrchestrationContext):
             winner = yield context.task_any([task, timer])
         except Exception:
             timer.cancel()
-            swept = yield context.call_activity(
-                "fail_wave_documents_activity", {"runId": run_id, "reason": "retry_exhausted"},
+            interrupted = yield context.call_activity(
+                "timeout_wave_documents_activity",
+                {"documents": [doc_ref], "errorCode": "retry_exhausted"},
             )
-            failed += max(swept.get("failedCount", 0), 1)
+            if interrupted.get("error"):
+                return {
+                    "status": "failed",
+                    "phase": "timeout_fence",
+                    "error": interrupted["error"],
+                }
+            failed += 1
             continue
         if winner == timer:
+            timed_out = yield context.call_activity(
+                "timeout_wave_documents_activity",
+                {"documents": [doc_ref], "errorCode": "retry_timeout"},
+            )
+            if timed_out.get("error"):
+                return {
+                    "status": "failed",
+                    "phase": "timeout_fence",
+                    "error": timed_out["error"],
+                }
             failed += 1
         else:
             timer.cancel()
@@ -906,7 +977,7 @@ def process_document_activity(payload: dict) -> dict:
         repository = _build_repository(config)
         lifecycle_repository = _build_lifecycle_repository(config)
         graph_client = _build_graph_client(config)
-        di_client = _build_di_client(config) if config.extraction_enabled else None
+        di_client, cu_client = _build_extraction_clients(config)
         language_client = _build_language_client(config) if config.enrichment_enabled else None
         openai_client = _build_openai_client(config)
         audit_container = _build_audit_container(config)
@@ -922,6 +993,7 @@ def process_document_activity(payload: dict) -> dict:
                 config, stored.record, stored.etag, repository, lifecycle_repository,
                 connector, di_client, language_client, openai_client,
                 audit_container=audit_container,
+                cu_client=cu_client,
             )
             if outcome.status.value == "succeeded":
                 _retire_prior_version(config, document_ref["documentId"], document_ref["sourceRunId"], audit_container)
@@ -973,6 +1045,51 @@ def process_document_activity(payload: dict) -> dict:
 
 
 @app.activity_trigger(input_name="payload")
+def timeout_wave_documents_activity(payload: dict) -> dict:
+    """Fence every exact document in a timed-out wave against late publication."""
+    from config import load_config
+
+    documents = payload.get("documents")
+    if not isinstance(documents, list) or not documents:
+        return {"error": "invalid_timeout_documents", "failedCount": 0}
+    error_code = payload.get("errorCode", "wave_timeout")
+    failed_count = 0
+    terminal_count = 0
+    error_count = 0
+    try:
+        config = load_config()
+        lifecycle_repository = _build_lifecycle_repository(config)
+        for document in documents:
+            try:
+                changed = lifecycle_repository.fail_timed_out_document(
+                    source_run_id=document["sourceRunId"],
+                    document_id=document["documentId"],
+                    error_code=error_code,
+                )
+                if changed:
+                    failed_count += 1
+                else:
+                    terminal_count += 1
+            except Exception:
+                error_count += 1
+                logger.exception(
+                    "timeout closure failed for document=%s",
+                    document.get("documentId", "") if isinstance(document, dict) else "",
+                )
+    except Exception:
+        logger.exception("timeout_wave_documents_activity failed")
+        return {"error": "timeout_fence_failed", "failedCount": failed_count}
+    if error_count:
+        return {
+            "error": "timeout_fence_incomplete",
+            "failedCount": failed_count,
+            "terminalCount": terminal_count,
+            "errorCount": error_count,
+        }
+    return {"failedCount": failed_count, "terminalCount": terminal_count}
+
+
+@app.activity_trigger(input_name="payload")
 def fail_wave_documents_activity(payload: dict) -> dict:
     """Force-fail any discovered/processing docs for this run after retry exhaustion."""
     from config import load_config
@@ -1012,7 +1129,7 @@ def delta_sync_activity(payload: Any) -> dict:
         repository = _build_repository(config)
         lifecycle_repository = _build_lifecycle_repository(config)
         graph_client = _build_graph_client(config)
-        di_client = _build_di_client(config) if config.extraction_enabled else None
+        di_client, cu_client = _build_extraction_clients(config)
         language_client = _build_language_client(config) if config.enrichment_enabled else None
         openai_client = _build_openai_client(config)
         audit_container = _build_audit_container(config)
@@ -1022,6 +1139,7 @@ def delta_sync_activity(payload: Any) -> dict:
             config, repository, lifecycle_repository, connector,
             di_client, language_client, openai_client,
             audit_container=audit_container,
+            cu_client=cu_client,
         )
         logger.info(
             "delta_sync_completed bootstrapped=%s created_or_updated=%d deleted=%d acl_resynced=%d failed=%d items_seen=%d",
@@ -1322,6 +1440,28 @@ def _build_di_client(config):
         credential = DefaultAzureCredential(managed_identity_client_id=config.managed_identity_client_id)
         _client_cache["di_client"] = DocumentIntelligenceClient(endpoint=config.document_intelligence_endpoint, credential=credential)
     return _client_cache["di_client"]
+
+
+def _build_extraction_clients(config):
+    from config import ExtractionProvider
+
+    if not config.extraction_enabled:
+        return None, None
+    if config.extraction_provider is ExtractionProvider.CONTENT_UNDERSTANDING:
+        return None, _build_cu_client(config)
+    return _build_di_client(config), None
+
+
+def _build_cu_client(config):
+    if "cu_client" not in _client_cache:
+        from azure.ai.contentunderstanding import ContentUnderstandingClient
+        from azure.identity import DefaultAzureCredential
+        credential = DefaultAzureCredential(managed_identity_client_id=config.managed_identity_client_id)
+        _client_cache["cu_client"] = ContentUnderstandingClient(
+            endpoint=config.content_understanding_endpoint.rstrip("/"),
+            credential=credential,
+        )
+    return _client_cache["cu_client"]
 
 
 def _build_language_client(config):

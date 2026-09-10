@@ -1,6 +1,6 @@
 # Enterprise RAG Pipeline
 
-Secure, ACL-trimmed RAG system that ingests PDFs from one SharePoint document library and serves grounded answers with per-document security trimming. Ingestion extracts, chunks, enriches, and embeds content into Cosmos DB. Retrieval uses an LLM query planner to route one planned query through the standard path and two or more planned queries through an Agent Framework path with automatic fallback.
+Secure, ACL-trimmed RAG system that ingests Markdown, PDF, DOCX, PPTX, and XLSX from one SharePoint document library and serves grounded answers with per-document security trimming. Ingestion preserves native source identity, adds required visual descriptions, and then chunks, enriches, and embeds canonical content into Cosmos DB. Retrieval uses an LLM query planner to route one planned query through the standard path and two or more planned queries through an Agent Framework path with automatic fallback.
 
 ## Architecture
 
@@ -8,7 +8,7 @@ Secure, ACL-trimmed RAG system that ingests PDFs from one SharePoint document li
 - **Retrieval:** Hybrid RAG (standard + agentic) on Azure Container Apps with automatic routing
 - **Durable Backend:** Durable Task Scheduler (fresh instance ID per run, tracked via Cosmos)
 - **Storage:** Cosmos DB NoSQL (ingestion-runs, source-documents, search-chunks, retrieval-config, service-audit)
-- **AI Services:** Document Intelligence, Azure AI Language, Azure OpenAI
+- **AI Services:** Document Intelligence, optional Content Understanding rollback, Azure AI Language, Azure OpenAI
 - **Auth:** Managed Identity (Azure services) + Certificate credential (Microsoft Graph)
 - **Networking:** VNet-integrated with Private Endpoints
 
@@ -25,7 +25,7 @@ Browse the [documentation index](docs/README.md) for setup, API, configuration, 
 ```text
 POST /api/ingestion/full-sync → HTTP 202 + status polling URL
 Orchestrator: activate → discover → [fan-out in waves] → finalize
-Per-document: ACL verify → Download → Extract → Chunk → Enrich → Embed → write ineligible chunks → admit generation → READY
+Per-document: ACL verify → Download → Extract native semantics and required visuals → Chunk → Enrich → Embed → write ineligible chunks → admit generation → READY
 ```
 
 **Incremental sync:** Microsoft Graph webhooks push change notifications. A daily reconciliation timer runs delta queries as a safety net, weekly ACL resync re-verifies permissions, and a 10-minute lifecycle reconciliation repairs interrupted transitions, duplicate ready versions, and orphan chunks.
@@ -81,7 +81,7 @@ Use [docs/AZURE_SETUP.md](docs/AZURE_SETUP.md) for the guarded deployment proced
 │   │   ├── lifecycle_repository.py  # Document lifecycle: retire, ACL refresh, delta cursor
 │   │   ├── source_connector.py      # SharePoint connector protocol + implementation
 │   │   ├── graph.py       # Microsoft Graph: discovery, ACL, download, delta
-│   │   ├── extraction.py  # Document Intelligence
+│   │   ├── extraction.py  # Document Intelligence and Content Understanding strategies
 │   │   ├── chunking.py    # Token-based page-aware chunking
 │   │   ├── enrichment.py  # Language AI: key phrases, entities, summary
 │   │   ├── embedding.py   # OpenAI embedding
@@ -104,5 +104,5 @@ Use [docs/AZURE_SETUP.md](docs/AZURE_SETUP.md) for the guarded deployment proced
 ├── evaluation/            # Evaluation schemas (ground-truth, experiments)
 ├── tests/                 # Unit tests (ingestion, retrieval, infra)
 ├── docs/                  # Architecture, API, configuration, setup, readiness, demo, and infrastructure guides
-└── data/                  # Sample Cosmos data exports
+└── data/                  # Policy PDFs; generated Cosmos exports are ignored
 ```

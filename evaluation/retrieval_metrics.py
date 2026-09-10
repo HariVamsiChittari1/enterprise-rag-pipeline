@@ -16,7 +16,7 @@ import json
 import math
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 
 JudgedInterval = tuple[str, int, int]
@@ -91,10 +91,11 @@ def _assert_unit_metric(value: float, label: str) -> None:
 
 
 def evaluate_rankings(
-    judgments: dict[str, list[JudgedInterval]],
-    rankings: dict[str, list[RankingItem]],
+    judgments: dict[str, list[Any]],
+    rankings: dict[str, list[Any]],
     *,
     k: int,
+    matcher: Callable[[Any, Any], bool] = _matches_interval,
 ) -> list[QueryMetrics]:
     if isinstance(k, bool) or not isinstance(k, int) or k < 1:
         raise ValueError("k must be a positive integer")
@@ -112,7 +113,7 @@ def evaluate_rankings(
         for rank, item in enumerate(retrieved, start=1):
             hit = False
             for index, interval in enumerate(intervals):
-                if _matches_interval(item, interval):
+                if matcher(item, interval):
                     hit = True
                     judged_hits.add(index)
             if hit:
@@ -147,14 +148,15 @@ def summarize(metrics: Iterable[QueryMetrics]) -> dict[str, float | int]:
 
 
 def compare(
-    judgments: dict[str, list[JudgedInterval]],
-    baseline: dict[str, list[RankingItem]],
-    candidate: dict[str, list[RankingItem]],
+    judgments: dict[str, list[Any]],
+    baseline: dict[str, list[Any]],
+    candidate: dict[str, list[Any]],
     *,
     k: int,
+    matcher: Callable[[Any, Any], bool] = _matches_interval,
 ) -> dict[str, Any]:
-    baseline_metrics = evaluate_rankings(judgments, baseline, k=k)
-    candidate_metrics = evaluate_rankings(judgments, candidate, k=k)
+    baseline_metrics = evaluate_rankings(judgments, baseline, k=k, matcher=matcher)
+    candidate_metrics = evaluate_rankings(judgments, candidate, k=k, matcher=matcher)
     baseline_summary = summarize(baseline_metrics)
     candidate_summary = summarize(candidate_metrics)
     baseline_by_query = {item.query_id: item for item in baseline_metrics}

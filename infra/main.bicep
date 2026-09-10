@@ -22,6 +22,19 @@ param embeddingDeploymentName string = 'text-embedding-3-large'
 @minLength(1)
 param chatDeploymentName string
 
+@description('Enable Document Intelligence extraction')
+param documentIntelligenceEnabled bool = true
+
+@description('Enable Content Understanding extraction and infrastructure')
+param contentUnderstandingEnabled bool = false
+
+@description('API-version-pinned Content Understanding analyzer ID')
+@minLength(1)
+param contentUnderstandingAnalyzerId string = 'prebuilt-documentSearch'
+
+@description('Temporary public IPv4 address allowed during guarded Content Understanding setup; empty keeps private-only access')
+param contentUnderstandingAllowedIpAddress string = ''
+
 @description('SharePoint tenant ID')
 param sharePointTenantId string
 
@@ -104,11 +117,32 @@ param applicationInsightsDailyCapGb int = -1
 @description('Enable ACL filtering in the retrieval service')
 param aclEnabled bool = true
 
+@description('Include source citations in retrieval query responses')
+param includeCitations bool = true
+
 @description('Immutable retrieval image reference repository@sha256:<digest>; required when deployServing=true')
 param retrievalImageReference string = ''
 
-@description('Immutable retrieval catalog sha256:<digest>; required when deployServing=true')
+@description('Reviewed seed sha256:<digest>; required only for explicit catalog initialization')
 param retrievalCatalogDigest string = ''
+
+@description('Human catalog editor principal object ID; empty leaves assignment disabled')
+param catalogEditorPrincipalId string = ''
+
+@description('Optional guarded catalog writer principal object ID')
+param catalogWriterPrincipalId string = ''
+
+@description('Read-only catalog observer principal object ID')
+param catalogObserverPrincipalId string = ''
+
+@description('Private catalog operation; ordinary redeployment verifies without writing')
+@allowed(['publish-catalog', 'verify-catalog'])
+param catalogOperation string = 'verify-catalog'
+
+@description('Runtime catalog poll interval in seconds')
+@minValue(60)
+@maxValue(86400)
+param retrievalCatalogPollSeconds int = 7200
 
 @description('ACA minimum replicas')
 @minValue(1)
@@ -120,6 +154,15 @@ param retrievalMaxReplicas int = 5
 
 @description('ACA zone redundancy creation-time setting')
 param retrievalZoneRedundant bool = false
+
+@description('Existing Function integration subnet network security group resource ID')
+param functionIntegrationSubnetNsgId string = ''
+
+@description('Existing private endpoint subnet network security group resource ID')
+param privateEndpointSubnetNsgId string = ''
+
+@description('Existing ACA environment subnet network security group resource ID')
+param acaEnvironmentSubnetNsgId string = ''
 
 @description('Resource tags')
 param tags object = {
@@ -147,6 +190,8 @@ module monitoring './modules/monitoring.bicep' = {
     applicationInsightsName: '${prefix}-ai'
     location: location
     dailyQuotaGb: applicationInsightsDailyCapGb
+    retrievalPrincipalId: acaRetrievalIdentity.outputs.identityPrincipalId
+    observerPrincipalId: catalogObserverPrincipalId
     tags: tags
   }
 }
@@ -174,6 +219,7 @@ module cosmos './modules/cosmos.bicep' = {
   name: 'cosmos'
   params: {
     cosmosAccountName: take('${prefix}-cosmos-${suffix}', 44)
+    logAnalyticsWorkspaceId: monitoring.outputs.logAnalyticsId
     location: location
     mode: cosmosDbMode
     metadataAutoscaleMaxThroughput: cosmosMetadataAutoscaleMaxRUs
@@ -207,55 +253,80 @@ module documentIntelligence './modules/ai-services.bicep' = {
   }
 }
 
+module contentUnderstanding './modules/content-understanding.bicep' = if (contentUnderstandingEnabled) {
+  name: 'content-understanding'
+  params: {
+    accountName: take('${prefix}-cu-${suffix}', 64)
+    location: location
+    allowedIpAddress: contentUnderstandingAllowedIpAddress
+    tags: tags
+  }
+}
+
 module networking './modules/networking.bicep' = {
   name: 'networking'
   params: {
     virtualNetworkName: '${prefix}-vnet'
     location: location
-    privateEndpointTargets: [
-      {
-        name: 'storage-blob'
-        resourceId: storage.outputs.storageAccountId
-        groupId: 'blob'
-        dnsZoneName: 'privatelink.blob.${environment().suffixes.storage}'
-      }
-      {
-        name: 'storage-queue'
-        resourceId: storage.outputs.storageAccountId
-        groupId: 'queue'
-        dnsZoneName: 'privatelink.queue.${environment().suffixes.storage}'
-      }
-      {
-        name: 'storage-table'
-        resourceId: storage.outputs.storageAccountId
-        groupId: 'table'
-        dnsZoneName: 'privatelink.table.${environment().suffixes.storage}'
-      }
-      {
-        name: 'cosmos-sql'
-        resourceId: cosmos.outputs.cosmosAccountId
-        groupId: 'Sql'
-        dnsZoneName: 'privatelink.documents.azure.com'
-      }
-      {
-        name: 'key-vault'
-        resourceId: sharePointKeyVaultId
-        groupId: 'vault'
-        dnsZoneName: 'privatelink.vaultcore.azure.net'
-      }
-      {
-        name: 'document-intelligence'
-        resourceId: documentIntelligence.outputs.documentIntelligenceId
-        groupId: 'account'
-        dnsZoneName: 'privatelink.cognitiveservices.azure.com'
-      }
-      {
-        name: 'language-service'
-        resourceId: documentIntelligence.outputs.languageServiceId
-        groupId: 'account'
-        dnsZoneName: 'privatelink.cognitiveservices.azure.com'
-      }
-    ]
+    functionIntegrationSubnetNsgId: functionIntegrationSubnetNsgId
+    privateEndpointSubnetNsgId: privateEndpointSubnetNsgId
+    acaEnvironmentSubnetNsgId: acaEnvironmentSubnetNsgId
+    privateEndpointTargets: concat(
+      [
+        {
+          name: 'storage-blob'
+          resourceId: storage.outputs.storageAccountId
+          groupId: 'blob'
+          dnsZoneName: 'privatelink.blob.${environment().suffixes.storage}'
+        }
+        {
+          name: 'storage-queue'
+          resourceId: storage.outputs.storageAccountId
+          groupId: 'queue'
+          dnsZoneName: 'privatelink.queue.${environment().suffixes.storage}'
+        }
+        {
+          name: 'storage-table'
+          resourceId: storage.outputs.storageAccountId
+          groupId: 'table'
+          dnsZoneName: 'privatelink.table.${environment().suffixes.storage}'
+        }
+        {
+          name: 'cosmos-sql'
+          resourceId: cosmos.outputs.cosmosAccountId
+          groupId: 'Sql'
+          dnsZoneName: 'privatelink.documents.azure.com'
+        }
+        {
+          name: 'key-vault'
+          resourceId: sharePointKeyVaultId
+          groupId: 'vault'
+          dnsZoneName: 'privatelink.vaultcore.azure.net'
+        }
+        {
+          name: 'document-intelligence'
+          resourceId: documentIntelligence.outputs.documentIntelligenceId
+          groupId: 'account'
+          dnsZoneName: 'privatelink.cognitiveservices.azure.com'
+        }
+        {
+          name: 'language-service'
+          resourceId: documentIntelligence.outputs.languageServiceId
+          groupId: 'account'
+          dnsZoneName: 'privatelink.cognitiveservices.azure.com'
+        }
+      ],
+      contentUnderstandingEnabled
+        ? [
+            {
+              name: 'content-understanding'
+              resourceId: contentUnderstanding.?outputs.?accountId ?? ''
+              groupId: 'account'
+              dnsZoneName: 'privatelink.services.ai.azure.com'
+            }
+          ]
+        : []
+    )
     tags: tags
   }
 }
@@ -295,6 +366,10 @@ module functions './modules/functions.bicep' = if (deployServing) {
     embeddingDeploymentName: embeddingDeploymentName
     chatDeploymentName: chatDeploymentName
     documentIntelligenceEndpoint: documentIntelligence.outputs.documentIntelligenceEndpoint
+    documentIntelligenceEnabled: documentIntelligenceEnabled
+    contentUnderstandingEndpoint: contentUnderstanding.?outputs.?endpoint ?? ''
+    contentUnderstandingAnalyzerId: contentUnderstandingEnabled ? contentUnderstandingAnalyzerId : ''
+    contentUnderstandingEnabled: contentUnderstandingEnabled
     languageEndpoint: documentIntelligence.outputs.languageServiceEndpoint
     keyVaultUri: sharePointKeyVaultUri
     entraTenantId: sharePointTenantId
@@ -320,6 +395,7 @@ module rbac './modules/rbac.bicep' = {
     cosmosAccountId: cosmos.outputs.cosmosAccountId
     storageAccountId: storage.outputs.storageAccountId
     documentIntelligenceId: documentIntelligence.outputs.documentIntelligenceId
+    contentUnderstandingId: contentUnderstanding.?outputs.?accountId ?? ''
     languageServiceId: documentIntelligence.outputs.languageServiceId
     applicationInsightsId: monitoring.outputs.applicationInsightsId
   }
@@ -399,6 +475,8 @@ module retrievalConfigPublisherRbac './modules/retrieval-config-publisher-rbac.b
   name: 'retrieval-config-publisher-rbac'
   params: {
     publisherPrincipalId: operationsIdentity.outputs.identityPrincipalId
+    editorPrincipalId: catalogEditorPrincipalId
+    writerPrincipalId: catalogWriterPrincipalId
     cosmosAccountId: cosmos.outputs.cosmosAccountId
     cosmosDatabaseName: cosmos.outputs.databaseName
     retrievalConfigContainerName: cosmos.outputs.retrievalConfigContainerName
@@ -419,6 +497,7 @@ module operationsJob './modules/aca-operations-job.bicep' = if (deployOperations
     retrievalConfigContainerName: cosmos.outputs.retrievalConfigContainerName
     deploymentInstanceId: deploymentInstanceId
     catalogDigest: retrievalCatalogDigest
+    catalogOperation: catalogOperation
     tags: tags
   }
 }
@@ -437,8 +516,9 @@ module retrievalConfig './modules/retrieval-config.bicep' = if (deployServing) {
     gatewayClientId: identity.outputs.identityClientId
     gatewayPrincipalId: identity.outputs.identityPrincipalId
     deploymentInstanceId: deploymentInstanceId
-    catalogDigest: retrievalCatalogDigest
+    catalogPollSeconds: retrievalCatalogPollSeconds
     aclEnabled: aclEnabled
+    includeCitations: includeCitations
     appInsightsConnectionString: monitoring.outputs.connectionString
     retrievalConfigContainer: cosmos.outputs.retrievalConfigContainerName
   }
@@ -448,6 +528,7 @@ module aca './modules/aca.bicep' = if (deployServing) {
   name: 'aca'
   params: {
     containerAppName: '${take(replace(prefix, '-', ''), 18)}-retr-${suffix}'
+    observerPrincipalId: catalogObserverPrincipalId
     location: location
     acrLoginServer: acr.outputs.loginServer
     imageName: retrievalImageReference
@@ -489,8 +570,13 @@ output keyVaultName string = sharePointKeyVaultName
 output cosmosDbEndpoint string = cosmos.outputs.endpoint
 output cosmosDbDatabaseName string = cosmos.outputs.databaseName
 output documentIntelligenceEndpoint string = documentIntelligence.outputs.documentIntelligenceEndpoint
+output contentUnderstandingAccountId string = contentUnderstanding.?outputs.?accountId ?? ''
+output contentUnderstandingEndpoint string = contentUnderstanding.?outputs.?endpoint ?? ''
+output contentUnderstandingCompletionDeploymentName string = contentUnderstanding.?outputs.?completionDeploymentName ?? ''
+output contentUnderstandingEmbeddingDeploymentName string = contentUnderstanding.?outputs.?embeddingDeploymentName ?? ''
 output openAiEndpoint string = openAiEndpoint
 output acrLoginServer string = acr.outputs.loginServer
 output retrievalServiceUrl string = aca.?outputs.?internalUrl ?? ''
 output retrievalContainerAppName string = aca.?outputs.?containerAppName ?? ''
+output catalogObservationWorkspaceId string = monitoring.outputs.logAnalyticsWorkspaceId
 output retrievalConfigMap object = retrievalConfig.?outputs.?configMap ?? {}

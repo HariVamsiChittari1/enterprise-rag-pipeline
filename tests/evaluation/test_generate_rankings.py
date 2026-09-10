@@ -1,9 +1,10 @@
-"""Focused tests for the private one-fetch protected ranking generator."""
+"""Focused tests for the private profile-specific protected ranking generator."""
 
 from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,8 +17,10 @@ from evaluation.generate_rankings import (
     GenerateRankingsError,
     generate_rankings,
     _canonical_json_bytes,
+    _identity_ranking,
 )
-from retrieval.cosmos import RetrievalMode, RetrievedChunk
+from retrieval.catalog import RuntimeCatalogSnapshot
+from retrieval.cosmos import RetrievalLocatorKind, RetrievalMode, RetrievedChunk
 from retrieval.cosmos_registry import CosmosRegistry
 from retrieval.scoring import (
     FreshnessParameters,
@@ -45,6 +48,22 @@ def _raw_candidate(chunk_id: str, source_modified_at: str | None) -> dict[str, A
 
 def _registry(retriever) -> CosmosRegistry:
     return CosmosRegistry({"source": retriever})
+
+
+def _retrieved_chunk(item: dict[str, Any]) -> RetrievedChunk:
+    page_number = item["pageStart"]
+    return RetrievedChunk(
+        chunk_id=item["id"],
+        document_id=item["documentId"],
+        content=item["content"],
+        source_name=item["sourceName"],
+        source_url=item["sourceUrl"],
+        locator_kind=RetrievalLocatorKind.PAGE,
+        locator_label=f"Page {page_number}",
+        locator_ordinal_start=page_number,
+        locator_ordinal_end=page_number,
+        source_modified_at=item.get("sourceModifiedAt"),
+    )
 
 
 def _write_jsonl(path: Path, records: list[dict[str, Any]]) -> None:
@@ -159,7 +178,6 @@ def _manifest_extras() -> dict[str, Any]:
         "baseImageDigest": "sha256:" + SHA256,
         "dependencyLockHash": SHA256,
         "acrBuildId": "fabricated-build-id",
-        "catalogSha": SHA256,
         "profiles": {
             name: {"version": f"{name}-v1", "parameters": {}}
             for name in (
@@ -180,6 +198,16 @@ def _manifest_extras() -> dict[str, Any]:
     }
 
 
+def _provider(profiles: dict[str, ScoringProfile]) -> SimpleNamespace:
+    return SimpleNamespace(snapshot=RuntimeCatalogSnapshot(
+        deployment_instance_id="test", catalog_id="runtime-catalog", etag="etag-a",
+        digest="sha256:" + "a" * 64, operation_id="operation-a",
+        changed_at="2026-09-08T00:00:00Z", accepted_at=datetime(2026, 9, 8, tzinfo=timezone.utc),
+        over_fetch_factor=1, hybrid_weights=(1, 1), full_text_score_scope="Global",
+        default_profile=None, profiles=profiles, synonym_maps={}, synonym_expanders={},
+    ))
+
+
 def _service_factory(profiles: dict[str, ScoringProfile], candidates: list[dict[str, Any]]):
     """Return a factory that constructs a RagService with mocked retriever + OpenAI."""
 
@@ -191,16 +219,11 @@ def _service_factory(profiles: dict[str, ScoringProfile], candidates: list[dict[
         retriever = Mock()
         retriever.retrieve.return_value = list(candidates)
         retriever.to_chunks.side_effect = lambda pool: [
-            RetrievedChunk(
-                item["id"], item["documentId"], item["content"],
-                item["sourceName"], item["sourceUrl"], item["pageStart"],
-                item.get("sourceModifiedAt"),
-            )
-            for item in pool
+            _retrieved_chunk(item) for item in pool
         ]
         return RagService(
             client, _registry(retriever), "embedding", "chat",
-            scoring_profiles=profiles, over_fetch_factor=1,
+            catalog_provider=_provider(profiles),
         )
 
     return factory
@@ -311,6 +334,22 @@ def test_generate_rankings_writes_identity_only_baseline_and_candidate(tmp_path:
     assert manifest["baselineRankingHash"] == hashlib.sha256(baseline_path.read_bytes()).hexdigest()
     assert manifest["candidateRankingHash"] == hashlib.sha256(candidate_path.read_bytes()).hexdigest()
 
+def test_generic_ranking_rejects_non_page_locator() -> None:
+    chunk = RetrievedChunk(
+        chunk_id="chunk-1",
+        document_id="doc-1",
+        content="Fabricated.",
+        source_name="forecast.xlsx",
+        source_url="https://example.invalid/forecast.xlsx",
+        locator_kind=RetrievalLocatorKind.WORKSHEET,
+        locator_label="Worksheet: Forecast",
+        locator_ordinal_start=1,
+        locator_ordinal_end=1,
+    )
+
+    with pytest.raises(GenerateRankingsError, match="page locators only"):
+        _identity_ranking([chunk])
+
 
 def test_generate_rankings_uses_profile_specific_retrieval_per_query(tmp_path: Path) -> None:
     profiles = {
@@ -322,6 +361,8 @@ def test_generate_rankings_uses_profile_specific_retrieval_per_query(tmp_path: P
         _raw_candidate("new", "2024-01-01T00:00:00Z"),
     ]
     call_counter = {"retrieve": 0}
+    provider = _provider(profiles)
+    observed_weights = []
 
     def factory() -> RagService:
         client = Mock()
@@ -332,27 +373,31 @@ def test_generate_rankings_uses_profile_specific_retrieval_per_query(tmp_path: P
 
         def _tracked_retrieve(*args, **kwargs):
             call_counter["retrieve"] += 1
+            observed_weights.append(kwargs["rrf_weights"])
+            provider.snapshot = replace(
+                provider.snapshot, etag="etag-b", operation_id="operation-b",
+                digest="sha256:" + "b" * 64, hybrid_weights=(7, 3), profiles={},
+            )
             return list(candidates)
 
         retriever.retrieve.side_effect = _tracked_retrieve
         retriever.to_chunks.side_effect = lambda pool: [
-            RetrievedChunk(
-                item["id"], item["documentId"], item["content"],
-                item["sourceName"], item["sourceUrl"], item["pageStart"],
-                item.get("sourceModifiedAt"),
-            )
-            for item in pool
+            _retrieved_chunk(item) for item in pool
         ]
         return RagService(
             client, _registry(retriever), "embedding", "chat",
-            scoring_profiles=profiles, over_fetch_factor=1,
+            catalog_provider=provider,
         )
 
     kwargs = _default_kwargs(tmp_path, profiles=profiles)
     kwargs["service_factory"] = factory
-    generate_rankings(**kwargs)
-    # Exactly one query in ground truth -> exactly one Cosmos retrieve call.
+    manifest_path = generate_rankings(**kwargs)
     assert call_counter["retrieve"] == 2
+    assert observed_weights == [(1, 1), (1, 1)]
+    manifest = json.loads(manifest_path.read_text("utf-8"))
+    assert manifest["catalogEtag"] == "etag-a"
+    assert manifest["catalogSha"] == "a" * 64
+    assert provider.snapshot.etag == "etag-b"
 
 
 def test_generate_rankings_rejects_deny_set_hit(tmp_path: Path) -> None:
@@ -466,11 +511,12 @@ def test_generate_rankings_rejects_unknown_raw_pool_document(tmp_path: Path) -> 
         generate_rankings(**kwargs)
 
 
-def test_generate_rankings_rejects_computed_manifest_collision(tmp_path: Path) -> None:
+@pytest.mark.parametrize("field", ["datasetHash", "catalogSha", "catalogEtag"])
+def test_generate_rankings_rejects_computed_manifest_collision(tmp_path: Path, field: str) -> None:
     kwargs = _default_kwargs(tmp_path)
     kwargs["manifest_extras"] = {
         **kwargs["manifest_extras"],
-        "datasetHash": "b" * 64,
+        field: "b" * 64,
     }
 
     with pytest.raises(GenerateRankingsError, match="cannot overwrite computed fields"):

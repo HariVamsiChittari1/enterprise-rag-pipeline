@@ -34,6 +34,58 @@ def pdf_item(item_id: str, name: str | None = None, size: int = 100) -> dict:
     }
 
 
+@pytest.mark.parametrize(
+    ("name", "mime_type"),
+    [
+        ("guide.md", "text/markdown"),
+        ("report.pdf", "application/pdf"),
+        (
+            "report.docx",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ),
+        (
+            "briefing.pptx",
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        ),
+        (
+            "forecast.xlsx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        ),
+    ],
+)
+def test_discovery_preserves_validated_source_mime(
+    name: str,
+    mime_type: str,
+) -> None:
+    item = pdf_item("source", name=name)
+    item["file"]["mimeType"] = f"{mime_type}; charset=binary"
+
+    step = advance_discovery(
+        DiscoveryState.initial(),
+        ChildrenPage((item,), None),
+        ScaleLimits(),
+        allowed_extensions=(".md", ".pdf", ".docx", ".pptx", ".xlsx"),
+    )
+
+    assert step.pdfs[0].mime_type == mime_type
+    assert step.pdfs[0].to_dict()["mimeType"] == mime_type
+
+
+def test_discovery_skips_source_mime_mismatch_and_keeps_valid_items() -> None:
+    mismatched = pdf_item("bad", name="report.docx")
+    valid = pdf_item("good", name="report.pdf")
+
+    step = advance_discovery(
+        DiscoveryState.initial(),
+        ChildrenPage((mismatched, valid), None),
+        ScaleLimits(),
+        allowed_extensions=(".docx", ".pdf"),
+    )
+
+    assert [pdf.name for pdf in step.pdfs] == ["report.pdf"]
+    assert step.state.pdfs_discovered == 1
+
+
 def test_discovery_pages_root_then_nested_folders_and_preserves_next_link() -> None:
     opaque_next = (
         "https://graph.microsoft.com/v1.0/drives/drive/root/children"
@@ -111,7 +163,7 @@ def test_discovery_traverses_package_facets_as_containers() -> None:
         (ScaleLimits(max_folders=1), DiscoveryState.initial(), ChildrenPage(({"id": "one", "folder": {}}, {"id": "two", "folder": {}}), None), "max_folders_exceeded"),
         (ScaleLimits(max_folder_depth=1), DiscoveryState((FolderCursor("parent", 1),)), ChildrenPage(({"id": "child", "folder": {}},), None), "max_folder_depth_exceeded"),
         (ScaleLimits(max_eligible_pdfs=1), DiscoveryState.initial(), ChildrenPage((pdf_item("one"), pdf_item("two")), None), "max_eligible_pdfs_exceeded"),
-        (ScaleLimits(max_pdf_bytes=99), DiscoveryState.initial(), ChildrenPage((pdf_item("large", size=100),), None), "max_pdf_bytes_exceeded"),
+        (ScaleLimits(max_source_bytes=99), DiscoveryState.initial(), ChildrenPage((pdf_item("large", size=100),), None), "max_source_bytes_exceeded"),
     ],
 )
 def test_discovery_enforces_guards(limits, state, page, code: str) -> None:

@@ -18,15 +18,28 @@ import function_app
 
 
 class FakeLifecycleRepository:
-    def __init__(self, existing_instance_id: str | None = None) -> None:
+    def __init__(
+        self,
+        existing_instance_id: str | None = None,
+        *,
+        claim_succeeds: bool = True,
+    ) -> None:
         self._existing_instance_id = existing_instance_id
-        self.saved: list[tuple[str, str, str]] = []
+        self._claim_succeeds = claim_succeeds
+        self.claims: list[tuple[str, str, str | None, str]] = []
 
     def get_trigger_instance_id(self, source_id: str, control_id: str) -> str | None:
         return self._existing_instance_id
 
-    def save_trigger_instance_id(self, source_id: str, control_id: str, instance_id: str) -> None:
-        self.saved.append((source_id, control_id, instance_id))
+    def try_claim_trigger_instance_id(
+        self,
+        source_id: str,
+        control_id: str,
+        expected_instance_id: str | None,
+        instance_id: str,
+    ) -> bool:
+        self.claims.append((source_id, control_id, expected_instance_id, instance_id))
+        return self._claim_succeeds
 
 
 class FakeClient:
@@ -53,7 +66,9 @@ def test_starts_fresh_instance_when_nothing_previously_tracked() -> None:
     assert result is not None
     assert result.startswith("delta-sync-trigger-")
     assert client.started == [("delta_sync_orchestrator", result)]
-    assert lifecycle_repository.saved == [("source-1", "delta-sync-trigger", result)]
+    assert lifecycle_repository.claims == [
+        ("source-1", "delta-sync-trigger", None, result)
+    ]
 
 
 def test_skips_start_when_tracked_instance_is_running() -> None:
@@ -67,7 +82,7 @@ def test_skips_start_when_tracked_instance_is_running() -> None:
 
     assert result is None
     assert client.started == []
-    assert lifecycle_repository.saved == []
+    assert lifecycle_repository.claims == []
 
 
 def test_skips_start_when_tracked_instance_is_pending() -> None:
@@ -81,6 +96,23 @@ def test_skips_start_when_tracked_instance_is_pending() -> None:
 
     assert result is None
     assert client.started == []
+
+
+def test_skips_start_when_concurrent_caller_wins_trigger_claim() -> None:
+    lifecycle_repository = FakeLifecycleRepository(
+        existing_instance_id="delta-sync-trigger-old",
+        claim_succeeds=False,
+    )
+    status = type("Status", (), {"runtime_status": df.OrchestrationRuntimeStatus.Completed})()
+    client = FakeClient(status=status)
+
+    result = asyncio.run(
+        function_app._start_if_not_running(client, lifecycle_repository, "source-1", "delta-sync-trigger", "delta_sync_orchestrator")
+    )
+
+    assert result is None
+    assert client.started == []
+    assert len(lifecycle_repository.claims) == 1
 
 
 def test_starts_new_instance_when_tracked_instance_has_completed() -> None:

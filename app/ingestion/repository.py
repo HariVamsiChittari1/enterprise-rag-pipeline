@@ -14,14 +14,17 @@ logger = logging.getLogger(__name__)
 
 from ingestion.models import (
     ChunkingProfile,
+    ContentModality,
     DocumentStage,
     DocumentStatus,
     EmbeddingProfile,
     EnrichmentProfile,
     EnrichmentStatuses,
     Entity,
+    ExtractionProvenance,
     ExtractionProfile,
     IngestionRunRecord,
+    LocatorKind,
     ModuleStatus,
     ProfileSnapshot,
     RunCounters,
@@ -30,12 +33,21 @@ from ingestion.models import (
     SafeError,
     ScaleLimits,
     SearchChunkRecord,
+    SOURCE_DOCUMENT_RECORD_TYPE,
     SourceControlRecord,
     SourceDocumentRecord,
+    SourceLocator,
+    VisualDisposition,
+    VisualCoverageStatus,
+    VisualManifestEntry,
+    VisualManifestPage,
+    VisualRelevance,
+    VISUAL_MANIFEST_PAGE_RECORD_TYPE,
     create_chunk_id,
     create_source_run_id,
     run_record_id,
     serialized_size_bytes,
+    visual_manifest_hash,
 )
 
 
@@ -121,6 +133,16 @@ class IngestionRepository:
         if item is None:
             return None
         return _hydrate(item, _chunk_from_item, "search chunk")
+
+    def get_visual_manifest_page(
+        self,
+        source_run_id: str,
+        page_id: str,
+    ) -> VisualManifestPage | None:
+        item = self._read_item(self._source_documents, page_id, source_run_id)
+        if item is None:
+            return None
+        return _hydrate(item, _visual_manifest_page_from_item, "visual manifest page")
 
     def activate_run(
         self,
@@ -225,6 +247,8 @@ class IngestionRepository:
                 "pageCount",
                 "expectedChunkCount",
                 "writtenChunkCount",
+                "visualManifestPageCount",
+                "visualManifestHash",
                 "contentHash",
                 "extractionMode",
             },
@@ -257,11 +281,14 @@ class IngestionRepository:
             or document.stage is not DocumentStage.VERIFYING
             or document.expected_chunk_count is None
             or document.written_chunk_count != document.expected_chunk_count
+            or document.visual_manifest_page_count is None
+            or document.visual_manifest_hash is None
             or not document.allowed_group_ids
             or not document.acl_hash
             or document.acl_evaluated_at is None
         ):
             raise ValueError("admitting document integrity fields are incomplete")
+        self._verify_visual_manifest(document)
         return self._replace_document(
             document,
             etag,
@@ -276,6 +303,8 @@ class IngestionRepository:
                 "aclEvaluatedAt",
                 "expectedChunkCount",
                 "writtenChunkCount",
+                "visualManifestPageCount",
+                "visualManifestHash",
             },
         )
 
@@ -285,9 +314,13 @@ class IngestionRepository:
         query = (
             "SELECT * FROM c "
             "WHERE c.sourceRunId = @sourceRunId "
+            "AND c.recordType = @recordType "
             "AND c.status IN ('discovered', 'processing')"
         )
-        parameters = [{"name": "@sourceRunId", "value": source_run_id}]
+        parameters = [
+            {"name": "@sourceRunId", "value": source_run_id},
+            {"name": "@recordType", "value": SOURCE_DOCUMENT_RECORD_TYPE},
+        ]
         failed_count = 0
         continuation: str | None = None
         now = datetime.now(tz=__import__("datetime").timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -322,8 +355,14 @@ class IngestionRepository:
     def get_failed_documents(self, source_id: str, run_id: str) -> list[dict[str, Any]]:
         """Return all failed documents for a given run."""
         source_run_id = create_source_run_id(source_id, run_id)
-        query = "SELECT * FROM c WHERE c.sourceRunId = @sourceRunId AND c.status = 'failed'"
-        parameters = [{"name": "@sourceRunId", "value": source_run_id}]
+        query = (
+            "SELECT * FROM c WHERE c.sourceRunId = @sourceRunId "
+            "AND c.recordType = @recordType AND c.status = 'failed'"
+        )
+        parameters = [
+            {"name": "@sourceRunId", "value": source_run_id},
+            {"name": "@recordType", "value": SOURCE_DOCUMENT_RECORD_TYPE},
+        ]
         results: list[dict[str, Any]] = []
         continuation: str | None = None
         while True:
@@ -391,6 +430,24 @@ class IngestionRepository:
             self._create_chunk_batch(tuple(batch))
         return len(validated)
 
+    def write_visual_manifest_pages(
+        self,
+        pages: Sequence[VisualManifestPage],
+    ) -> int:
+        validated = self._validate_visual_manifest_pages(pages)
+        for page in validated:
+            try:
+                self._source_documents.create_item(body=page.to_cosmos_item())
+            except Exception as error:
+                if _error_status(error) != 409:
+                    raise RepositoryError("Cosmos visual-manifest create failed") from None
+                stored = self.get_visual_manifest_page(page.source_run_id, page.id)
+                if stored is None or not _same_domain(stored, page):
+                    raise RepositoryConflictError(
+                        "visual-manifest page id has different content"
+                    ) from None
+        return len(validated)
+
     def verify_and_mark_document_ready(
         self,
         document: SourceDocumentRecord,
@@ -406,6 +463,7 @@ class IngestionRepository:
             or document.error is not None
         ):
             raise ValueError("ready document integrity fields are incomplete")
+        self._verify_visual_manifest(document)
         self._verify_exact_chunks(document)
         return self._replace_document(
             document,
@@ -438,9 +496,12 @@ class IngestionRepository:
         source_run_id = create_source_run_id(source_id, run_id)
         query = (
             "SELECT c.status, c.writtenChunkCount FROM c "
-            "WHERE c.sourceRunId = @sourceRunId"
+            "WHERE c.sourceRunId = @sourceRunId AND c.recordType = @recordType"
         )
-        parameters = [{"name": "@sourceRunId", "value": source_run_id}]
+        parameters = [
+            {"name": "@sourceRunId", "value": source_run_id},
+            {"name": "@recordType", "value": SOURCE_DOCUMENT_RECORD_TYPE},
+        ]
         counts = {status.value: 0 for status in DocumentStatus}
         chunks_written = 0
         continuation: str | None = None
@@ -654,10 +715,11 @@ class IngestionRepository:
             "SELECT c.id, c.sourceId, c.runId, c.sourceRunId, c.documentKey, c.sourceName, "
             "c.sourcePath, c.status, c.stage, c.discoveryOrdinal, c.attemptCount, "
             "c.expectedChunkCount, c.writtenChunkCount, c.updatedAt, c.error.code AS errorCode "
-            "FROM c WHERE c.sourceRunId = @sourceRunId"
+            "FROM c WHERE c.sourceRunId = @sourceRunId AND c.recordType = @recordType"
         )
         parameters: list[dict[str, Any]] = [
-            {"name": "@sourceRunId", "value": source_run_id}
+            {"name": "@sourceRunId", "value": source_run_id},
+            {"name": "@recordType", "value": SOURCE_DOCUMENT_RECORD_TYPE},
         ]
         if status is not None:
             query += " AND c.status = @status"
@@ -730,6 +792,26 @@ class IngestionRepository:
                 page_size,
                 None,
             )
+            manifest_query = (
+                "SELECT c.id, c.documentId FROM c "
+                "WHERE c.sourceRunId = @sourceRunId "
+                "AND c.documentId = @documentId AND c.recordType = @recordType"
+            )
+            manifest_pages, manifest_token = self._query_page(
+                self._source_documents,
+                manifest_query,
+                [
+                    {"name": "@sourceRunId", "value": source_run_id},
+                    {"name": "@documentId", "value": document_id},
+                    {
+                        "name": "@recordType",
+                        "value": VISUAL_MANIFEST_PAGE_RECORD_TYPE,
+                    },
+                ],
+                source_run_id,
+                page_size,
+                None,
+            )
             self._ensure_not_current(source_id, run_id)
             for chunk in chunks:
                 chunk_id = chunk.get("id")
@@ -737,7 +819,21 @@ class IngestionRepository:
                     raise RepositoryDataError("cleanup query returned invalid chunk identity")
                 if self._delete_item(self._search_chunks, chunk_id, document_key):
                     chunks_deleted += 1
-            if chunk_token is None:
+            for manifest_page in manifest_pages:
+                manifest_page_id = manifest_page.get("id")
+                if (
+                    not isinstance(manifest_page_id, str)
+                    or manifest_page.get("documentId") != document_id
+                ):
+                    raise RepositoryDataError(
+                        "cleanup query returned invalid visual-manifest identity"
+                    )
+                self._delete_item(
+                    self._source_documents,
+                    manifest_page_id,
+                    source_run_id,
+                )
+            if chunk_token is None and manifest_token is None:
                 self._ensure_not_current(source_id, run_id)
                 if self._delete_item(self._source_documents, document_id, source_run_id):
                     documents_deleted += 1
@@ -838,6 +934,29 @@ class IngestionRepository:
             remaining = tuple(missing)
         raise RepositoryConflictError("chunk batch conflicts did not converge")
 
+    @staticmethod
+    def _validate_visual_manifest_pages(
+        pages: Sequence[VisualManifestPage],
+    ) -> tuple[VisualManifestPage, ...]:
+        validated = tuple(pages)
+        if any(not isinstance(page, VisualManifestPage) for page in validated):
+            raise TypeError("manifest pages must be VisualManifestPage values")
+        if not validated:
+            return validated
+        if tuple(page.page_index for page in validated) != tuple(range(len(validated))):
+            raise ValueError("manifest page indices must be contiguous from zero")
+        if any(page.page_count != len(validated) for page in validated):
+            raise ValueError("manifest page count is inconsistent")
+        first = validated[0]
+        identity = (first.source_run_id, first.document_id, first.document_key)
+        if any(
+            (page.source_run_id, page.document_id, page.document_key) != identity
+            for page in validated
+        ):
+            raise ValueError("manifest pages must belong to one document and run")
+        visual_manifest_hash(validated)
+        return validated
+
     def _execute_batch_with_throttle_retry(
         self, chunks: tuple[SearchChunkRecord, ...]
     ) -> None:
@@ -932,6 +1051,52 @@ class IngestionRepository:
             raise RepositoryConflictError("ready verification found missing or extra chunks")
         if seen_indices != set(range(expected_count)):
             raise RepositoryConflictError("ready verification found missing or extra chunks")
+
+    def _verify_visual_manifest(self, document: SourceDocumentRecord) -> None:
+        expected_count = document.visual_manifest_page_count
+        expected_hash = document.visual_manifest_hash
+        if expected_count is None or expected_hash is None:
+            raise RepositoryConflictError("source document is missing its manifest binding")
+        query = (
+            "SELECT * FROM c WHERE c.sourceRunId = @sourceRunId "
+            "AND c.recordType = @recordType AND c.documentId = @documentId"
+        )
+        parameters = [
+            {"name": "@sourceRunId", "value": document.source_run_id},
+            {"name": "@recordType", "value": "visual_manifest_page"},
+            {"name": "@documentId", "value": document.document_id},
+        ]
+        pages: list[VisualManifestPage] = []
+        continuation: str | None = None
+        while True:
+            rows, continuation = self._query_page(
+                self._source_documents,
+                query,
+                parameters,
+                document.source_run_id,
+                INTERNAL_PAGE_SIZE,
+                continuation,
+            )
+            for row in rows:
+                try:
+                    pages.append(_hydrate(row, _visual_manifest_page_from_item, "visual manifest page"))
+                except RepositoryDataError:
+                    raise RepositoryConflictError(
+                        "manifest verification found invalid page content"
+                    ) from None
+            if continuation is None:
+                break
+        if len(pages) < expected_count:
+            raise RepositoryConflictError("manifest verification found missing manifest pages")
+        if len(pages) > expected_count:
+            raise RepositoryConflictError("manifest verification found missing or extra manifest pages")
+        pages.sort(key=lambda page: page.page_index)
+        try:
+            actual_hash = visual_manifest_hash(tuple(pages))
+        except ValueError:
+            raise RepositoryConflictError("manifest verification found invalid page ordering") from None
+        if actual_hash != expected_hash:
+            raise RepositoryConflictError("manifest verification found a manifest hash mismatch")
 
     @staticmethod
     def _query_page(
@@ -1117,11 +1282,42 @@ def _document_from_item(item: Mapping[str, Any]) -> SourceDocumentRecord:
     values["stage"] = DocumentStage(values["stage"])
     values["allowed_group_ids"] = tuple(values["allowed_group_ids"])
     values.setdefault("source_modified_at", None)
-    for _removed in ("quality_flags", "profiles", "acl_policy_version", "verified_at", "record_type"):
+    for _removed in ("quality_flags", "profiles", "acl_policy_version", "verified_at"):
         values.pop(_removed, None)
     if values.get("error") is not None:
         values["error"] = SafeError(**_snake_keys(values["error"]))
     return SourceDocumentRecord(**values)
+
+
+def _visual_manifest_page_from_item(item: Mapping[str, Any]) -> VisualManifestPage:
+    values = _snake_keys(_domain_item(item))
+    entries: list[VisualManifestEntry] = []
+    for entry_data in values["entries"]:
+        entry = _snake_keys(entry_data)
+        locator = _snake_keys(entry["source_locator"])
+        entry["source_locator"] = SourceLocator(
+            kind=LocatorKind(locator["kind"]),
+            label=locator["label"],
+            ordinal_start=locator["ordinal_start"],
+            ordinal_end=locator["ordinal_end"],
+        )
+        derivative = entry.get("derivative_locator")
+        if derivative is not None:
+            derivative_values = _snake_keys(derivative)
+            entry["derivative_locator"] = SourceLocator(
+                kind=LocatorKind(derivative_values["kind"]),
+                label=derivative_values["label"],
+                ordinal_start=derivative_values["ordinal_start"],
+                ordinal_end=derivative_values["ordinal_end"],
+            )
+        entry["relevance"] = VisualRelevance(entry["relevance"])
+        entry["disposition"] = VisualDisposition(entry["disposition"])
+        entry["provenance"] = tuple(
+            ExtractionProvenance(value) for value in entry["provenance"]
+        )
+        entries.append(VisualManifestEntry(**entry))
+    values["entries"] = tuple(entries)
+    return VisualManifestPage(**values)
 
 
 def _chunk_from_item(item: Mapping[str, Any]) -> SearchChunkRecord:
@@ -1132,12 +1328,17 @@ def _chunk_from_item(item: Mapping[str, Any]) -> SearchChunkRecord:
         )
     values["allowed_group_ids"] = tuple(values["allowed_group_ids"])
     values["section_path"] = tuple(values["section_path"])
+    values["locator_kind"] = LocatorKind(values["locator_kind"])
+    values["modalities"] = tuple(
+        ContentModality(modality) for modality in values["modalities"]
+    )
+    values["provenance"] = tuple(
+        ExtractionProvenance(provenance) for provenance in values["provenance"]
+    )
+    values["visual_coverage"] = VisualCoverageStatus(values["visual_coverage"])
     values["key_phrases"] = tuple(values["key_phrases"])
     values["entities"] = tuple(Entity(**_snake_keys(entity)) for entity in values["entities"])
     values["embedding"] = tuple(values["embedding"])
-    if "searchable_text" not in values:
-        values["searchable_text"] = values.get("content", "")
-    values.setdefault("source_modified_at", None)
     for _removed in (
         "source_path", "drive_id", "item_id", "embedding_input_hash",
         "chunking_strategy", "chunking_profile_version", "tokenizer",

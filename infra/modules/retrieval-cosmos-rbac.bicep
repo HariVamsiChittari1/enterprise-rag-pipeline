@@ -36,10 +36,28 @@ resource cosmosDataReaders 'Microsoft.DocumentDB/databaseAccounts/sqlRoleAssignm
   }
 ]
 
-resource cosmosAuditWriter 'Microsoft.DocumentDB/databaseAccounts/sqlRoleAssignments@2024-05-15' = {
-  name: '${last(split(cosmosAccountId, '/'))}/${guid(principalId, cosmosAccountId, 'retrieval-audit-writer')}'
+resource auditRole 'Microsoft.DocumentDB/databaseAccounts/sqlRoleDefinitions@2024-05-15' = {
+  name: '${last(split(cosmosAccountId, '/'))}/${guid(cosmosAccountId, 'audit-create-read')}'
   properties: {
-    roleDefinitionId: '${cosmosAccountId}/sqlRoleDefinitions/00000000-0000-0000-0000-000000000002'
+    roleName: 'Audit create and read'
+    type: 'CustomRole'
+    assignableScopes: [cosmosAccountId]
+    permissions: [
+      {
+        dataActions: [
+          'Microsoft.DocumentDB/databaseAccounts/readMetadata'
+          'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/items/create'
+          'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/items/read'
+        ]
+      }
+    ]
+  }
+}
+
+resource cosmosAuditWriter 'Microsoft.DocumentDB/databaseAccounts/sqlRoleAssignments@2024-05-15' = {
+  name: '${last(split(cosmosAccountId, '/'))}/${guid(principalId, cosmosAccountId, 'retrieval-audit-create-read')}'
+  properties: {
+    roleDefinitionId: auditRole.id
     principalId: principalId
     scope: '${cosmosAccountId}/dbs/${cosmosDatabaseName}/colls/${serviceAuditContainerName}'
   }

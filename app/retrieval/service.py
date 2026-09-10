@@ -15,9 +15,11 @@ from typing import Any
 import structlog
 
 from retrieval.auth import Principal
+from retrieval.catalog import RequestPolicy, RuntimeCatalogSnapshot, UnknownScoringProfileError
 from retrieval.cosmos import MAX_CANDIDATE_POOL_TOTAL, RetrievalMode, RetrievedChunk, SecureCosmosRetriever
 from retrieval.cosmos_registry import CosmosRegistry
 from retrieval.pipeline import (
+    citation_source,
     RetrievalBatchStatus,
     allocate_candidate_budget,
     citation_label,
@@ -25,6 +27,7 @@ from retrieval.pipeline import (
     merge_ranked_results,
 )
 from retrieval.scoring import ScoringProfile, ScoringProfileReranker
+from retrieval.runtime_catalog import RuntimeCatalogProvider
 from retrieval.synonyms import SynonymExpander
 
 logger = structlog.get_logger()
@@ -35,10 +38,6 @@ _INJECTION_RE = re.compile(
     r"^(system\s*:|assistant\s*:|\[INST\]|<\|im_start\|>|ignore previous|forget your instructions|disregard above)",
     re.IGNORECASE | re.MULTILINE,
 )
-
-
-class UnknownScoringProfileError(ValueError):
-    """A request selected a scoring profile that is not in the active catalog."""
 
 
 @dataclass(frozen=True)
@@ -74,14 +73,8 @@ class RagService:
         max_evidence: int = 5,
         max_planned_queries: int = 3,
         *,
+        catalog_provider: RuntimeCatalogProvider,
         acl_enabled: bool = True,
-        scoring_profiles: dict[str, ScoringProfile] | None = None,
-        default_scoring_profile: str | None = None,
-        over_fetch_factor: int = 1,
-        full_text_score_scope: str | None = None,
-        hybrid_rrf_weights: tuple[float, float] | None = None,
-        synonym_expanders: dict[str, SynonymExpander] | None = None,
-        synonyms_enabled: bool = False,
     ) -> None:
         self._openai = openai_client
         self._registry = registry
@@ -92,24 +85,21 @@ class RagService:
         self._max_evidence = max_evidence
         self._max_planned_queries = max_planned_queries
         self._acl_enabled = acl_enabled
-        self._scoring_profiles = scoring_profiles or {}
-        if default_scoring_profile and default_scoring_profile not in self._scoring_profiles:
-            raise ValueError(f"default_scoring_profile '{default_scoring_profile}' is not in the catalog")
-        self._default_scoring_profile = default_scoring_profile
-        if over_fetch_factor < 1:
-            raise ValueError("over_fetch_factor must be >= 1")
-        self._over_fetch_factor = over_fetch_factor
-        if full_text_score_scope is not None and full_text_score_scope not in ("Local", "Global"):
-            raise ValueError("full_text_score_scope must be 'Local' or 'Global'")
-        self._full_text_score_scope = full_text_score_scope
-        self._hybrid_rrf_weights = hybrid_rrf_weights
-        self._synonym_expanders = synonym_expanders or {}
-        self._synonyms_enabled = synonyms_enabled
+        self._catalog_provider = catalog_provider
         max_workers = _CONCURRENT_REQUESTS_FACTOR * max_planned_queries * max(1, len(registry))
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
 
     def close(self) -> None:
         self._executor.shutdown(wait=False, cancel_futures=True)
+
+    def capture_snapshot(self) -> RuntimeCatalogSnapshot:
+        return self._catalog_provider.snapshot
+
+    def capture_policy(
+        self, scoring_profile: str | None = None, expand_synonyms: bool | None = None,
+        *, snapshot: RuntimeCatalogSnapshot | None = None,
+    ) -> RequestPolicy:
+        return RequestPolicy.capture(snapshot or self.capture_snapshot(), scoring_profile, expand_synonyms)
 
     def plan_queries(
         self,
@@ -133,12 +123,15 @@ class RagService:
         mode: RetrievalMode = RetrievalMode.HYBRID,
         scoring_profile: str | None = None,
         expand_synonyms: bool | None = None,
+        *,
+        policy: RequestPolicy | None = None,
     ) -> dict[str, Any]:
+        policy = policy or self.capture_policy(scoring_profile, expand_synonyms)
         queries, usage = self.plan_queries(question, history)
         return self.answer_with_queries(
             question, queries, principal, mode=mode, usage=usage,
             scoring_profile=scoring_profile,
-            expand_synonyms=expand_synonyms,
+            expand_synonyms=expand_synonyms, policy=policy,
         )
 
     def answer_with_queries(
@@ -151,8 +144,11 @@ class RagService:
         top_k: int | None = None,
         scoring_profile: str | None = None,
         expand_synonyms: bool | None = None,
+        *,
+        policy: RequestPolicy | None = None,
     ) -> dict[str, Any]:
         """Generate an answer using pre-planned queries (skips re-planning)."""
+        policy = policy or self.capture_policy(scoring_profile, expand_synonyms)
         normalized_question = question.strip()
         if not normalized_question or len(normalized_question) > 4000:
             raise ValueError("question_length_invalid")
@@ -165,7 +161,7 @@ class RagService:
             mode=mode,
             top_k=top_k,
             scoring_profile=scoring_profile,
-            expand_synonyms=expand_synonyms,
+            expand_synonyms=expand_synonyms, policy=policy,
         )
         usage.extend(search_result.usage)
         evidence = list(search_result.chunks)
@@ -174,10 +170,11 @@ class RagService:
                 "answer": "I could not find authorized evidence for this question.",
                 "citations": [],
                 "usage": usage,
+                "policy": policy.metadata(),
             }
 
         context = "\n\n".join(
-            f"{citation_label(index)} {chunk.source_name}, page {chunk.page_number}\n{_sanitize_chunk(chunk.content)}"
+            f"{citation_label(index)} {citation_source(chunk)}\n{_sanitize_chunk(chunk.content)}"
             for index, chunk in enumerate(evidence, start=1)
         )
         start = time.perf_counter()
@@ -206,6 +203,7 @@ class RagService:
             "answer": answer.strip(),
             "citations": [asdict(chunk) for chunk in evidence],
             "usage": usage,
+            "policy": policy.metadata(),
         }
 
     def search(
@@ -219,12 +217,13 @@ class RagService:
         scoring_profile: str | None = None,
         expand_synonyms: bool | None = None,
         now: datetime | None = None,
+        policy: RequestPolicy | None = None,
     ) -> SearchResult:
         """Execute the shared standard/agent retrieval policy without generation."""
         normalized = _validate_evaluation_inputs(question, now)
         effective_k = top_k or self._max_evidence
-        profile = self._resolve_profile(scoring_profile)
-        expander = self._resolve_synonym_expander(expand_synonyms, profile)
+        policy = policy or self.capture_policy(scoring_profile, expand_synonyms)
+        profile, expander = policy.profile, policy.expander
         rerank_terms = (
             expander.expand(normalized) if expander is not None else [normalized]
         )
@@ -238,46 +237,27 @@ class RagService:
             profile,
             expander,
             rerank_terms,
-            now=now,
+            now=now, policy=policy,
         )
         return SearchResult(tuple(chunks), tuple(usage))
 
     def validate_scoring_profile(self, requested: str | None) -> None:
-        self._resolve_profile(requested)
+        self.capture_policy(requested)
 
-    def _resolve_profile(self, requested: str | None) -> ScoringProfile | None:
-        name = requested if requested is not None else self._default_scoring_profile
-        if name is None:
-            return None
-        profile = self._scoring_profiles.get(name)
-        if profile is None:
-            raise UnknownScoringProfileError(f"unknown_scoring_profile:{name}")
-        return profile
-
-    def get_scoring_profile(self, name: str) -> ScoringProfile:
+    def get_scoring_profile(
+        self, name: str, *, snapshot: RuntimeCatalogSnapshot | None = None,
+    ) -> ScoringProfile:
         """Return a configured scoring profile by name for private evaluation callers.
 
         Raises ``UnknownScoringProfileError`` if the profile is not in the active
-        catalog. Deployed HTTP paths continue to use ``_resolve_profile``.
+        catalog.
         """
         if not isinstance(name, str) or not name:
             raise UnknownScoringProfileError("scoring_profile_name_required")
-        profile = self._scoring_profiles.get(name)
+        profile = (snapshot or self.capture_snapshot()).profiles.get(name)
         if profile is None:
             raise UnknownScoringProfileError(f"unknown_scoring_profile:{name}")
         return profile
-
-    def _resolve_synonym_expander(
-        self, expand_synonyms: bool | None, profile: ScoringProfile | None,
-    ) -> SynonymExpander | None:
-        """3-level enablement: deploy toggle → profile.synonym_map → request override."""
-        if not self._synonyms_enabled:
-            return None
-        if expand_synonyms is False:
-            return None
-        if profile is None or profile.synonym_map is None:
-            return None
-        return self._synonym_expanders.get(profile.synonym_map)
 
     def _retrieve_evidence(
         self,
@@ -290,14 +270,15 @@ class RagService:
         expander: SynonymExpander | None = None,
         rerank_terms: list[str] | None = None,
         *,
+        policy: RequestPolicy,
         now: datetime | None = None,
     ) -> list[RetrievedChunk]:
         effective_max = max_k or self._max_evidence
         planned = queries[:self._max_planned_queries]
-        over_fetch = None if profile is None else self._over_fetch_factor
+        over_fetch = None if profile is None else policy.snapshot.over_fetch_factor
         successful_results, candidate_budget, instances = self._run_retrieval_batch(
             planned, principal, mode, usage, effective_max, expander,
-            raw=profile is not None, over_fetch_factor=over_fetch,
+            raw=profile is not None, over_fetch_factor=over_fetch, policy=policy,
         )
 
         if profile is None:
@@ -324,6 +305,7 @@ class RagService:
         effective_max: int,
         expander: SynonymExpander | None,
         *,
+        policy: RequestPolicy,
         raw: bool,
         over_fetch_factor: int | None,
     ) -> tuple[list[Any], int, list[tuple[str, SecureCosmosRetriever]]]:
@@ -355,7 +337,7 @@ class RagService:
             self._executor.submit(
                 self._retrieve_for_query,
                 query, retriever, principal, mode, usage, usage_lock,
-                allocation, 1, raw, expander,
+                allocation, 1, raw, expander, policy,
             )
             for (query, retriever), allocation in zip(task_specs, allocations)
             if allocation > 0
@@ -424,6 +406,7 @@ class RagService:
         scoring_profile: str | None = None,
         expand_synonyms: bool | None = None,
         evaluation_as_of: datetime | None = None,
+        policy: RequestPolicy | None = None,
     ) -> list[RetrievedChunk]:
         """Private evaluation seam: standard retrieval + rerank, no answer generation.
 
@@ -433,15 +416,15 @@ class RagService:
         """
         normalized = _validate_evaluation_inputs(question, evaluation_as_of)
         effective_k = top_k or self._max_evidence
-        profile = self._resolve_profile(scoring_profile)
-        expander = self._resolve_synonym_expander(expand_synonyms, profile)
+        policy = policy or self.capture_policy(scoring_profile, expand_synonyms)
+        profile, expander = policy.profile, policy.expander
         rerank_terms = (
             expander.expand(normalized) if expander is not None else [normalized]
         )
         usage: list[dict[str, Any]] = []
         return self._retrieve_evidence(
             queries, principal, mode, usage, effective_k, profile, expander,
-            rerank_terms, now=evaluation_as_of,
+            rerank_terms, now=evaluation_as_of, policy=policy,
         )
 
     def retrieve_evaluation_pool(
@@ -454,6 +437,7 @@ class RagService:
         top_k: int | None = None,
         scoring_profile: str,
         expand_synonyms: bool | None = None,
+        policy: RequestPolicy | None = None,
     ) -> "EvaluationPool":
         """Fetch one candidate pool for evaluation and freeze it for repeated rerank.
 
@@ -463,17 +447,18 @@ class RagService:
         """
         normalized = _validate_evaluation_inputs(question, None)
         effective_max = top_k or self._max_evidence
-        profile = self._resolve_profile(scoring_profile)
+        policy = policy or self.capture_policy(scoring_profile, expand_synonyms)
+        profile = policy.profile
         if profile is None:
             raise UnknownScoringProfileError(
                 "retrieve_evaluation_pool requires an explicit scoring profile"
             )
-        expander = self._resolve_synonym_expander(expand_synonyms, profile)
+        expander = policy.expander
         rerank_terms = (
             expander.expand(normalized) if expander is not None else [normalized]
         )
         pool_dicts, candidate_budget, instances = self._collect_pool_for_evaluation(
-            queries, principal, mode, effective_max, expander,
+            queries, principal, mode, effective_max, expander, policy,
         )
         if not instances:
             raise RuntimeError("retrieval_registry_empty")
@@ -493,6 +478,7 @@ class RagService:
         mode: RetrievalMode,
         effective_max: int,
         expander: SynonymExpander | None,
+        policy: RequestPolicy,
     ) -> tuple[list[dict[str, Any]], int, list[tuple[str, SecureCosmosRetriever]]]:
         """Fail-closed one-fetch pool collection for offline evaluation.
 
@@ -505,7 +491,7 @@ class RagService:
         usage: list[dict[str, Any]] = []
         successful, candidate_budget, instances = self._run_retrieval_batch(
             planned, principal, mode, usage, effective_max, expander,
-            raw=True, over_fetch_factor=self._over_fetch_factor,
+            raw=True, over_fetch_factor=policy.snapshot.over_fetch_factor, policy=policy,
         )
         pool = merge_ranked_results(
             successful, limit=candidate_budget, identity=evidence_identity,
@@ -523,7 +509,8 @@ class RagService:
         top_k: int,
         over_fetch_factor: int,
         raw: bool,
-        expander: SynonymExpander | None = None,
+        expander: SynonymExpander | None,
+        policy: RequestPolicy,
     ) -> list[RetrievedChunk] | list[dict[str, Any]]:
         embedding = [] if mode is RetrievalMode.FULL_TEXT else self._embed(query, usage, usage_lock)
         search_terms = expander.expand(query) if expander is not None else None
@@ -534,8 +521,8 @@ class RagService:
             mode=mode,
             top_k=top_k,
             over_fetch_factor=over_fetch_factor,
-            rrf_weights=self._hybrid_rrf_weights if mode is RetrievalMode.HYBRID else None,
-            full_text_score_scope=self._full_text_score_scope,
+            rrf_weights=policy.snapshot.hybrid_weights if mode is RetrievalMode.HYBRID else None,
+            full_text_score_scope=policy.snapshot.full_text_score_scope,
             raw=raw,
             search_terms=search_terms,
         )

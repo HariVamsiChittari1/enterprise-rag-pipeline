@@ -24,6 +24,9 @@ param tags object = {}
 @description('Database name')
 param databaseName string = 'rag-db'
 
+@description('Existing Log Analytics workspace for resource-specific data-plane diagnostics')
+param logAnalyticsWorkspaceId string = ''
+
 resource cosmosAccount 'Microsoft.DocumentDB/databaseAccounts@2026-03-15' = {
   name: cosmosAccountName
   location: location
@@ -51,6 +54,16 @@ resource cosmosAccount 'Microsoft.DocumentDB/databaseAccounts@2026-03-15' = {
     disableLocalAuth: true
   }
   tags: tags
+}
+
+resource diagnostics 'Microsoft.Insights/diagnosticSettings@2021-05-01-preview' = if (!empty(logAnalyticsWorkspaceId)) {
+  name: 'catalog-data-plane'
+  scope: cosmosAccount
+  properties: {
+    workspaceId: logAnalyticsWorkspaceId
+    logAnalyticsDestinationType: 'Dedicated'
+    logs: [{ category: 'DataPlaneRequests', enabled: true }]
+  }
 }
 
 resource database 'Microsoft.DocumentDB/databaseAccounts/sqlDatabases@2026-03-15' = {
@@ -119,6 +132,7 @@ resource sourceDocumentsContainer 'Microsoft.DocumentDB/databaseAccounts/sqlData
         indexingMode: 'consistent'
         automatic: true
         includedPaths: [
+          { path: '/recordType/?' }
           { path: '/runId/?' }
           { path: '/status/?' }
           { path: '/stage/?' }

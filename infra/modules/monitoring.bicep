@@ -23,6 +23,12 @@ param retentionInDays int = 90
 @description('Daily ingestion cap in GB (-1 for unlimited)')
 param dailyQuotaGb int = -1
 
+@description('Retrieval identity authorized to publish telemetry with Entra authentication')
+param retrievalPrincipalId string = ''
+
+@description('Observer principal authorized to query the existing workspace')
+param observerPrincipalId string = ''
+
 // =========================================
 // Resources
 // =========================================
@@ -54,6 +60,31 @@ resource applicationInsights 'Microsoft.Insights/components@2020-02-02' = {
     publicNetworkAccessForQuery: 'Enabled'
   }
   tags: tags
+}
+
+resource retrievalPublisher 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (!empty(retrievalPrincipalId)) {
+  name: guid(applicationInsights.id, retrievalPrincipalId, '3913510d-42f4-4e42-8a64-420c390055eb')
+  scope: applicationInsights
+  properties: {
+    roleDefinitionId: subscriptionResourceId(
+      'Microsoft.Authorization/roleDefinitions',
+      '3913510d-42f4-4e42-8a64-420c390055eb'
+    )
+    principalId: retrievalPrincipalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+resource observerReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (!empty(observerPrincipalId)) {
+  name: guid(logAnalytics.id, observerPrincipalId, '73c42c96-874c-492b-b04d-ab87d138a893')
+  scope: logAnalytics
+  properties: {
+    roleDefinitionId: subscriptionResourceId(
+      'Microsoft.Authorization/roleDefinitions',
+      '73c42c96-874c-492b-b04d-ab87d138a893'
+    )
+    principalId: observerPrincipalId
+  }
 }
 
 // Daily cap configuration (if specified)

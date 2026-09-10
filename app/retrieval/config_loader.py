@@ -55,7 +55,7 @@ SCORING_PROFILES_SCHEMA: Mapping[str, Any] = {
                         "items": {
                             "type": "object",
                             "additionalProperties": False,
-                            "required": ["type", "fieldName", "boost", "interpolation"],
+                            "required": ["type", "fieldName", "boost", "interpolation", "freshness"],
                             "properties": {
                                 "type": {"const": "freshness"},
                                 "fieldName": {
@@ -79,7 +79,6 @@ SCORING_PROFILES_SCHEMA: Mapping[str, Any] = {
                                     },
                                 },
                             },
-                            "required": ["freshness"],
                         },
                     },
                 },
@@ -199,15 +198,3 @@ def _build_function(payload: dict[str, Any]) -> ScoringFunction:
         interpolation=payload["interpolation"],
         freshness=freshness_params,
     )
-
-
-def redact_catalog(profiles: dict[str, ScoringProfile]) -> list[dict[str, Any]]:
-    """Return a compact summary safe for startup logs (names + function types only)."""
-    return [
-        {
-            "name": profile.name,
-            "weights": sorted(profile.text_weights.keys()),
-            "functions": [function.type for function in profile.functions],
-        }
-        for profile in profiles.values()
-    ]

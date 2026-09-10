@@ -18,6 +18,7 @@
     "dependencyLockHash",
     "acrBuildId",
     "catalogSha",
+    "catalogEtag",
     "profiles",
     "modelDeployments",
     "environment",
@@ -43,7 +44,12 @@
     "datasetComponents": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["groundTruthHash", "principalCasesHash", "approvalHash", "datasetManifestHash"],
+      "required": [
+        "groundTruthHash",
+        "principalCasesHash",
+        "approvalHash",
+        "datasetManifestHash"
+      ],
       "properties": {
         "groundTruthHash": { "$ref": "#/$defs/sha256" },
         "principalCasesHash": { "$ref": "#/$defs/sha256" },
@@ -61,6 +67,7 @@
     "dependencyLockHash": { "$ref": "#/$defs/sha256" },
     "acrBuildId": { "type": "string", "minLength": 1, "maxLength": 200 },
     "catalogSha": { "$ref": "#/$defs/sha256" },
+    "catalogEtag": { "type": "string", "pattern": "\\S" },
     "profiles": {
       "type": "object",
       "additionalProperties": false,

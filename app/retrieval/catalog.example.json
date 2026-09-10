@@ -1,5 +1,4 @@
 {
-  "schemaVersion": 1,
   "config": {
     "retrieval": {
       "overFetchFactor": 3,
@@ -10,7 +9,6 @@
       "fullTextScoreScope": "Global"
     },
     "defaultProfile": "hr-relevance",
-    "synonymsEnabled": true,
     "profiles": [
       {
         "name": "hr-relevance",

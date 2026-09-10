@@ -4,7 +4,13 @@ from unittest.mock import Mock
 
 import pytest
 
-from retrieval.cosmos import MAX_CANDIDATE_POOL_TOTAL, RetrievalMode, SecureCosmosRetriever
+from retrieval.cosmos import (
+    MAX_CANDIDATE_POOL_TOTAL,
+    RetrievalLocatorKind,
+    RetrievalMode,
+    SecureCosmosRetriever,
+)
+from retrieval.pipeline import citation_location, citation_url
 
 
 def candidate() -> dict[str, object]:
@@ -15,8 +21,21 @@ def candidate() -> dict[str, object]:
         "content": "authorized content",
         "sourceName": "document.pdf",
         "sourceUrl": "https://example.sharepoint.com/sites/docs/document.pdf",
-        "pageStart": 2,
+        "locatorKind": "page",
+        "locatorLabel": "Page 2",
+        "locatorOrdinalStart": 2,
+        "locatorOrdinalEnd": 2,
     }
+
+
+def active_manifest(**overrides: object) -> dict[str, object]:
+    manifest: dict[str, object] = {
+        "schemaVersion": 1,
+        "recordType": "source_document",
+        "status": "ready",
+    }
+    manifest.update(overrides)
+    return manifest
 
 
 @pytest.mark.parametrize("mode", list(RetrievalMode))
@@ -24,9 +43,7 @@ def test_every_ranked_query_filters_acl_before_ranking(mode: RetrievalMode) -> N
     chunks = Mock()
     chunks.query_items.return_value = [candidate()]
     manifests = Mock()
-    manifests.read_item.return_value = {
-        "status": "ready",
-    }
+    manifests.read_item.return_value = active_manifest()
     retriever = SecureCosmosRetriever(chunks, manifests)
 
     results = retriever.retrieve(
@@ -55,9 +72,7 @@ def test_non_ready_document_is_not_returned() -> None:
     chunks = Mock()
     chunks.query_items.return_value = [candidate()]
     manifests = Mock()
-    manifests.read_item.return_value = {
-        "status": "failed",
-    }
+    manifests.read_item.return_value = active_manifest(status="failed")
 
     assert SecureCosmosRetriever(chunks, manifests).retrieve(
         "policy", [0.1], ["group"]
@@ -69,11 +84,8 @@ def test_citation_uses_active_manifest_source_name_with_legacy_fallback() -> Non
     chunks.query_items.return_value = [candidate()]
     manifests = Mock()
     manifests.read_item.side_effect = [
-        {
-            "status": "ready",
-            "sourceName": "renamed.pdf",
-        },
-        {"status": "ready"},
+        active_manifest(sourceName="renamed.pdf"),
+        active_manifest(),
     ]
     retriever = SecureCosmosRetriever(chunks, manifests)
 
@@ -82,6 +94,92 @@ def test_citation_uses_active_manifest_source_name_with_legacy_fallback() -> Non
 
     assert renamed[0].source_name == "renamed.pdf"
     assert legacy[0].source_name == "document.pdf"
+
+
+@pytest.mark.parametrize(
+    "manifest",
+    [
+        active_manifest(recordType="visual_manifest_page"),
+        active_manifest(schemaVersion=2),
+    ],
+)
+def test_non_source_or_non_v1_manifest_is_not_returned(
+    manifest: dict[str, object],
+) -> None:
+    chunks = Mock()
+    chunks.query_items.return_value = [candidate()]
+    manifests = Mock()
+    manifests.read_item.return_value = manifest
+
+    assert SecureCosmosRetriever(chunks, manifests).retrieve(
+        "policy", [0.1], ["group"]
+    ) == []
+
+
+@pytest.mark.parametrize(
+    ("kind", "label", "source_name", "source_url", "expected_url"),
+    [
+        (
+            "page",
+            "Page 2",
+            "document.pdf",
+            "https://example.sharepoint.com/sites/docs/document.pdf",
+            "https://example.sharepoint.com/sites/docs/document.pdf#page=2",
+        ),
+        (
+            "page",
+            "Rendered page 2",
+            "document.docx",
+            "https://example.sharepoint.com/sites/docs/document.docx?action=default",
+            "https://example.sharepoint.com/sites/docs/document.docx?action=default",
+        ),
+        (
+            "section",
+            "Section 2",
+            "document.pdf",
+            "https://example.sharepoint.com/sites/docs/document.pdf",
+            "https://example.sharepoint.com/sites/docs/document.pdf",
+        ),
+        (
+            "slide",
+            "Slide 2",
+            "document.pdf",
+            "https://example.sharepoint.com/sites/docs/document.pdf",
+            "https://example.sharepoint.com/sites/docs/document.pdf",
+        ),
+        (
+            "worksheet",
+            "Summary",
+            "document.pdf",
+            "https://example.sharepoint.com/sites/docs/document.pdf",
+            "https://example.sharepoint.com/sites/docs/document.pdf",
+        ),
+    ],
+)
+def test_typed_locator_drives_format_appropriate_citation(
+    kind: str,
+    label: str,
+    source_name: str,
+    source_url: str,
+    expected_url: str,
+) -> None:
+    chunks = Mock()
+    item = candidate()
+    item["locatorKind"] = kind
+    item["locatorLabel"] = label
+    item["sourceName"] = source_name
+    item["sourceUrl"] = source_url
+    chunks.query_items.return_value = [item]
+    manifests = Mock()
+    manifests.read_item.return_value = active_manifest()
+
+    result = SecureCosmosRetriever(chunks, manifests).retrieve(
+        "policy", [0.1], ["group"]
+    )[0]
+
+    assert result.locator_kind is RetrievalLocatorKind(kind)
+    assert citation_location(result) == label
+    assert citation_url(result) == expected_url
 
 
 def test_empty_principals_fail_before_query() -> None:
@@ -95,7 +193,7 @@ def test_acl_disabled_omits_filter_and_accepts_empty_principals() -> None:
     chunks = Mock()
     chunks.query_items.return_value = [candidate()]
     manifests = Mock()
-    manifests.read_item.return_value = {"status": "ready"}
+    manifests.read_item.return_value = active_manifest()
     retriever = SecureCosmosRetriever(chunks, manifests, acl_enabled=False)
 
     results = retriever.retrieve("policy", [0.1, 0.2], [], mode=RetrievalMode.HYBRID)
@@ -112,7 +210,7 @@ def test_projection_includes_source_modified_at_and_returns_field() -> None:
     chunks = Mock()
     chunks.query_items.return_value = [row]
     manifests = Mock()
-    manifests.read_item.return_value = {"status": "ready"}
+    manifests.read_item.return_value = active_manifest()
 
     result = SecureCosmosRetriever(chunks, manifests, acl_enabled=False).retrieve(
         "policy", [0.1], []
@@ -129,7 +227,7 @@ def test_raw_projection_excludes_ingestion_only_token_count() -> None:
     chunks = Mock()
     chunks.query_items.return_value = [row]
     manifests = Mock()
-    manifests.read_item.return_value = {"status": "ready"}
+    manifests.read_item.return_value = active_manifest()
     retriever = SecureCosmosRetriever(chunks, manifests, acl_enabled=False)
 
     raw = retriever.retrieve("policy", [0.1], [], raw=True)
@@ -153,7 +251,7 @@ def test_hybrid_weighted_rrf_adds_rrf_weights_parameter_only_when_supplied() -> 
     chunks = Mock()
     chunks.query_items.return_value = [candidate()]
     manifests = Mock()
-    manifests.read_item.return_value = {"status": "ready"}
+    manifests.read_item.return_value = active_manifest()
     retriever = SecureCosmosRetriever(chunks, manifests, acl_enabled=False)
 
     retriever.retrieve("policy", [0.1], [], rrf_weights=(2.0, 1.0))
@@ -215,7 +313,7 @@ def test_raw_mode_returns_candidate_dicts_ready_for_rerank() -> None:
     chunks = Mock()
     chunks.query_items.return_value = [row]
     manifests = Mock()
-    manifests.read_item.return_value = {"status": "ready", "sourceName": "renamed.pdf"}
+    manifests.read_item.return_value = active_manifest(sourceName="renamed.pdf")
     retriever = SecureCosmosRetriever(chunks, manifests, acl_enabled=False)
 
     raw = retriever.retrieve("policy", [0.1], [], raw=True)

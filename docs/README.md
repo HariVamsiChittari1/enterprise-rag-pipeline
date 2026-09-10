@@ -1,6 +1,6 @@
 # Documentation
 
-Use this index to locate the owner of each maintained documentation concern. Historical execution records are kept separately under `archive/` and do not define current behavior.
+Use this index to locate the owner of each maintained documentation concern.
 
 | Document | Audience and responsibility |
 | --- | --- |
@@ -14,8 +14,3 @@ Use this index to locate the owner of each maintained documentation concern. His
 | [Production readiness](PRODUCTION_READINESS.md) | Verified evidence, release gates, unresolved production risks, and readiness verdict |
 | [Troubleshooting](TROUBLESHOOTING.md) | Failure diagnosis and bounded recovery procedures |
 | [Protected evaluation](../evaluation/README.md) | Evaluation inputs, ranking generation, metrics, and regression gates |
-| [Architecture decisions](decisions/README.md) | Existing significant decisions and their rationale |
-
-## Historical Records
-
-- [E2E test runbook executed 2026-08-19](archive/E2E_TEST_RUNBOOK_2026-08-19.md)

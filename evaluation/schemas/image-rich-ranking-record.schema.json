@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://bfl.example/schemas/rag/image-rich-ranking-record.schema.json",
+  "title": "Protected Five-Format RAG Ranking Record",
+  "description": "Identity-only per-query ranking with typed source locators.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["queryId", "retrievedContext"],
+  "properties": {
+    "queryId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$"
+    },
+    "retrievedContext": {
+      "type": "array",
+      "maxItems": 5,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "documentItemId",
+          "locatorKind",
+          "locatorLabel",
+          "locatorOrdinalStart",
+          "locatorOrdinalEnd"
+        ],
+        "properties": {
+          "documentItemId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+          },
+          "locatorKind": {
+            "enum": ["page", "section", "slide", "worksheet"]
+          },
+          "locatorLabel": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+          },
+          "locatorOrdinalStart": { "type": "integer", "minimum": 1 },
+          "locatorOrdinalEnd": { "type": "integer", "minimum": 1 }
+        }
+      }
+    }
+  }
+}

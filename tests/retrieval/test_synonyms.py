@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import FrozenInstanceError
+
 import pytest
 
 from retrieval.synonyms import (
@@ -14,6 +16,16 @@ from retrieval.synonyms import (
 
 def _map(*rules: str) -> SynonymMap:
     return SynonymMap.parse("test", list(rules))
+
+
+def test_given_expander_when_map_reassigned_then_state_is_unchanged() -> None:
+    expander = SynonymExpander(_map("leave, vacation"))
+    before = expander.expand("leave")
+
+    with pytest.raises(FrozenInstanceError):
+        expander._map = _map("leave => absence")
+
+    assert expander.expand("leave") == before
 
 
 def test_equivalency_rule_expands_query_with_synonyms() -> None:

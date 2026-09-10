@@ -18,9 +18,11 @@ Provide:
 ### SharePoint Ingestion Application
 
 - Certificate credential whose exportable PFX is stored as a Key Vault secret.
-- Graph application permissions required by the deployed connector: `Sites.Selected`, `Sites.Read.All`, `GroupMember.Read.All`, and `User.Read.All`.
+- Graph application permissions required by the deployed five-format connector: `Sites.Selected`, `Sites.Read.All`, `Files.ReadWrite.All`, `GroupMember.Read.All`, and `User.Read.All`. `Files.ReadWrite.All` is required for Office-to-PDF conversion.
 - SharePoint application permission `Sites.Read.All` for `/_api/web/sitegroups(...)/users` expansion.
 - Required SharePoint site grant and tenant admin consent.
+
+The current connector also requests permission-change metadata whose documented Microsoft Graph permission is `Sites.FullControl.All`. That broader permission is not approved by this request and must not be granted implicitly. Return a security decision to either approve it as a separately reviewed exception or require the connector and validation contract to stop depending on that metadata.
 
 ### Function API Application
 
@@ -81,15 +83,21 @@ The guarded controller requires these azd environment values before resource mut
 - `INGESTION_SOURCE_ID`.
 - `ADMIN_API_CLIENT_ID`, `FUNCTION_API_AUDIENCE`, `FUNCTION_ALLOWED_CALLER_CLIENT_ID`.
 - `RETRIEVAL_API_CLIENT_ID`, `RETRIEVAL_API_AUDIENCE`, `RETRIEVAL_API_SERVICE_PRINCIPAL_ID`.
-- `WEBHOOK_CLIENT_STATE`.
+- `WEBHOOK_CLIENT_STATE`, supplied through `azd env set-secret WEBHOOK_CLIENT_STATE` or an organization-approved external secret source, never `azd env set`.
 - `COST_CENTER`, `CLEANUP_DATE`.
 
 Capacity and reliability inputs include Cosmos mode/RUs, storage redundancy, Application Insights daily cap, ACA replica bounds, and ACA zone redundancy.
 
-Immutable artifact values are produced during deployment:
+Artifact and catalog inputs have distinct lifecycles:
 
 - `RETRIEVAL_IMAGE_REFERENCE=repository@sha256:<digest>`.
-- `RETRIEVAL_CATALOG_DIGEST=sha256:<digest>`.
+- `RETRIEVAL_CATALOG_DIGEST=sha256:<digest>` verifies the reviewed seed only during explicit initialization; it is not a serving pin.
+- Current catalog evidence records its ETag and validated config digest.
+
+Optional editor, guarded-writer, and observer principals and polling inputs are
+listed in [configuration](CONFIGURATION.md). The
+[resource reuse contract](AZURE_RESOURCES.md#resource-reuse-contract) distinguishes
+external prerequisites from same-instance redeployment and unsupported adoption.
 
 ## Deployment and Acceptance
 
@@ -106,7 +114,13 @@ Cloud operations must use `scripts/deploy.ps1`, which defaults to preview and re
 9. End-to-end validation and fixture cleanup.
 10. `OperationsCleanup` after explicit approval.
 
-Acceptance evidence must include successful Bicep what-if/deployment, immutable image and catalog digests, Function and ACA health checks, exact authentication settings, private endpoint/DNS and managed-identity checks, end-to-end retrieval/ACL tests, and removal of the temporary catalog job.
+Acceptance evidence must include successful Bicep what-if/deployment, immutable
+image identity, current catalog ETag/digest and read-only verification, Function
+and ACA health, exact authentication, private endpoint/DNS and managed identity,
+effective role denials, private keyless Data Explorer editing, replica adoption,
+end-to-end retrieval/ACL tests, and approved temporary job cleanup. Review
+account-wide diagnostic volume and retention before enabling export. See
+[Azure setup](AZURE_SETUP.md) for the initialization and verification sequence.
 
 ## Required Outputs
 

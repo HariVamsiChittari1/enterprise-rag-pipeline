@@ -78,6 +78,9 @@ class FakeContainer:
         self.batch_calls: list[tuple[str, list[tuple[Any, ...]]]] = []
         self.delete_calls: list[tuple[str, str]] = []
         self.query_pages: dict[str, list[list[dict[str, Any]]]] = {}
+        self.before_patch: Any = None
+        self.before_replace: Any = None
+        self.batch_error: Exception | None = None
 
     def read_item(self, *, item: str, partition_key: str) -> dict[str, Any]:
         key = (partition_key, item)
@@ -89,6 +92,35 @@ class FakeContainer:
         key = (body[self.partition_field], body["id"])
         self.items[key] = deepcopy(body)
         return deepcopy(body)
+
+    def create_item(self, *, body: dict[str, Any]) -> dict[str, Any]:
+        key = (body[self.partition_field], body["id"])
+        if key in self.items:
+            raise FakeCosmosError(409)
+        stored = {**deepcopy(body), "_etag": "etag-created"}
+        self.items[key] = stored
+        return deepcopy(stored)
+
+    def replace_item(
+        self,
+        *,
+        item: str,
+        body: dict[str, Any],
+        etag: str | None = None,
+        match_condition: MatchConditions | None = None,
+    ) -> dict[str, Any]:
+        if self.before_replace is not None:
+            callback = self.before_replace
+            self.before_replace = None
+            callback()
+        key = (body[self.partition_field], item)
+        if key not in self.items:
+            raise FakeCosmosError(404)
+        if etag is not None and self.items[key].get("_etag") != etag:
+            raise FakeCosmosError(412)
+        stored = {**deepcopy(body), "_etag": "etag-replaced"}
+        self.items[key] = stored
+        return deepcopy(stored)
 
     def patch_item(
         self,
@@ -103,6 +135,10 @@ class FakeContainer:
         self.patch_calls.append(
             {"item": item, "partition_key": partition_key, "patch_operations": patch_operations}
         )
+        if self.before_patch is not None:
+            callback = self.before_patch
+            self.before_patch = None
+            callback()
         key = (partition_key, item)
         if key not in self.items:
             raise FakeCosmosError(404)
@@ -136,6 +172,10 @@ class FakeContainer:
         no_response: bool = False,
     ) -> list[dict[str, Any]]:
         self.batch_calls.append((partition_key, deepcopy(batch_operations)))
+        if self.batch_error is not None:
+            error = self.batch_error
+            self.batch_error = None
+            raise error
         for operation in batch_operations:
             kind, args = operation[:2]
             if kind != "patch":
@@ -143,6 +183,12 @@ class FakeContainer:
             item_id, patch_operations = args
             key = (partition_key, item_id)
             stored = self.items[key]
+            options = operation[2] if len(operation) > 2 else {}
+            predicate = options.get("filter_predicate", "")
+            if "lifecycleGeneration <=" in predicate:
+                maximum_generation = int(predicate.rsplit(" ", 1)[-1])
+                if stored["lifecycleGeneration"] > maximum_generation:
+                    raise FakeCosmosError(412)
             for operation in patch_operations:
                 stored[operation["path"].lstrip("/")] = operation["value"]
         return [{"statusCode": 200} for _ in batch_operations]
@@ -195,6 +241,8 @@ class FakeContainer:
                 continue
             if "@documentKey" in parameter_values and stored.get("documentKey") != parameter_values["@documentKey"]:
                 continue
+            if "@recordType" in parameter_values and stored.get("recordType") != parameter_values["@recordType"]:
+                continue
             rows.append(deepcopy(stored))
         return FakeQueryIterator(rows, None)
 
@@ -202,6 +250,8 @@ class FakeContainer:
 def _ready_document(document_id: str = "doc-1", **overrides: Any) -> dict[str, Any]:
     base = {
         "id": document_id,
+        "schemaVersion": 1,
+        "recordType": "source_document",
         "documentId": document_id,
         "sourceRunId": "source:run-a",
         "documentKey": f"source:run-a:{document_id}",
@@ -215,6 +265,154 @@ def _ready_document(document_id: str = "doc-1", **overrides: Any) -> dict[str, A
     }
     base.update(overrides)
     return base
+
+
+@pytest.mark.parametrize("status", ["discovered", "processing", "admitting", "ready"])
+def test_timeout_closure_fails_manifest_before_disabling_chunks(status: str) -> None:
+    document = _ready_document(status=status, lifecycleGeneration=1, stage="embedding")
+    if status == "ready":
+        document["readyAt"] = "2026-08-05T12:00:00Z"
+    documents = FakeContainer(
+        "sourceRunId", {(document["sourceRunId"], document["id"]): document}
+    )
+    chunk = {
+        "id": "chunk-1",
+        "documentKey": document["documentKey"],
+        "lifecycleGeneration": 1,
+        "isRetrievable": status in {"admitting", "ready"},
+    }
+    chunks = FakeContainer(
+        "documentKey", {(chunk["documentKey"], chunk["id"]): chunk}
+    )
+    repository = DocumentLifecycleRepository(FakeContainer("sourceId"), documents, chunks)
+
+    changed = repository.fail_timed_out_document(
+        source_run_id=document["sourceRunId"],
+        document_id=document["id"],
+        error_code="wave_timeout",
+    )
+
+    assert changed is True
+    stored_document = documents.items[(document["sourceRunId"], document["id"])]
+    assert stored_document["status"] == "failed"
+    assert stored_document["stage"] == "terminal"
+    assert stored_document["lifecycleGeneration"] == 2
+    assert stored_document["readyAt"] is None
+    assert stored_document["failedAt"]
+    assert stored_document["error"] == {
+        "code": "wave_timeout",
+        "stage": "orchestration",
+        "retryable": True,
+    }
+    stored_chunk = chunks.items[(chunk["documentKey"], chunk["id"])]
+    assert stored_chunk["lifecycleGeneration"] == 2
+    assert stored_chunk["isRetrievable"] is False
+    assert documents.patch_calls[0]["patch_operations"][0]["path"] == "/status"
+    assert chunks.batch_calls
+
+
+def test_timeout_closure_compensates_when_ready_wins_first_etag_race() -> None:
+    document = _ready_document(status="admitting", lifecycleGeneration=1, _etag="etag-1")
+    documents = FakeContainer(
+        "sourceRunId", {(document["sourceRunId"], document["id"]): document}
+    )
+    chunks = FakeContainer("documentKey")
+    repository = DocumentLifecycleRepository(FakeContainer("sourceId"), documents, chunks)
+
+    def _publish_ready() -> None:
+        stored = documents.items[(document["sourceRunId"], document["id"])]
+        stored["status"] = "ready"
+        stored["readyAt"] = "2026-08-05T12:00:00Z"
+        stored["_etag"] = "etag-2"
+
+    documents.before_patch = _publish_ready
+
+    changed = repository.fail_timed_out_document(
+        source_run_id=document["sourceRunId"],
+        document_id=document["id"],
+        error_code="wave_timeout",
+    )
+
+    assert changed is True
+    stored = documents.items[(document["sourceRunId"], document["id"])]
+    assert stored["status"] == "failed"
+    assert stored["readyAt"] is None
+    assert stored["lifecycleGeneration"] == 2
+    assert len(documents.patch_calls) == 2
+
+
+def test_timeout_generation_rejects_late_activity_chunk_enablement() -> None:
+    document = _ready_document(status="admitting", lifecycleGeneration=1)
+    documents = FakeContainer(
+        "sourceRunId", {(document["sourceRunId"], document["id"]): document}
+    )
+    chunk = {
+        "id": "chunk-1",
+        "documentKey": document["documentKey"],
+        "lifecycleGeneration": 1,
+        "isRetrievable": True,
+    }
+    chunks = FakeContainer(
+        "documentKey", {(chunk["documentKey"], chunk["id"]): chunk}
+    )
+    repository = DocumentLifecycleRepository(FakeContainer("sourceId"), documents, chunks)
+    repository.fail_timed_out_document(
+        source_run_id=document["sourceRunId"],
+        document_id=document["id"],
+        error_code="wave_timeout",
+    )
+
+    with pytest.raises(LifecycleConflictError, match="generation"):
+        repository.set_document_chunks_retrievable(
+            document_key=document["documentKey"],
+            lifecycle_generation=1,
+            is_retrievable=True,
+        )
+
+    stored_chunk = chunks.items[(chunk["documentKey"], chunk["id"])]
+    assert stored_chunk["lifecycleGeneration"] == 2
+    assert stored_chunk["isRetrievable"] is False
+
+
+def test_timeout_closure_resumes_chunk_compensation_after_partial_failure() -> None:
+    document = _ready_document(status="ready", lifecycleGeneration=1)
+    documents = FakeContainer(
+        "sourceRunId", {(document["sourceRunId"], document["id"]): document}
+    )
+    chunk = {
+        "id": "chunk-1",
+        "documentKey": document["documentKey"],
+        "lifecycleGeneration": 1,
+        "isRetrievable": True,
+    }
+    chunks = FakeContainer(
+        "documentKey", {(chunk["documentKey"], chunk["id"]): chunk}
+    )
+    chunks.batch_error = FakeCosmosError(400)
+    repository = DocumentLifecycleRepository(FakeContainer("sourceId"), documents, chunks)
+
+    with pytest.raises(LifecycleRepositoryError, match="batch patch failed"):
+        repository.fail_timed_out_document(
+            source_run_id=document["sourceRunId"],
+            document_id=document["id"],
+            error_code="wave_timeout",
+        )
+
+    stored_document = documents.items[(document["sourceRunId"], document["id"])]
+    assert stored_document["status"] == "failed"
+    assert stored_document["lifecycleGeneration"] == 2
+    assert chunks.items[(chunk["documentKey"], chunk["id"])]["isRetrievable"] is True
+
+    changed = repository.fail_timed_out_document(
+        source_run_id=document["sourceRunId"],
+        document_id=document["id"],
+        error_code="wave_timeout",
+    )
+
+    assert changed is True
+    stored_chunk = chunks.items[(chunk["documentKey"], chunk["id"])]
+    assert stored_chunk["lifecycleGeneration"] == 2
+    assert stored_chunk["isRetrievable"] is False
 
 
 def test_cross_partition_scans_consume_internal_pages_without_continuation() -> None:
@@ -284,8 +482,12 @@ def test_duplicate_ready_scan_is_streamable_and_deduplicates_each_page() -> None
     assert page.continuation_token == "next-page"
     assert iterator.requested_continuation_token == "current-page"
     assert captured["query"] == (
-        "SELECT c.documentId FROM c WHERE c.status = 'ready'"
+        "SELECT c.documentId FROM c WHERE c.recordType = @recordType "
+        "AND c.status = 'ready'"
     )
+    assert captured["parameters"] == [
+        {"name": "@recordType", "value": "source_document"}
+    ]
     assert "GROUP BY" not in captured["query"]
     assert "DISTINCT" not in captured["query"]
     assert "ORDER BY" not in captured["query"]
@@ -691,7 +893,18 @@ def test_chunk_transition_replay_converges_after_committed_response_is_lost() ->
 
 
 def test_delete_document_and_chunks_removes_everything() -> None:
-    documents = FakeContainer("sourceRunId", {("source:run-a", "doc-1"): _ready_document()})
+    documents = FakeContainer(
+        "sourceRunId",
+        {
+            ("source:run-a", "doc-1"): _ready_document(),
+            ("source:run-a", "visual-manifest:doc-1:000000"): {
+                "id": "visual-manifest:doc-1:000000",
+                "recordType": "visual_manifest_page",
+                "sourceRunId": "source:run-a",
+                "documentId": "doc-1",
+            },
+        },
+    )
     chunks = FakeContainer(
         "documentKey",
         {("source:run-a:doc-1", "chunk:000000"): {
@@ -706,6 +919,7 @@ def test_delete_document_and_chunks_removes_everything() -> None:
     )
 
     assert ("source:run-a", "doc-1") not in documents.items
+    assert ("source:run-a", "visual-manifest:doc-1:000000") not in documents.items
     assert ("source:run-a:doc-1", "chunk:000000") not in chunks.items
 
 
@@ -789,6 +1003,13 @@ def test_list_ready_documents_page_and_find_by_document_id() -> None:
             ("source:run-a", "doc-4"): _ready_document("doc-4", status="retired", retiredReason="acl_revoked"),
             ("source:run-a", "doc-5"): _ready_document("doc-5", status="retired", retiredReason="deleted"),
             ("source:run-a", "doc-6"): _ready_document("doc-6", status="retired", retiredReason="superseded"),
+            ("source:run-a", "visual-manifest:doc-1:000000"): {
+                "id": "visual-manifest:doc-1:000000",
+                "recordType": "visual_manifest_page",
+                "documentId": "doc-1",
+                "sourceRunId": "source:run-a",
+                "status": "ready",
+            },
         },
     )
     repo = DocumentLifecycleRepository(FakeContainer("sourceId"), documents, FakeContainer("documentKey"))
@@ -923,3 +1144,77 @@ def test_save_trigger_instance_id_rejects_empty_id() -> None:
 
     with pytest.raises(ValueError):
         repo.save_trigger_instance_id("source", DELTA_SYNC_TRIGGER_ID, "")
+
+
+def test_trigger_instance_claim_creates_missing_control() -> None:
+    from ingestion.lifecycle_repository import DELTA_SYNC_TRIGGER_ID
+
+    runs = FakeContainer("sourceId")
+    repo = DocumentLifecycleRepository(runs, FakeContainer("sourceRunId"), FakeContainer("documentKey"))
+
+    claimed = repo.try_claim_trigger_instance_id(
+        "source",
+        DELTA_SYNC_TRIGGER_ID,
+        None,
+        "delta-sync-trigger-new",
+    )
+
+    assert claimed is True
+    assert repo.get_trigger_instance_id("source", DELTA_SYNC_TRIGGER_ID) == "delta-sync-trigger-new"
+
+
+def test_trigger_instance_claim_replaces_expected_control() -> None:
+    from ingestion.lifecycle_repository import DELTA_SYNC_TRIGGER_ID
+
+    runs = FakeContainer(
+        "sourceId",
+        {
+            ("source", DELTA_SYNC_TRIGGER_ID): {
+                "id": DELTA_SYNC_TRIGGER_ID,
+                "sourceId": "source",
+                "currentInstanceId": "delta-sync-trigger-old",
+                "_etag": "etag-old",
+            }
+        },
+    )
+    repo = DocumentLifecycleRepository(runs, FakeContainer("sourceRunId"), FakeContainer("documentKey"))
+
+    claimed = repo.try_claim_trigger_instance_id(
+        "source",
+        DELTA_SYNC_TRIGGER_ID,
+        "delta-sync-trigger-old",
+        "delta-sync-trigger-new",
+    )
+
+    assert claimed is True
+    assert repo.get_trigger_instance_id("source", DELTA_SYNC_TRIGGER_ID) == "delta-sync-trigger-new"
+
+
+def test_trigger_instance_claim_loses_concurrent_etag_race() -> None:
+    from ingestion.lifecycle_repository import DELTA_SYNC_TRIGGER_ID
+
+    runs = FakeContainer(
+        "sourceId",
+        {
+            ("source", DELTA_SYNC_TRIGGER_ID): {
+                "id": DELTA_SYNC_TRIGGER_ID,
+                "sourceId": "source",
+                "currentInstanceId": "delta-sync-trigger-old",
+                "_etag": "etag-old",
+            }
+        },
+    )
+    runs.before_replace = lambda: runs.items[("source", DELTA_SYNC_TRIGGER_ID)].update(
+        {"currentInstanceId": "delta-sync-trigger-winner", "_etag": "etag-winner"}
+    )
+    repo = DocumentLifecycleRepository(runs, FakeContainer("sourceRunId"), FakeContainer("documentKey"))
+
+    claimed = repo.try_claim_trigger_instance_id(
+        "source",
+        DELTA_SYNC_TRIGGER_ID,
+        "delta-sync-trigger-old",
+        "delta-sync-trigger-loser",
+    )
+
+    assert claimed is False
+    assert repo.get_trigger_instance_id("source", DELTA_SYNC_TRIGGER_ID) == "delta-sync-trigger-winner"

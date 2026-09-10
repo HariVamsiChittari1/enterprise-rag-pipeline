@@ -7,6 +7,9 @@ misconfiguration must not prevent the retrieval service from starting.
 from __future__ import annotations
 
 from dataclasses import replace
+import sys
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -32,7 +35,6 @@ def _config(**overrides: object) -> RetrievalConfig:
         gateway_client_id="33333333-3333-4333-8333-333333333333",
         gateway_principal_id="44444444-4444-4444-8444-444444444444",
         deployment_instance_id="instance-a",
-        catalog_digest="sha256:" + "a" * 64,
         retrieval_timeout_seconds=5.0,
         generation_timeout_seconds=3.0,
         agent_timeout_seconds=8.0,
@@ -66,3 +68,16 @@ def test_configure_tracing_swallows_failures(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setattr("builtins.__import__", _blocking_import)
 
     _configure_tracing(_config(app_insights_connection_string="InstrumentationKey=fake"))
+
+
+def test_catalog_logger_is_registered_for_azure_monitor(monkeypatch):
+    configure = Mock()
+    instrumentor = Mock()
+    monkeypatch.setitem(sys.modules, "azure.monitor.opentelemetry", SimpleNamespace(configure_azure_monitor=configure))
+    monkeypatch.setitem(sys.modules, "opentelemetry.instrumentation.openai_v2", SimpleNamespace(OpenAIInstrumentor=instrumentor))
+    credential = Mock()
+    _configure_tracing(_config(app_insights_connection_string="InstrumentationKey=fake"), credential=credential)
+    configure.assert_called_once_with(
+        connection_string="InstrumentationKey=fake", logger_name="retrieval.catalog_runtime", credential=credential,
+    )
+    instrumentor.return_value.instrument.assert_called_once_with()

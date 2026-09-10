@@ -126,6 +126,13 @@ def test_cosmos_search_policy_and_throughput_ownership() -> None:
             {"path": "/discoveryOrdinal", "order": "ascending"},
         ]
     ]
+    source_document_paths = {
+        path["path"]
+        for path in containers_by_id["source-documents"]["properties"][
+            "resource"
+        ]["indexingPolicy"]["includedPaths"]
+    }
+    assert "/recordType/?" in source_document_paths
 
     database = _resources(
         template, "Microsoft.DocumentDB/databaseAccounts/sqlDatabases"
@@ -146,7 +153,7 @@ def test_retrieval_catalog_and_gateway_env_contracts() -> None:
     )
     for name in (
         "DEPLOYMENT_INSTANCE_ID",
-        "RETRIEVAL_CATALOG_DIGEST",
+        "RETRIEVAL_CATALOG_POLL_SECONDS",
         "RETRIEVAL_CONFIG_CONTAINER",
         "RETRIEVAL_API_AUDIENCE",
         "RETRIEVAL_GATEWAY_CLIENT_ID",
@@ -154,6 +161,13 @@ def test_retrieval_catalog_and_gateway_env_contracts() -> None:
         "RETRIEVAL_OPERATION_TIMEOUT_SECONDS",
     ):
         assert name in config_source
+
+    assert "RETRIEVAL_CATALOG_DIGEST" not in config_source
+    template = _compile_bicep("infra/modules/retrieval-config.bicep")
+    assert template["parameters"]["catalogPollSeconds"] == {
+        "type": "int", "defaultValue": 7200, "minValue": 60, "maxValue": 86400,
+        "metadata": {"description": "Runtime catalog poll interval in seconds"},
+    }
 
     retrieval_rbac = _compile_bicep("infra/modules/retrieval-cosmos-rbac.bicep")
     retrieval_roles = _resources(
@@ -173,7 +187,7 @@ def test_retrieval_catalog_and_gateway_env_contracts() -> None:
     assert "readableContainerNames" in reader_role["properties"]["scope"]
     assert any(
         "serviceAuditContainerName" in role["properties"]["scope"]
-        and role["properties"]["roleDefinitionId"].endswith("000000000002', parameters('cosmosAccountId'))]")
+        and "audit-create-read" in role["properties"]["roleDefinitionId"]
         for role in retrieval_roles
     )
 
@@ -182,10 +196,55 @@ def test_retrieval_catalog_and_gateway_env_contracts() -> None:
         publisher, "Microsoft.DocumentDB/databaseAccounts/sqlRoleAssignments"
     )[0]
     assert publisher_role["condition"] == "[not(empty(parameters('publisherPrincipalId')))]"
-    assert "retrievalConfigContainerName" in publisher_role["properties"]["scope"]
-    assert publisher_role["properties"]["roleDefinitionId"].endswith(
-        "000000000002', parameters('cosmosAccountId'))]"
+    assert publisher_role["properties"]["scope"] == "[variables('containerScope')]"
+    assert "catalog-bootstrap-create-read" in publisher_role["properties"]["roleDefinitionId"]
+
+
+def test_catalog_roles_have_no_delete_upsert_or_wildcard_actions():
+    publisher = _compile_bicep("infra/modules/retrieval-config-publisher-rbac.bicep")
+    roles = _resources(publisher, "Microsoft.DocumentDB/databaseAccounts/sqlRoleDefinitions")
+    assert len(roles) == 3
+    source = (PROJECT_ROOT / "infra/modules/retrieval-config-publisher-rbac.bicep").read_text(encoding="utf-8")
+    for forbidden in ("items/delete", "items/upsert", "items/*", "containers/*", "000000000002"):
+        assert forbidden not in source
+    assert publisher["variables"]["readActions"] == [
+        "Microsoft.DocumentDB/databaseAccounts/readMetadata",
+        "Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/items/read",
+    ]
+    assert publisher["variables"]["editActions"] == (
+        "[concat(variables('readActions'), createArray("
+        "'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/items/replace', "
+        "'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/executeQuery', "
+        "'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/readChangeFeed'))]"
     )
+    assert "items/create" in json.dumps(roles[0]["properties"]["permissions"])
+    assert roles[1]["properties"]["permissions"] == [{"dataActions": "[variables('editActions')]"}]
+    audit = _compile_bicep("infra/modules/retrieval-cosmos-rbac.bicep")
+    actions = _resources(audit, "Microsoft.DocumentDB/databaseAccounts/sqlRoleDefinitions")[0]["properties"]["permissions"][0]["dataActions"]
+    assert set(actions) == {
+        "Microsoft.DocumentDB/databaseAccounts/readMetadata",
+        "Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/items/create",
+        "Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/items/read",
+    }
+
+
+def test_catalog_diagnostics_and_observer_wiring_compile():
+    template = _compile_bicep("infra/main.bicep")
+    for name in ("catalogEditorPrincipalId", "catalogWriterPrincipalId", "catalogObserverPrincipalId"):
+        assert template["parameters"][name]["defaultValue"] == ""
+    cosmos = _compile_bicep("infra/modules/cosmos.bicep")
+    diagnostic = _resources(cosmos, "Microsoft.Insights/diagnosticSettings")[0]
+    assert diagnostic["properties"]["logs"] == [{"category": "DataPlaneRequests", "enabled": True}]
+    assert diagnostic["properties"]["logAnalyticsDestinationType"] == "Dedicated"
+    monitoring = _compile_bicep("infra/modules/monitoring.bicep")
+    assignments = _resources(monitoring, "Microsoft.Authorization/roleAssignments")
+    assert len(assignments) == 2
+    assert "3913510d-42f4-4e42-8a64-420c390055eb" in assignments[0]["properties"]["roleDefinitionId"]
+    assert "73c42c96-874c-492b-b04d-ab87d138a893" in assignments[1]["properties"]["roleDefinitionId"]
+    aca = _compile_bicep("infra/modules/aca.bicep")
+    reader = _resources(aca, "Microsoft.Authorization/roleAssignments")[0]
+    assert "acdd72a7-3385-48ef-bd42-f606fba81ae7" in reader["properties"]["roleDefinitionId"]
+    assert "Microsoft.App/containerApps" in reader["scope"]
 
 def test_main_has_no_active_aks_or_directory_mutation_path() -> None:
     main_source = (PROJECT_ROOT / "infra/main.bicep").read_text(encoding="utf-8")
@@ -198,6 +257,111 @@ def test_main_has_no_active_aks_or_directory_mutation_path() -> None:
     assert "param deployServing bool = false" in main_source
     assert "module aca './modules/aca.bicep' = if (deployServing)" in main_source
     assert "module functions './modules/functions.bicep' = if (deployServing)" in main_source
+
+
+def test_content_understanding_account_and_model_contract() -> None:
+    template = _compile_bicep("infra/modules/content-understanding.bicep")
+    account = _resources(template, "Microsoft.CognitiveServices/accounts")[0]
+    deployments = _resources(
+        template,
+        "Microsoft.CognitiveServices/accounts/deployments",
+    )
+    deployments_by_model = {
+        deployment["properties"]["model"]["name"]: deployment
+        for deployment in deployments
+    }
+
+    assert account["apiVersion"] == "2025-06-01"
+    assert account["kind"] == "AIServices"
+    assert account["sku"] == {"name": "S0"}
+    assert account["identity"] == {"type": "SystemAssigned"}
+    assert account["properties"]["disableLocalAuth"] is True
+    assert template["parameters"]["allowedIpAddress"]["defaultValue"] == ""
+    assert account["properties"]["publicNetworkAccess"] == (
+        "[if(empty(parameters('allowedIpAddress')), 'Disabled', 'Enabled')]"
+    )
+    network_acls = account["properties"]["networkAcls"]
+    assert network_acls["defaultAction"] == "Deny"
+    assert network_acls["virtualNetworkRules"] == []
+    assert network_acls["ipRules"] == (
+        "[if(empty(parameters('allowedIpAddress')), createArray(), "
+        "createArray(createObject('value', parameters('allowedIpAddress'))))]"
+    )
+    assert set(deployments_by_model) == {
+        "gpt-5.2",
+        "text-embedding-3-large",
+    }
+    assert deployments_by_model["gpt-5.2"]["properties"] == {
+        "model": {
+            "format": "OpenAI",
+            "name": "gpt-5.2",
+            "version": "2025-12-11",
+        },
+        "versionUpgradeOption": "NoAutoUpgrade",
+    }
+    assert deployments_by_model["gpt-5.2"]["sku"] == {
+        "name": "GlobalStandard",
+        "capacity": 30,
+    }
+    assert deployments_by_model["text-embedding-3-large"]["properties"] == {
+        "model": {
+            "format": "OpenAI",
+            "name": "text-embedding-3-large",
+            "version": "1",
+        },
+        "versionUpgradeOption": "NoAutoUpgrade",
+    }
+    assert deployments_by_model["text-embedding-3-large"]["sku"] == {
+        "name": "GlobalStandard",
+        "capacity": 120,
+    }
+    assert deployments_by_model["text-embedding-3-large"]["dependsOn"] == [
+        "[resourceId('Microsoft.CognitiveServices/accounts', "
+        "parameters('accountName'))]",
+        "[resourceId('Microsoft.CognitiveServices/accounts/deployments', "
+        "parameters('accountName'), variables('completionDeploymentName'))]"
+    ]
+    assert all(deployment["apiVersion"] == "2025-06-01" for deployment in deployments)
+
+
+def test_content_understanding_composition_is_private_and_identity_scoped() -> None:
+    main_source = (PROJECT_ROOT / "infra/main.bicep").read_text(encoding="utf-8")
+    rbac = _compile_bicep("infra/modules/rbac.bicep")
+    roles = _resources(rbac, "Microsoft.Authorization/roleAssignments")
+    content_understanding_roles = [
+        role
+        for role in roles
+        if "contentUnderstandingId" in role["scope"]
+    ]
+
+    assert (
+        "module contentUnderstanding './modules/content-understanding.bicep' = "
+        "if (contentUnderstandingEnabled)"
+    ) in main_source
+    assert "param contentUnderstandingEnabled bool = false" in main_source
+    assert "name: 'content-understanding'" in main_source
+    assert "resourceId: contentUnderstanding.?outputs.?accountId ?? ''" in main_source
+    assert "groupId: 'account'" in main_source
+    assert "dnsZoneName: 'privatelink.services.ai.azure.com'" in main_source
+    assert "contentUnderstanding.?outputs.?endpoint ?? ''" in main_source
+    assert "contentUnderstanding.?outputs.?accountId ?? ''" in main_source
+    assert rbac["variables"]["roles"]["ContentUnderstandingContributor"] == (
+        "59a2dba3-6303-4fd8-9a2e-8cbb4bdda972"
+    )
+    assert len(content_understanding_roles) == 1
+    assert content_understanding_roles[0]["properties"]["roleDefinitionId"] == (
+        "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', "
+        "variables('roles').ContentUnderstandingContributor)]"
+    )
+    assert content_understanding_roles[0]["properties"]["principalId"] == (
+        "[parameters('principalId')]"
+    )
+    assert content_understanding_roles[0]["properties"]["principalType"] == (
+        "ServicePrincipal"
+    )
+    assert content_understanding_roles[0]["condition"] == (
+        "[not(empty(parameters('contentUnderstandingId')))]"
+    )
 
 
 def test_aca_requires_immutable_inputs_and_exact_gateway_auth() -> None:
@@ -254,8 +418,13 @@ def test_private_catalog_job_is_manual_identity_only_and_secretless() -> None:
     }
     assert container["command"] == ["python"]
     assert container["args"] == [
-        "-m", "retrieval.operations", "publish-catalog",
+        "-m", "retrieval.operations", "[parameters('catalogOperation')]",
     ]
+    assert template["parameters"]["catalogOperation"]["defaultValue"] == "verify-catalog"
+    assert template["parameters"]["catalogOperation"]["allowedValues"] == [
+        "publish-catalog", "verify-catalog",
+    ]
+    assert template["parameters"]["catalogDigest"]["defaultValue"] == ""
     assert env_names == {
         "COSMOS_ENDPOINT",
         "COSMOS_DATABASE",
@@ -316,6 +485,18 @@ def test_function_settings_match_full_sync_contract() -> None:
         "[parameters('cosmosContainerNames').searchChunks]"
     )
     assert settings["TASKHUB_NAME"] == "[parameters('durableTaskHubName')]"
+    assert settings["CONTENT_UNDERSTANDING_ENDPOINT"] == (
+        "[parameters('contentUnderstandingEndpoint')]"
+    )
+    assert settings["CONTENT_UNDERSTANDING_ANALYZER_ID"] == (
+        "[parameters('contentUnderstandingAnalyzerId')]"
+    )
+    assert settings["DOCUMENT_INTELLIGENCE_ENABLED"] == (
+        "[string(parameters('documentIntelligenceEnabled'))]"
+    )
+    assert settings["CONTENT_UNDERSTANDING_ENABLED"] == (
+        "[string(parameters('contentUnderstandingEnabled'))]"
+    )
     assert settings["DURABLE_TASK_SCHEDULER_CONNECTION_STRING"] == (
         "[format('Endpoint={0};Authentication=ManagedIdentity;ClientID={1}', "
         "parameters('durableTaskSchedulerEndpoint'), "
@@ -337,8 +518,26 @@ def test_one_generic_parameter_contract_has_no_target_defaults() -> None:
     assert "readEnvironmentVariable('SHAREPOINT_ASSIGNED_DRIVE_ID')" in parameters
     assert "readEnvironmentVariable('SHAREPOINT_SITE_URL')" in parameters
     assert "readEnvironmentVariable('SHAREPOINT_SITE_URL', '')" not in parameters
+    assert "readEnvironmentVariable('SUBNET_FUNCTION_INTEGRATION_NSG_ID', '')" in parameters
+    assert "readEnvironmentVariable('SUBNET_PRIVATE_ENDPOINTS_NSG_ID', '')" in parameters
+    assert "readEnvironmentVariable('SUBNET_ACA_ENVIRONMENT_NSG_ID', '')" in parameters
+    assert "readEnvironmentVariable('DOCUMENT_INTELLIGENCE_ENABLED', 'true') == 'true'" in parameters
+    assert "readEnvironmentVariable('CONTENT_UNDERSTANDING_ENABLED', 'false') == 'true'" in parameters
+    assert "'prebuilt-documentSearch'" in parameters
     assert "param resourceGroup" not in parameters
     assert "dev-webhook-secret" not in parameters
+
+
+def test_networking_preserves_subnet_security_associations() -> None:
+    template = _compile_bicep("infra/modules/networking.bicep")
+    subnet_inputs = template["resources"]["virtualNetwork"]["properties"][
+        "parameters"
+    ]["subnets"]["value"]
+
+    assert len(subnet_inputs) == 3
+    for subnet in subnet_inputs:
+        assert subnet["privateEndpointNetworkPolicies"] == "Disabled"
+        assert subnet["networkSecurityGroupResourceId"].startswith("[parameters('")
 
 
 def test_function_easyauth_requires_exact_api_audience_and_callers() -> None:

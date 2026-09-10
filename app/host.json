@@ -14,6 +14,9 @@
     }
   },
   "extensions": {
+    "durableTask": {
+      "maxConcurrentActivityFunctions": 1
+    },
     "queues": {
       "batchSize": 1,
       "newBatchThreshold": 0,

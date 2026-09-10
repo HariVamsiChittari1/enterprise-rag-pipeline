@@ -1,18 +1,19 @@
-"""Lifespan tests for the required immutable Cosmos retrieval catalog."""
+"""Lifespan tests for the required singleton Cosmos retrieval catalog."""
 
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 
 from retrieval import main as retrieval_main
-from retrieval.catalog import CatalogError, RetrievalCatalog
+from retrieval.catalog import CatalogError, RuntimeCatalogSnapshot
 from retrieval.config import RetrievalConfig
 from retrieval.scoring import ScoringProfile
-from retrieval.synonyms import SynonymMap
+from retrieval.synonyms import SynonymExpander, SynonymMap
 
 
 DIGEST = "sha256:" + "a" * 64
@@ -34,7 +35,6 @@ def _base_config() -> RetrievalConfig:
         gateway_client_id="33333333-3333-4333-8333-333333333333",
         gateway_principal_id="44444444-4444-4444-8444-444444444444",
         deployment_instance_id="instance-a",
-        catalog_digest=DIGEST,
         retrieval_timeout_seconds=5.0,
         generation_timeout_seconds=15.0,
         agent_timeout_seconds=8.0,
@@ -50,19 +50,23 @@ def _base_config() -> RetrievalConfig:
     )
 
 
-def _catalog() -> RetrievalCatalog:
-    return RetrievalCatalog(
+def _catalog() -> RuntimeCatalogSnapshot:
+    synonym_map = SynonymMap.parse("geo-map", ["dog, puppy"])
+    return RuntimeCatalogSnapshot(
         deployment_instance_id="instance-a",
-        catalog_id="catalog:" + "a" * 64,
-        version=DIGEST,
-        created_at="2026-08-26T00:00:00Z",
+        catalog_id="runtime-catalog",
+        etag="etag-a",
+        digest=DIGEST,
+        operation_id="operation-a",
+        changed_at="2026-08-26T00:00:00Z",
+        accepted_at=datetime(2026, 8, 26, tzinfo=timezone.utc),
         over_fetch_factor=3,
         hybrid_weights=(2.0, 1.0),
         full_text_score_scope="Local",
         default_profile="geo",
-        synonyms_enabled=True,
         profiles={"geo": ScoringProfile(name="geo", synonym_map="geo-map")},
-        synonym_maps={"geo-map": SynonymMap.parse("geo-map", ["dog, puppy"])},
+        synonym_maps={"geo-map": synonym_map},
+        synonym_expanders={"geo-map": SynonymExpander(synonym_map)},
     )
 
 
@@ -72,7 +76,7 @@ def _patch_azure_sdks(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(retrieval_main, "build_cosmos_registry", lambda *_a, **_k: MagicMock())
     monkeypatch.setattr(retrieval_main, "CosmosClient", lambda **_: MagicMock())
     monkeypatch.setattr(retrieval_main, "AzureOpenAI", lambda **_: MagicMock())
-    monkeypatch.setattr(retrieval_main, "_configure_tracing", lambda _cfg: None)
+    monkeypatch.setattr(retrieval_main, "_configure_tracing", lambda _cfg, **_kwargs: None)
     monkeypatch.setattr(retrieval_main, "_AGENT_AVAILABLE", False)
     monkeypatch.setattr(retrieval_main, "load_retrieval_config", _base_config)
 
@@ -82,26 +86,28 @@ async def _enter_lifespan() -> None:
         pass
 
 
-def test_lifespan_loads_exact_digest_and_applies_catalog(
+def test_lifespan_loads_singleton_and_applies_snapshot(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _patch_azure_sdks(monkeypatch)
-    captured: list[tuple[str, str]] = []
+    captured: list[str] = []
 
-    def _loader(_container: object, instance_id: str, digest: str) -> object:
-        captured.append((instance_id, digest))
+    def _loader(_container: object, instance_id: str) -> object:
+        captured.append(instance_id)
         return SimpleNamespace(load=_catalog)
 
-    monkeypatch.setattr(retrieval_main, "CosmosCatalogLoader", _loader)
+    monkeypatch.setattr(retrieval_main, "RuntimeCatalogLoader", _loader)
 
     asyncio.run(_enter_lifespan())
 
-    assert captured == [("instance-a", DIGEST)]
-    assert retrieval_main._state.catalog_version == DIGEST
-    assert retrieval_main._state.config.over_fetch_factor == 3
-    assert retrieval_main._state.config.hybrid_rrf_weights == (2.0, 1.0)
-    assert retrieval_main._state.config.default_scoring_profile == "geo"
-    assert "geo-map" in retrieval_main._state.synonym_expanders
+    assert captured == ["instance-a"]
+    policy = retrieval_main._state.rag_service.capture_policy()
+    assert policy.snapshot.digest == DIGEST
+    assert policy.snapshot.over_fetch_factor == 3
+    assert policy.snapshot.hybrid_weights == (2.0, 1.0)
+    assert policy.profile.name == "geo"
+    assert policy.expander.map_name == "geo-map"
+    assert retrieval_main._state.catalog_provider._closed is True
 
 
 def test_lifespan_catalog_failure_prevents_startup(
@@ -110,13 +116,13 @@ def test_lifespan_catalog_failure_prevents_startup(
     _patch_azure_sdks(monkeypatch)
     monkeypatch.setattr(
         retrieval_main,
-        "CosmosCatalogLoader",
+        "RuntimeCatalogLoader",
         lambda *_args: SimpleNamespace(
             load=lambda: (_ for _ in ()).throw(CatalogError("catalog corrupt"))
         ),
     )
 
-    with pytest.raises(CatalogError, match="catalog corrupt"):
+    with pytest.raises(CatalogError):
         asyncio.run(_enter_lifespan())
 
 
@@ -132,18 +138,18 @@ def test_lifespan_catalog_failure_closes_acquired_resources(
     monkeypatch.setattr(retrieval_main, "build_cosmos_registry", lambda *_a, **_k: registry)
     monkeypatch.setattr(retrieval_main, "CosmosClient", lambda **_: cosmos)
     monkeypatch.setattr(retrieval_main, "AzureOpenAI", lambda **_: openai_client)
-    monkeypatch.setattr(retrieval_main, "_configure_tracing", lambda _cfg: None)
+    monkeypatch.setattr(retrieval_main, "_configure_tracing", lambda _cfg, **_kwargs: None)
     monkeypatch.setattr(retrieval_main, "_AGENT_AVAILABLE", False)
     monkeypatch.setattr(retrieval_main, "load_retrieval_config", _base_config)
     monkeypatch.setattr(
         retrieval_main,
-        "CosmosCatalogLoader",
+        "RuntimeCatalogLoader",
         lambda *_args: SimpleNamespace(
             load=lambda: (_ for _ in ()).throw(CatalogError("catalog corrupt"))
         ),
     )
 
-    with pytest.raises(CatalogError, match="catalog corrupt"):
+    with pytest.raises(CatalogError):
         asyncio.run(_enter_lifespan())
 
     credential.close.assert_called_once()

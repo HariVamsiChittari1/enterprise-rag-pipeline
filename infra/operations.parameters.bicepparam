@@ -11,7 +11,8 @@ param cosmosEndpoint = readEnvironmentVariable('COSMOS_ENDPOINT')
 param cosmosDatabaseName = 'rag-db'
 param retrievalConfigContainerName = 'retrieval-config'
 param deploymentInstanceId = readEnvironmentVariable('DEPLOYMENT_INSTANCE_ID')
-param catalogDigest = readEnvironmentVariable('RETRIEVAL_CATALOG_DIGEST')
+param catalogDigest = readEnvironmentVariable('RETRIEVAL_CATALOG_DIGEST', '')
+param catalogOperation = readEnvironmentVariable('CATALOG_OPERATION', 'verify-catalog')
 param tags = {
   DeploymentInstance: readEnvironmentVariable('DEPLOYMENT_INSTANCE_ID')
   Project: 'RAG-SharePoint'

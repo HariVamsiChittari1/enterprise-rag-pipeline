@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -9,6 +10,25 @@ from typing import Any
 import structlog
 
 logger = structlog.get_logger()
+CATALOG_LOGGER_NAME = "retrieval.catalog_runtime"
+
+
+def catalog_event_emitter(revision: str, replica: str, *, application: str = "", deployment_instance_hash: str = ""):
+    event_logger = logging.getLogger(CATALOG_LOGGER_NAME)
+    event_logger.setLevel(logging.INFO)
+    process_incarnation = str(uuid.uuid4())
+
+    def emit(event: str, fields: dict[str, Any]) -> None:
+        event_logger.info(event, extra={
+            **fields,
+            "revision": revision,
+            "replica": replica,
+            "process_incarnation": process_incarnation,
+            "application": application,
+            "deployment_instance_hash": deployment_instance_hash,
+        })
+
+    return emit
 
 
 def write_audit_records(

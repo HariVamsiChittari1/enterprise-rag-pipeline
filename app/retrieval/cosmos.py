@@ -15,8 +15,17 @@ class RetrievalMode(StrEnum):
     FULL_TEXT = "full_text"
 
 
+class RetrievalLocatorKind(StrEnum):
+    PAGE = "page"
+    SECTION = "section"
+    SLIDE = "slide"
+    WORKSHEET = "worksheet"
+
+
 # Reranker input cap; matches AI Search's semantic-ranker top-50 rerank cap.
 MAX_CANDIDATE_POOL_TOTAL = 50
+SOURCE_DOCUMENT_SCHEMA_VERSION = 1
+SOURCE_DOCUMENT_RECORD_TYPE = "source_document"
 
 
 @dataclass(frozen=True)
@@ -26,13 +35,17 @@ class RetrievedChunk:
     content: str
     source_name: str
     source_url: str
-    page_number: int
+    locator_kind: RetrievalLocatorKind
+    locator_label: str
+    locator_ordinal_start: int
+    locator_ordinal_end: int
     source_modified_at: str | None = None
 
 
 _PROJECTION = (
     "c.id, c.documentId, c.sourceRunId, c.content, "
-    "c.sourceName, c.sourceUrl, c.pageStart, c.sourceModifiedAt, "
+    "c.sourceName, c.sourceUrl, c.locatorKind, c.locatorLabel, "
+    "c.locatorOrdinalStart, c.locatorOrdinalEnd, c.sourceModifiedAt, "
     "c.sectionPath, c.keyPhrases, c.createdAt"
 )
 _ACL_FILTER = (
@@ -204,7 +217,11 @@ class SecureCosmosRetriever:
             )
         except CosmosResourceNotFoundError:
             return None
-        if manifest.get("status") != "ready":
+        if (
+            manifest.get("schemaVersion") != SOURCE_DOCUMENT_SCHEMA_VERSION
+            or manifest.get("recordType") != SOURCE_DOCUMENT_RECORD_TYPE
+            or manifest.get("status") != "ready"
+        ):
             return None
         return manifest
 
@@ -218,14 +235,30 @@ def _to_chunk(candidate: Mapping[str, Any]) -> RetrievedChunk:
         "content": candidate.get("content"),
         "source_name": candidate.get("sourceName"),
         "source_url": source_url,
-        "page_number": candidate.get("pageStart"),
+        "locator_label": candidate.get("locatorLabel"),
+        "locator_ordinal_start": candidate.get("locatorOrdinalStart"),
+        "locator_ordinal_end": candidate.get("locatorOrdinalEnd"),
     }
+    try:
+        locator_kind = RetrievalLocatorKind(candidate.get("locatorKind"))
+    except (TypeError, ValueError) as error:
+        raise ValueError("invalid_retrieval_record") from error
     if (
-        not all(isinstance(values[name], str) and values[name] for name in values if name not in ("page_number", "source_url"))
-        or not isinstance(values["page_number"], int)
-        or values["page_number"] < 1
+        not all(
+            isinstance(values[name], str) and values[name]
+            for name in values
+            if name not in ("source_url", "locator_ordinal_start", "locator_ordinal_end")
+        )
+        or not isinstance(values["locator_ordinal_start"], int)
+        or not isinstance(values["locator_ordinal_end"], int)
+        or values["locator_ordinal_start"] < 1
+        or values["locator_ordinal_end"] < values["locator_ordinal_start"]
     ):
         raise ValueError("invalid_retrieval_record")
     if source_modified_at is not None and not isinstance(source_modified_at, str):
         source_modified_at = None
-    return RetrievedChunk(source_modified_at=source_modified_at, **values)
+    return RetrievedChunk(
+        locator_kind=locator_kind,
+        source_modified_at=source_modified_at,
+        **values,
+    )

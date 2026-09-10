@@ -163,6 +163,7 @@ def _validate_matrix_audit(
     expected_mode: str,
     expected_profile: str | None,
     expected_catalog_sha: str | None,
+    expected_catalog_etag: str | None = None,
 ) -> list[str]:
     failures = []
     if audit.get("path") != expected_path:
@@ -194,6 +195,11 @@ def _validate_matrix_audit(
             f"expected catalog_version={expected_catalog_sha!r}, observed "
             f"{audit.get('catalog_version')!r}"
         )
+    if expected_catalog_etag is not None and audit.get("catalog_etag") != expected_catalog_etag:
+        failures.append(
+            f"expected catalog_etag={expected_catalog_etag!r}, observed "
+            f"{audit.get('catalog_etag')!r}"
+        )
     return failures
 
 
@@ -210,6 +216,7 @@ def _run_matrix(
     scoring_profile: str | None,
     expected_scoring_profile: str | None,
     expected_catalog_sha: str | None,
+    expected_catalog_etag: str | None = None,
 ) -> list[dict[str, Any]]:
     results = []
     for expected_path, question in (
@@ -248,6 +255,7 @@ def _run_matrix(
                     expected_mode=mode,
                     expected_profile=expected_scoring_profile,
                     expected_catalog_sha=expected_catalog_sha,
+                    expected_catalog_etag=expected_catalog_etag,
                 )
                 scenario.update({
                     "requestId": request_id,
@@ -257,6 +265,7 @@ def _run_matrix(
                     "retrievalDegraded": audit.get("retrieval_degraded"),
                     "citationsCount": audit.get("citations_count"),
                     "catalogVersion": audit.get("catalog_version"),
+                    "catalogEtag": audit.get("catalog_etag"),
                     "scoringProfile": audit.get("scoring_profile"),
                     "status": "passed" if not failures else "failed",
                     "failures": failures,
@@ -350,6 +359,11 @@ def main() -> int:
         help="Assert every audited request used this catalog SHA.",
     )
     parser.add_argument(
+        "--expected-catalog-etag",
+        default=None,
+        help="Assert every audited request used this exact Cosmos catalog ETag.",
+    )
+    parser.add_argument(
         "--report",
         type=Path,
         default=Path("demo-output/retrieval-scenario-matrix.json"),
@@ -383,6 +397,7 @@ def main() -> int:
             scoring_profile=args.scoring_profile,
             expected_scoring_profile=args.expected_scoring_profile,
             expected_catalog_sha=args.expected_catalog_sha,
+            expected_catalog_etag=args.expected_catalog_etag,
         )
         _write_matrix_report(args.report, args.function_app, results)
         print(json.dumps(results, indent=2, ensure_ascii=False))

@@ -61,8 +61,11 @@ def build_config(**overrides: Any) -> IngestionConfig:
         cosmos_source_documents_container="source-documents",
         cosmos_search_chunks_container="search-chunks",
         document_intelligence_endpoint="https://di.example",
+        content_understanding_endpoint="https://cu.example",
+        content_understanding_analyzer_id="rag-document-search-v1",
         language_endpoint="https://lang.example",
         openai_endpoint="https://openai.example",
+        vision_deployment="gpt-5.4",
         managed_identity_client_id="mi",
         chunk_max_tokens=800,
         chunk_overlap_tokens=100,
@@ -71,6 +74,9 @@ def build_config(**overrides: Any) -> IngestionConfig:
         delta_max_pages=200,
         embedding_batch_size=100,
         max_pdf_pages=500,
+        vision_max_output_tokens=400,
+        vision_max_image_bytes=2 * 1024 * 1024,
+        vision_max_figures=60,
         query_proxy_timeout_seconds=30.0,
         sharepoint_site_url="",
     )
@@ -137,19 +143,63 @@ class FakeLifecycleRepository:
         self.refreshed.append(kwargs)
 
 
-def _delta_pdf_item(item_id: str = "item-1", *, deleted: bool = False, name: str = "a.pdf") -> dict[str, Any]:
+def _delta_pdf_item(
+    item_id: str = "item-1",
+    *,
+    deleted: bool = False,
+    name: str = "a.pdf",
+    mime_type: str = "application/pdf",
+) -> dict[str, Any]:
     item: dict[str, Any] = {
         "id": item_id,
         "name": name,
         "eTag": "etag-x",
         "size": 100,
-        "file": {},
+        "file": {"mimeType": mime_type},
         "parentReference": {"id": "parent", "path": "/drive/root:"},
         "webUrl": "https://example.invalid/a.pdf",
     }
     if deleted:
         item["deleted"] = {"state": "deleted"}
     return item
+
+
+@pytest.mark.parametrize(
+    ("name", "mime_type"),
+    [
+        ("guide.md", "text/markdown"),
+        ("report.pdf", "application/pdf"),
+        (
+            "report.docx",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ),
+        (
+            "briefing.pptx",
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        ),
+        (
+            "forecast.xlsx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        ),
+    ],
+)
+def test_delta_document_serializes_native_source_mime(
+    name: str,
+    mime_type: str,
+) -> None:
+    config = build_config(
+        allowed_extensions=(".md", ".pdf", ".docx", ".pptx", ".xlsx")
+    )
+
+    document = services._delta_item_to_document(
+        _delta_pdf_item(name=name, mime_type=mime_type),
+        config,
+        "run-1",
+        0,
+    )
+
+    assert document is not None
+    assert document.to_cosmos_item()["mimeType"] == mime_type
 
 
 def _mock_connector(handler, drive_id: str = "drive") -> httpx.Client:

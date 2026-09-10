@@ -4,10 +4,10 @@ This runbook validates the deployed Function gateway, ACA retrieval service, ing
 
 ## Preconditions
 
-- The deployed Function, ACA revision, image digest, and catalog digest are known.
+- The deployed Function, ACA revision, image digest, and current catalog ETag/digest are known.
 - The caller can obtain a delegated token for `FUNCTION_API_AUDIENCE` with `user_impersonation`.
 - Disposable SharePoint fixtures inherit the target site's permissions.
-- The expected catalog and image digests are immutable.
+- The image is immutable; coordinate catalog editors so the expected generation remains stable during each evidence window.
 
 ```powershell
 $funcApp = '<function-app-name>'
@@ -26,7 +26,7 @@ Capture:
 - Function App name and gateway target.
 - ACA latest ready revision and 100% traffic assignment.
 - Full `repository@sha256:<digest>` image reference.
-- `DEPLOYMENT_INSTANCE_ID` and `RETRIEVAL_CATALOG_DIGEST`.
+- `DEPLOYMENT_INSTANCE_ID` and the inspected current catalog ETag/digest.
 - `ACL_ENABLED=true`.
 
 Any relevant Function deployment, ACA revision/traffic, image, catalog, profile, synonym, or timeout change invalidates affected live evidence.
@@ -71,6 +71,7 @@ python tools/script_query_retrieval.py `
   --client-id $clientId `
   --scenario-matrix `
   --expected-catalog-sha 'sha256:<catalog-digest>' `
+  --expected-catalog-etag '<exact-cosmos-etag>' `
   --report demo-output/retrieval-scenario-matrix.json
 ```
 
@@ -81,7 +82,18 @@ Required coverage:
 - Correct effective mode in audit.
 - At least one citation for corpus-supported questions.
 - `retrieval_degraded=false`.
-- Exact pinned catalog digest.
+- Exact captured catalog digest and ETag in request audit evidence.
+
+## Direct-Edit Validation
+
+Use [the operator procedure](AZURE_SETUP.md#catalog-observation-and-optional-writer)
+with an approved editor and protected previous valid body. Prove private keyless
+browser read/save, a valid config-only edit without an ACA deployment, and
+stable-cohort adoption. Verify malformed persisted edits retain last-known-good
+policy with degraded telemetry, then restore the protected body and prove
+recovery under a new ETag. Coordinate restart testing separately: an invalid
+persisted catalog must fail startup. Re-run affected retrieval/ACL scenarios
+and preserve protected generation-bound evidence after restoration.
 
 ## Scoring Profiles
 
@@ -167,6 +179,10 @@ Validate:
 
 - Source manifests become `ready` only after expected and written chunk counts match.
 - Chunks have `isRetrievable=true` and the same `lifecycleGeneration` as the ready manifest.
+- Representative Markdown, PDF, DOCX, PPTX, and XLSX fixtures use the expected provider route and preserve the original source identity.
+- Every required visual has a persisted manifest entry and description, with zero unexplained uncovered visuals before admission.
+- Representative visual queries return the expected source and typed page, section, slide, or worksheet locator in the top five; Office citations do not use PDF page fragments.
+- Hidden slides and worksheets remain excluded, and detected unsupported Office objects appear in audit evidence rather than retrievable chunks.
 - Delta cursor advances only after all items succeed.
 - ACL revocation removes retrieval eligibility; a valid unchanged source version can be restored.
 - Source deletion and supersession hard-delete document/chunk versions.

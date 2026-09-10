@@ -9,10 +9,39 @@ from datetime import datetime, timezone
 import pytest
 
 from retrieval.auth import Principal
-from retrieval.cosmos import RetrievalMode, RetrievedChunk
+from retrieval.catalog import RequestPolicy, RuntimeCatalogSnapshot
+from retrieval.cosmos import (
+    RetrievalLocatorKind,
+    RetrievalMode,
+    RetrievedChunk as _RetrievedChunk,
+)
 from retrieval.pipeline import RetrievalDependencyError
 from retrieval.service import SearchResult
+from retrieval.scoring import ScoringProfile
 from retrieval.tools import make_search_tool
+
+
+def RetrievedChunk(
+    chunk_id: str,
+    document_id: str,
+    content: str,
+    source_name: str,
+    source_url: str,
+    page_number: int,
+    source_modified_at: str | None = None,
+) -> _RetrievedChunk:
+    return _RetrievedChunk(
+        chunk_id=chunk_id,
+        document_id=document_id,
+        content=content,
+        source_name=source_name,
+        source_url=source_url,
+        locator_kind=RetrievalLocatorKind.PAGE,
+        locator_label=f"Page {page_number}",
+        locator_ordinal_start=page_number,
+        locator_ordinal_end=page_number,
+        source_modified_at=source_modified_at,
+    )
 
 
 class FakeRagService:
@@ -25,6 +54,19 @@ class FakeRagService:
         self._responses = list(responses)
         self._error = error
         self.calls: list[dict[str, Any]] = []
+        self.snapshot = RuntimeCatalogSnapshot(
+            deployment_instance_id="test", catalog_id="runtime-catalog", etag="etag-a",
+            digest="sha256:" + "a" * 64, operation_id="operation-a",
+            changed_at="2026-09-08T00:00:00Z", accepted_at=datetime(2026, 9, 8, tzinfo=timezone.utc),
+            over_fetch_factor=1, hybrid_weights=(1, 1), full_text_score_scope="Global",
+            default_profile=None, profiles={"fresh": ScoringProfile(name="fresh")},
+            synonym_maps={}, synonym_expanders={},
+        )
+        self.policy = None
+
+    def capture_policy(self, requested=None, expand_synonyms=None) -> RequestPolicy:
+        self.policy = RequestPolicy.capture(self.snapshot, requested, expand_synonyms)
+        return self.policy
 
     def search(
         self,
@@ -97,7 +139,30 @@ async def test_search_tool_delegates_policy_and_formats_chunks(
         "scoring_profile": "fresh",
         "expand_synonyms": True,
         "now": fixed_now,
+        "policy": service.policy,
     }]
+
+
+@pytest.mark.asyncio
+async def test_search_tool_preserves_office_url_and_locator(principal: Principal) -> None:
+    chunk = _RetrievedChunk(
+        "c1",
+        "d1",
+        "The operating margin is 18 percent.",
+        "finance.xlsx",
+        "https://sp.com/finance.xlsx",
+        RetrievalLocatorKind.WORKSHEET,
+        "Worksheet Summary",
+        2,
+        2,
+    )
+    tool = make_search_tool(FakeRagService([[chunk]]), principal, [])
+
+    result = await tool(query="operating margin")
+
+    assert "[S1] finance.xlsx, Worksheet Summary" in result
+    assert "(https://sp.com/finance.xlsx)" in result
+    assert "#page=" not in result
 
 
 @pytest.mark.asyncio

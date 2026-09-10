@@ -1,4 +1,7 @@
-# Architecture
+---
+title: Architecture
+description: System boundaries, flows, data contracts, security, and limitations
+---
 
 For environment-variable ownership, defaults, accepted values, and runtime effects, see [CONFIGURATION.md](CONFIGURATION.md).
 
@@ -9,9 +12,10 @@ flowchart LR
     subgraph Ingestion
         Operator[Operator] -->|POST full-sync| Functions[Azure Functions<br/>Flex Consumption<br/>Durable Orchestrator]
         Functions --> Graph[Microsoft Graph v1.0<br/>discovery + ACL + download]
-        Functions --> DI[Document Intelligence<br/>prebuilt-layout → Markdown]
+        Functions --> DI[Document Intelligence<br/>layout + figure crops]
+        Functions --> CU[Content Understanding<br/>document search]
         Functions --> Language[Azure AI Language<br/>key phrases + entities]
-        Functions --> OpenAI[Azure OpenAI<br/>text-embedding-3-large]
+        Functions --> OpenAI[Azure OpenAI<br/>vision descriptions + embeddings]
         Functions --> Cosmos[(Cosmos DB NoSQL<br/>Strong consistency<br/>vectors + metadata)]
     end
 
@@ -35,7 +39,7 @@ flowchart LR
 ### Ingestion (Function App)
 
 | Method | Route | Purpose |
-|--------|-------|---------|
+| --- | --- | --- |
 | POST | `/api/ingestion/full-sync` | Start durable full-sync orchestrator (fresh instance ID per run, returns 202) |
 | GET | `/api/ingestion/status` | Query orchestration instance status and output |
 | POST | `/api/ingestion/terminate` | Terminate orchestration, force-fail stuck docs, finalize run as TERMINATED |
@@ -44,12 +48,12 @@ flowchart LR
 | GET | `/api/ingestion/inspect` | Read up to 200 rows from allowlisted containers with Cosmos `_` system properties removed |
 | POST | `/api/query` | Proxy RAG queries to the retrieval service via `RETRIEVAL_SERVICE_URL` |
 | POST | `/api/webhook/sharepoint` | Receive Microsoft Graph change notifications (primary delta-sync trigger) |
-| POST | `/api/webhook/lifecycle` | Handle Graph subscription lifecycle events (missed, removed, reauthorizationRequired) |
+| POST | `/api/webhook/lifecycle` | Log Graph `reauthorizationRequired` lifecycle notifications for the subscribed drive |
 
 ### Retrieval (Azure Container Apps)
 
 | Method | Route | Purpose |
-|--------|-------|---------|
+| --- | --- | --- |
 | POST | `/api/query` | Hybrid RAG query — returns answer + citations |
 | GET | `/health/live` | Liveness probe |
 | GET | `/health/ready` | Readiness probe (Cosmos connectivity check) |
@@ -57,7 +61,7 @@ flowchart LR
 ### Timers (Function App)
 
 | Timer | Schedule | Purpose |
-|-------|----------|---------|
+| --- | --- | --- |
 | `reconciliation_timer` | Configurable (default daily 04:00 UTC) | Safety-net delta query — catches changes missed by webhooks |
 | `acl_resync_timer` | Configurable (default weekly Sunday 03:00 UTC) | Re-verify ACLs on already-ingested documents |
 | `lifecycle_reconcile_timer` | Configurable (default every 10 minutes) | Repair interrupted transitions and orphan chunks; remove older duplicate ready versions only when the current full-sync run supplies the ready winner |
@@ -74,6 +78,7 @@ sequenceDiagram
     participant Orch as Durable Orchestrator
     participant Graph as Microsoft Graph
     participant DI as Document Intelligence
+    participant CU as Content Understanding
     participant Lang as Language AI
     participant OAI as Azure OpenAI
     participant Cosmos as Cosmos DB
@@ -90,14 +95,40 @@ sequenceDiagram
         Note over Orch: Extract Entra group IDs + site group IDs
         Orch->>Orch: Site group IDs? → resolve via SP REST API
         Orch->>Graph: Verify each Entra group via GET /groups/{id} (securityEnabled check, 404=skip)
-        Orch->>Graph: Download PDF via @microsoft.graph.downloadUrl redirect
-        Orch->>DI: Extract pages → Markdown (prebuilt-layout)
-        Note over Orch: Chunk: cl100k_base, 800 tokens, 100 overlap, page-aware segments
+        Orch->>Graph: Download original source bytes
+        alt Markdown, provider independent
+            Orch->>Orch: Direct UTF-8 extraction
+            Orch->>Graph: Download authorized linked PNG files
+            Orch->>OAI: Describe linked images
+        else PDF with Content Understanding selected
+            Orch->>CU: Extract Markdown and described figures once
+        else PDF with Document Intelligence selected
+            Orch->>DI: Extract Markdown and figure crops
+            Orch->>OAI: Describe required figures
+        else Office with Content Understanding selected
+            Orch->>Orch: Inventory OOXML visual objects and exclusions
+            Orch->>Graph: Request rendered PDF derivative
+            Orch->>CU: Analyze rendered PDF once
+            opt Required visuals exist
+                Orch->>Orch: Bind results to source Office locators
+            end
+        else Office with Document Intelligence selected
+            Orch->>Orch: Inventory OOXML visual objects and exclusions
+            Orch->>DI: Extract native Office semantics
+            opt Required visuals exist
+                Orch->>Graph: Request rendered PDF derivative
+                Orch->>DI: Extract figure crops only
+                Orch->>OAI: Describe required figures
+            end
+            Orch->>Orch: Merge source-bound visual descriptions
+        end
+        Note over Orch: Reject incomplete coverage, then chunk canonical segments
         Orch->>Lang: Enrich batch (size=5): key phrases, entities, summary (each independently configurable)
         Orch->>OAI: Embed cleaned text (batch=100, 3072 dims)
         Orch->>Cosmos: Write initially ineligible chunks
+        Orch->>Cosmos: Write schema-v1 visual manifest pages and binding hash
         Orch->>Cosmos: Set document ADMITTING and enable matching chunk generation
-        Orch->>Cosmos: Verify chunk count and mark document READY
+        Orch->>Cosmos: Verify chunks and visual manifest, then mark document READY
     end
 
     Orch->>Cosmos: Finalize run: recount from source-documents, set terminal status
@@ -124,7 +155,10 @@ sequenceDiagram
         Act->>Cosmos: Save bootstrap cursor
         Act-->>Orch: bootstrapped=true (no items processed)
     else Cursor exists (steady state)
-        Act->>Graph: GET /root/delta (with stored deltaLink)
+        Act->>Graph: GET stored deltaLink unchanged
+        opt Graph returns 410 Gone
+            Act->>Graph: Follow reset Location and enumerate to a new deltaLink
+        end
         loop Each changed item
             alt Item deleted
                 Act->>Cosmos: Delete document + chunks (reason=deleted)
@@ -147,13 +181,14 @@ sequenceDiagram
 ### Delta Sync Behavior
 
 - **Bootstrap**: On the first tick (no cursor in `delta-control`), the timer fetches `?token=latest` with the same `Prefer` headers used for steady-state reads (`deltashowremovedasdeleted, deltatraversepermissiongaps, deltashowsharingchanges`). This ensures the bootstrap token is compatible with subsequent delta reads.
-- **Steady state**: Each tick reads Graph's delta feed, deduplicates by item ID (latest change wins), and processes additions/updates/deletions.
-- **Additions/updates**: Run through the full processing pipeline (ACL verification → Document Intelligence extraction → chunking → Language AI enrichment → embedding → Cosmos write). Previous versions are hard-deleted (document + chunks) via `lifecycle_repository.delete_document_and_chunks()`, ETag-guarded against concurrent changes, once the replacement is already `ready`.
+- **Permission-change contract**: Microsoft documents the three permission-scanning headers with `Sites.FullControl.All`. The connector sends those headers, but the approved prerequisite set does not include that permission. This is an unresolved permission-contract gap; weekly explicit ACL resync remains the safety net, and sharing-change delta events must not be treated as complete evidence until the design is reconciled.
+- **Steady state**: Each tick follows Graph's opaque `@odata.nextLink` and `@odata.deltaLink` URLs without editing their tokens, deduplicates by item ID (latest occurrence wins), and processes additions, updates, and deletions. Ordering and at-most-once delivery are not assumed.
+- **Additions/updates**: Run through the full processing pipeline (ACL verification → selected extraction provider → chunking → Language AI enrichment → embedding → Cosmos write). Previous versions are hard-deleted (document + chunks) via `lifecycle_repository.delete_document_and_chunks()`, ETag-guarded against concurrent changes, once the replacement is already `ready`.
 - **Permission-only changes**: When Graph flags `@microsoft.graph.sharedChanged` on an item with no content change, `resync_document_acl()` re-verifies that document's ACL directly (same outcome as ACL Resync below) instead of running the full pipeline. ACL revocation still soft-retires (`status=retired`, `retiredReason=acl_revoked`) rather than hard-deleting, since it reflects a permission change, not a confirmed source deletion.
 - **Deletions**: The document and its chunks are hard-deleted from Cosmos via `lifecycle_repository.delete_document_and_chunks()`, guarded by the document's ETag so a concurrent change (e.g. a racing ACL resync) is detected as a conflict and safely skipped rather than deleting stale data.
 - **Concurrency guard**: Skips if a full-sync orchestration or a previous delta tick is still running.
 - **Cursor persistence**: The new `deltaLink` is saved only when every item in the completed round succeeds. If any item fails, the previous cursor is retained; Graph can replay successful items, so item handling remains idempotent.
-- **Double-410 recovery**: If Graph returns `410 Gone` on the stored cursor AND the first reset-location URL, a nested handler retries the second reset-location. If that also fails, `run_delta_sync()` catches `DeltaResetRequired` and re-bootstraps the cursor from scratch.
+- **410 recovery**: A `410 Gone` response starts a fresh enumeration from Graph's `Location` URL. The connector follows up to two consecutive reset locations. If another 410 escapes that traversal, the service falls back to `?token=latest`; that restores future tracking but does not prove changes during the gap were reconciled, so run an approved full sync after this fallback.
 
 ## ACL Resync Flow
 
@@ -214,13 +249,13 @@ sequenceDiagram
 
     Note over SP,Graph: User edits/adds/deletes a file
     SP->>Graph: Change event
-    Graph->>Webhook: POST notification (clientState validated)
+    Graph->>Webhook: POST notification
     Webhook->>Webhook: Validate clientState, check concurrency
     alt Full-sync or delta-sync already running
-        Webhook-->>Graph: 200 OK (skip)
+        Webhook-->>Graph: 200 OK within 3 seconds (skip)
     else No conflict
         Webhook->>Orch: Start delta_sync_orchestrator
-        Webhook-->>Graph: 200 OK after dispatch
+        Webhook-->>Graph: 200 OK within 3 seconds after dispatch
         Orch->>Act: call_activity
         Act->>Graph: GET /root/delta (stored cursor)
         Act->>Act: Process adds/updates/deletes
@@ -236,16 +271,37 @@ sequenceDiagram
 
 ### Webhook Lifecycle
 
-- **Subscription creation**: `subscription_renew_timer` creates a Graph subscription on `/drives/{driveId}/root` with `changeType: updated` and `Prefer: includesecuritywebhooks`. The subscription ID is stored in `ingestion-runs` (Cosmos).
-- **Renewal**: The timer renews the subscription daily. Graph driveItem subscriptions expire after ~30 days; the timer renews with ~1 day margin.
-- **Lifecycle events**: `POST /api/webhook/lifecycle` receives `missed`, `removed`, and `reauthorizationRequired` events. They are logged without immediate repair. The next renewal timer recreates the subscription only when renewal reports it missing.
+```mermaid
+sequenceDiagram
+    participant Timer as subscription_renew_timer
+    participant Graph as Microsoft Graph
+    participant Hook as POST /api/webhook/lifecycle
+    participant Cosmos as ingestion-runs
+
+    Timer->>Cosmos: Read persisted subscription ID
+    alt Subscription exists
+        Timer->>Graph: PATCH expiration to now + 41,000 minutes
+    else Missing or renewal returns 404
+        Timer->>Graph: POST drive root subscription
+        Timer->>Cosmos: Persist replacement subscription ID
+    end
+    opt Graph requests reauthorization
+        Graph->>Hook: reauthorizationRequired notification
+        Hook-->>Graph: 200 OK within 3 seconds
+        Note over Hook: Log only, with no immediate repair or clientState validation
+    end
+```
+
+- **Subscription creation**: `subscription_renew_timer` creates a Graph subscription on `/drives/{driveId}/root` with `changeType: updated` and `Prefer: includesecuritywebhooks`. Graph validates each public HTTPS notification URL by requiring the decoded plain-text token and HTTP 200 response within 10 seconds. The subscription ID is stored in `ingestion-runs` (Cosmos).
+- **Renewal**: Graph permits a `driveItem` subscription lifetime of at most 42,300 minutes. The application requests 41,000 minutes and renews daily. An expired or deleted subscription cannot be renewed; a 404 causes creation of a replacement subscription, followed by the ordinary delta safety net.
+- **Lifecycle events**: For `driveItem`, Microsoft Graph supports only `reauthorizationRequired`; it does not send `missed` or `subscriptionRemoved`. The endpoint logs notifications without immediate repair. The next renewal timer recreates the subscription only when renewal reports it missing.
 - **Security**: Webhook endpoints are excluded from EasyAuth. SharePoint change notifications are validated by matching `clientState` (shared secret set via `WEBHOOK_CLIENT_STATE`). The lifecycle endpoint currently logs lifecycle events without validating `clientState`; subscription repair occurs on the next renewal timer.
 - **Auto ACL resync on zero-delta**: When the delta feed returns zero content changes (`itemsSeen == 0`), the orchestrator automatically runs one page of ACL resync. This catches permission-only changes that Graph's `@microsoft.graph.sharedChanged` does not surface for library-level inheritance.
 
 ## Authentication Model
 
 | Component | Method | Credentials |
-|-----------|--------|-------------|
+| --- | --- | --- |
 | Microsoft Graph | Certificate-based `CertificateCredential` | PFX from Key Vault secret (`https://graph.microsoft.com/.default` scope) |
 | SharePoint REST API | Certificate-based `CertificateCredential` | Same PFX, `https://{tenant}.sharepoint.com/.default` scope |
 | Cosmos DB, Doc Intelligence, Language AI | Managed Identity (`DefaultAzureCredential`) | User-assigned MI |
@@ -255,7 +311,7 @@ sequenceDiagram
 | Function → retrieval | Function UAMI service token + bounded gateway context | ACA Authentication and application code validate audience, tenant, app/client ID, principal ID, and `Retrieval.Gateway` role |
 | Retrieval ACL resolution | Microsoft Graph `/transitiveMemberOf` | Retrieval UAMI resolves the gateway-supplied user object ID to security groups |
 
-External app-registration prerequisites are Graph `Sites.Selected`, `Sites.Read.All`, `GroupMember.Read.All`, and `User.Read.All` application permissions, plus SharePoint `Sites.Read.All` under application ID `00000003-0000-0ff1-ce00-000000000000`. The Bicep deployment consumes these identities but does not create or consent directory permissions.
+External app-registration prerequisites are Graph `Files.ReadWrite.All` for source download and Office-to-PDF conversion, `Sites.Selected`, `Sites.Read.All`, `GroupMember.Read.All`, and `User.Read.All` application permissions, plus SharePoint `Sites.Read.All` under application ID `00000003-0000-0ff1-ce00-000000000000`. The Bicep deployment consumes these identities but does not create or consent directory permissions. The current set intentionally does not claim `Sites.FullControl.All`; reconcile the permission-scanning header gap before treating permission-change delta events as an approved control.
 
 ## Security Model
 
@@ -268,7 +324,7 @@ External app-registration prerequisites are Graph `Sites.Selected`, `Sites.Read.
 7. Retrieval requires: caller's transitive security groups ∩ document's `allowedGroupIds` ≠ ∅
 8. A candidate is searchable only when its chunk has `isRetrievable=true` and its point-read source manifest still has `status=ready`; retrieval does not rely on the full-sync current-run pointer.
 
-## Data Model (Cosmos DB) — Schema v1
+## Data Model (Cosmos DB) Schema v1
 
 ```mermaid
 flowchart LR
@@ -277,7 +333,7 @@ flowchart LR
         C2[source-documents<br/>partition: /sourceRunId]
         C3[search-chunks<br/>partition: /documentKey<br/>DiskANN + full-text indexes<br/>retrieval eligibility]
         C4[service-audit<br/>partition: /id<br/>best-effort audit, 90-day TTL]
-        C5[retrieval-config<br/>partition: /deploymentInstanceId<br/>Immutable retrieval catalogs]
+        C5[retrieval-config<br/>partition: /deploymentInstanceId<br/>Mutable runtime catalog]
     end
     C1 -->|source-control.currentRunId| C2
     C2 -->|documentKey| C3
@@ -306,20 +362,27 @@ flowchart LR
 ### search-chunks (partition: /documentKey)
 
 - One record per chunk with: content, searchable text, embedding (3072-dim), ACL, enrichment status per module, key phrases, entities, `isRetrievable`, and `lifecycleGeneration`
-- Citation fields: `sourceName`, `sourceUrl`, `pageStart`, `pageEnd`, `sectionPath`
+- Canonical extraction fields: typed locator kind, label, ordinal range, modalities, extraction provenance, and visual-coverage status
+- Citation fields: `sourceName`, `sourceUrl`, `locatorKind`, `locatorLabel`, `locatorOrdinalStart`, `locatorOrdinalEnd`, and `sectionPath`
 - Relevance signals: `sourceModifiedAt` — denormalized from the parent document when each chunk version is built, so client-side reranking reads it in the same projection; nullable legacy values are corrected by normal versioned reprocessing
 - DiskANN vector index on `/embedding` (cosine, 3072 dims)
 - Full-text indexes on `/content` and `/searchableText` (language: en-US)
 - ACL index on `/allowedGroupIds/[]`
+
+DiskANN supports the deployed 3,072 dimensions, but it is approximate and can
+return different neighbors across replicas. Containers with fewer than 1,000
+indexed vectors fall back to full scan. Shared-throughput database accounts are
+not supported for this vector path. Treat vector policy or index changes as a
+container migration until the exact deployed API behavior is tested.
 
 ### service-audit (partition: /id)
 
 Best-effort audit records for explicitly instrumented service calls and document lifecycle events. Retrieval audit failures are logged and do not fail the query. Items expire after the container's 90-day default TTL.
 
 | Operation | Source | Trigger | Key Fields |
-|-----------|--------|---------|------------|
+| --- | --- | --- | --- |
 | `ingestion_embedding` | embedding.py | Per batch | model, tokens, latency |
-| `document_extraction` | services.py | Per doc | model, pages, characters, latency |
+| `document_extraction` | services.py | Per doc | format, model, native segments, derivative use, provenance, visual inventory/accounting, exclusions, unsupported reasons, latency |
 | `enrichment` | services.py | Per batch | chunks, module statuses, latency |
 | `query_planning` | retrieval/service.py | Per query | model, tokens, latency |
 | `embedding` | retrieval/service.py | Per query | model, tokens, latency |
@@ -337,16 +400,21 @@ Best-effort audit records for explicitly instrumented service calls and document
 
 ### retrieval-config (partition: /deploymentInstanceId)
 
-Stores immutable retrieval catalogs and publication metadata for each deployment instance. At startup, retrieval directly point-reads `catalog:<digest>` using required `DEPLOYMENT_INSTANCE_ID` and `RETRIEVAL_CATALOG_DIGEST`, validates the item and references, and fails startup if the pinned item is missing or inconsistent. The optional `active` pointer supports publication/rollback operations but is not consulted by runtime loading.
+Stores one mutable `runtime-catalog` per deployment instance, plus optional
+guarded-writer history and outcome records. Retrieval validates the singleton
+at startup and polls for updates. Each request captures one immutable snapshot
+identified by the Cosmos ETag and normalized config digest. There is no active
+pointer or serving digest pin. See [configuration](CONFIGURATION.md#direct-catalog-editing).
 
 ## Retrieval Architecture
 
 > **Current-state boundary:** Scoring profiles, freshness reranking, weighted
 > RRF, a global candidate-pool cap, Solr synonym expansion (equivalency and
-> explicit mapping) with three-level enablement, and agentic-path parity are
-> implemented. Azure Container Apps directly loads the immutable catalog pinned
-> by deployment instance and digest from `retrieval-config` at startup and caches
-> the validated runtime objects for the replica lifetime. Only freshness scoring
+> explicit mapping) through selected-profile references, and agentic-path parity
+> are implemented. Azure Container Apps polls `retrieval-config` and atomically
+> adopts validated immutable snapshots. An absent catalog starts on a built-in
+> baseline; a present but invalid catalog fails closed at startup, and later
+> failures retain last-known-good configuration with degraded telemetry. Only freshness scoring
 > functions are accepted; `magnitude` and `tag` functions are rejected. The offline evaluator in
 > [evaluation/retrieval_metrics.py](../evaluation/retrieval_metrics.py) compares
 > protected baseline/candidate rankings using Precision@K, Recall@K, and MRR.
@@ -364,9 +432,9 @@ flowchart TD
     Decision -->|1 query: simple| Standard[Standard RAG Path]
     Decision -->|2+ queries: complex| Agentic[Agentic RAG Path]
 
-    Config[(Cosmos retrieval-config<br/>pinned immutable catalog)] --> Profile[Resolve requested/default<br/>scoring profile]
+    Config[(Cosmos retrieval-config<br/>captured runtime snapshot)] --> Profile[Resolve requested/default<br/>scoring profile]
     Standard -->|search| Profile
-    Profile --> SynonymGate{Synonyms enabled<br/>and profile has map?}
+    Profile --> SynonymGate{Profile has map<br/>and request permits expansion?}
     SynonymGate -->|yes| Synonyms[Solr synonym expansion<br/>parameterized terms, max 8]
     SynonymGate -->|no| Retrieve[Embed query + ACL-filtered<br/>candidate retrieval]
     Synonyms --> Retrieve
@@ -436,7 +504,7 @@ sequenceDiagram
 All queries are analyzed by the LLM query planner (regardless of conversation history). The planner decomposes multi-part queries into up to 3 focused sub-queries. The query count determines the path:
 
 | Planned Queries | Path | Description |
-|----------------|------|-------------|
+| --- | --- | --- |
 | 1 | Standard RAG | Fixed pipeline: embed → retrieve → generate |
 | 2–3 | Agentic RAG | Agent Framework agent with iterative search tool calls |
 
@@ -452,7 +520,7 @@ If the agentic path times out (`AGENT_TIMEOUT_SECONDS`, deployed Bicep default 2
 ### Retrieval Modes and Cosmos Query Syntax
 
 | Mode | Cosmos ORDER BY | Index Used |
-|------|----------------|------------|
+| --- | --- | --- |
 | `hybrid` | `ORDER BY RANK RRF(VectorDistance(...), FullTextScore(...))` | DiskANN + full-text |
 | `vector` | `ORDER BY VectorDistance(c.embedding, @embedding)` | DiskANN |
 | `full_text` | `ORDER BY RANK FullTextScore(c.searchableText, @searchText)` | Full-text (BM25) |
@@ -472,17 +540,17 @@ flowchart LR
     RR --> POST[Top-K evidence]
     POST --> GEN[Answer generation]
     subgraph Config
-        CP[(Cosmos retrieval-config<br/>pinned profile + synonym maps)]
+        CP[(Cosmos retrieval-config<br/>captured profile + synonym maps)]
     end
     CP --> SYN
     CP --> RR
 ```
 
-**Weighted RRF (in-server)** — the only knob Cosmos exposes for hybrid ranking. Passed as a bound parameter `RRF(VectorDistance(...), FullTextScore(...), @rrfWeights)`, where the weight array is positional: index `0` = `VectorDistance` (vector weight), index `1` = `FullTextScore` (BM25 weight). Documented at the SQL constant in [app/retrieval/cosmos.py](../app/retrieval/cosmos.py); the same positional convention is used by the [SDK weighted-RRF example](https://github.com/Azure/azure-sdk-for-python/blob/main/sdk/cosmos/azure-cosmos/tests/test_query_hybrid_search.py). Runtime weights come from the pinned catalog; the environment parser supplies only a pre-catalog fallback.
+**Weighted RRF (in-server)**: Passed as a bound parameter `RRF(VectorDistance(...), FullTextScore(...), @rrfWeights)`, where the weight array is positional: index `0` = `VectorDistance` (vector weight), index `1` = `FullTextScore` (BM25 weight). Documented at the SQL constant in [app/retrieval/cosmos.py](../app/retrieval/cosmos.py); the same convention appears in the [SDK example](https://github.com/Azure/azure-sdk-for-python/blob/main/sdk/cosmos/azure-cosmos/tests/test_query_hybrid_search.py). Runtime weights come from the request's captured catalog, with no environment relevance fallback.
 
 **Global candidate pool cap** — `MAX_CANDIDATE_POOL_TOTAL = 50` in [app/retrieval/cosmos.py](../app/retrieval/cosmos.py) applies to the sum requested across all sub-queries and registry instances, not only the merged list. [app/retrieval/pipeline.py](../app/retrieval/pipeline.py) allocates the exact budget and round-robin merges ranked lists so submission order cannot fill the pool first.
 
-**Client-side rerank pipeline** — when a `scoring_profile` is present, `RagService` allocates one global pool `min(top_k × overFetchFactor, 50)` across all planned queries and registry instances. Candidates are deduplicated by `(documentId, chunkId)`. `ScoringProfileReranker` applies an application-defined query-match approximation for text weights plus functions with `functionAggregation` in `{sum, average, minimum, maximum}` (development-stage `schemaVersion: 1`; legacy `max` is rejected without an alias). This is not exact Azure AI Search field-score weighting. If no profile is selected, the direct `RetrievedChunk` path remains.
+**Client-side rerank pipeline**: When a `scoring_profile` is present, `RagService` allocates one global pool `min(top_k × overFetchFactor, 50)` across all planned queries and registry instances. Candidates are deduplicated by `(documentId, chunkId)`. `ScoringProfileReranker` applies an application-defined query-match approximation for text weights plus functions with `functionAggregation` in `{sum, average, minimum, maximum}`; `max` is rejected without an alias. This is not exact Azure AI Search field-score weighting. If no profile is selected, the direct `RetrievedChunk` path remains.
 
 A private `RagService.retrieve_evaluation_pool` seam captures a post-ACL, post-ready-manifest candidate pool and returns a frozen deep-copied `EvaluationPool` for deterministic reranking under a caller-supplied timezone-aware `evaluationAsOf`. The current protected generator invokes this seam separately for the baseline and candidate profiles and hashes both resulting pools; it does not assert that the two fetched pools are identical. Deployed application code never imports the evaluation package.
 
@@ -490,9 +558,16 @@ A private `RagService.retrieve_evaluation_pool` seam captures a post-ACL, post-r
 
 Freshness uses only the configured `sourceModifiedAt` field (or its snake-case alias). Missing, malformed, or future timestamps contribute zero; ingestion is responsible for preserving the source timestamp. Legacy chunks remain readable but receive no freshness contribution until naturally reprocessed.
 
-**`full_text_score_scope` operator note** — Cosmos NoSQL supports `Local` and `Global` scope for BM25 statistics ([SDK reference](https://github.com/Azure/azure-sdk-for-python/blob/main/sdk/cosmos/azure-cosmos/azure/cosmos/container.py)). The pinned catalog supplies `fullTextScoreScope` and the example catalog uses **`Global`** for scoring consistency across cross-partition queries. `Local` computes statistics only within the queried partitions. The environment parser has a fallback value, but startup replaces it with the catalog value.
+**`full_text_score_scope` operator note**: Cosmos NoSQL supports `Local` and `Global` scope for BM25 statistics ([SDK reference](https://github.com/Azure/azure-sdk-for-python/blob/main/sdk/cosmos/azure-cosmos/azure/cosmos/container.py)). The captured catalog supplies `fullTextScoreScope`; the example uses `Global`. `Local` computes statistics only within the queried partitions. There is no environment relevance fallback.
 
-**Versioned Cosmos catalog** — the `retrieval-config` container is partitioned by `/deploymentInstanceId`. Each published configuration is an immutable `catalog:<sha256>` item. Retrieval performs one point read of the item named by `RETRIEVAL_CATALOG_DIGEST`, then verifies the deployment instance, digest, schema, profile references, and synonym-map references. Missing or inconsistent pinned data fails startup. The ETag-protected `active` pointer is publication metadata; changing it does not change a running or newly starting replica until the deployment's pinned digest is updated. See the [private catalog publication decision](decisions/0001-private-catalog-publication.md) for the existing network and identity rationale.
+**Runtime catalog**: A serialized provider refresh validates the entire singleton
+before publishing a snapshot. A timed-out read cannot publish late or overlap
+another read. New ETags are accepted even with unchanged optional writer
+metadata. Invalid or unavailable updates preserve the running snapshot; a
+restart with an absent catalog starts on a built-in baseline, while a present
+item must be valid. Standard, agentic, and
+fallback execution share one request snapshot. The optional writer's assurance
+is separate from ordinary direct editing; see [Azure setup](AZURE_SETUP.md#catalog-observation-and-optional-writer).
 
 **Solr synonym expansion** — [app/retrieval/synonyms.py](../app/retrieval/synonyms.py) parses equivalency and explicit replacement rules, including escaped commas/backslashes. Rewritten query variants are capped at eight, with five additions per matched rule. Cosmos receives one parameterized `FullTextScore(c.searchableText, @t0, ...)` and the hybrid RRF weights remain the stable two-component vector/text pair. No synonym value is concatenated into SQL.
 
@@ -530,7 +605,7 @@ The retrieval pipeline applies three layers of defense against indirect prompt i
 Ingestion classifies document-processing failures for the full-sync/retry activity loop:
 
 | Error Type | Representation | Full-sync behavior | Examples |
-|-----------|----------------|--------------------|----------|
+| --- | --- | --- | --- |
 | Retryable | `SafeError.retryable=true` | Persist `failed`, ETag-reset to `discovered`, then retry inside `process_document_activity` | 429 throttling, dependency timeouts, transient 5xx |
 | Terminal | `TerminalDocumentError` | Persist `failed` without activity-local retry | Invalid PDF, no pages, no verified ACL groups, sharing links |
 
@@ -539,7 +614,7 @@ Delta processing calls `process_document` once per changed item. Any failed item
 ## Configurable Modules
 
 | Module | Env Var | Default | Effect when disabled |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | Document Intelligence | `EXTRACTION_ENABLED` | `true` | Documents fail (no extraction alternative) |
 | Key Phrases (Language AI) | `KEY_PHRASES_ENABLED` | `true` | Chunks stored without key phrases |
 | Entities (Language AI) | `ENTITIES_ENABLED` | `true` | Chunks stored without named entities |
@@ -565,26 +640,35 @@ Delta processing calls `process_document` once per changed item. Any failed item
 | Agent Timeout | `AGENT_TIMEOUT_SECONDS` | `20.0` in Bicep | Agentic path deadline before standard-path fallback |
 | Retrieval Operation Timeout | `RETRIEVAL_OPERATION_TIMEOUT_SECONDS` | `27.0` | Wall-clock deadline for `/api/query` at ACA ingress |
 | Deployment Instance | `DEPLOYMENT_INSTANCE_ID` | Required | Retrieval catalog partition key |
-| Retrieval Catalog Digest | `RETRIEVAL_CATALOG_DIGEST` | Required | Immutable `sha256:<digest>` selecting the startup catalog item |
+| Catalog Poll Interval | `RETRIEVAL_CATALOG_POLL_SECONDS` | Optional | Deployment-owned bounded polling; see [configuration](CONFIGURATION.md#direct-catalog-editing) |
 | Retrieval Config Container | `RETRIEVAL_CONFIG_CONTAINER` | `retrieval-config` | Dedicated versioned configuration container |
 
 ## Scale Limits (hardcoded in `ScaleLimits`)
 
 | Limit | Value |
-|-------|-------|
-| Max eligible PDFs per run | 10,000 |
+| --- | --- |
+| Max eligible source documents per run | 10,000 |
 | Max drive items scanned | 50,000 |
 | Max folders traversed | 10,000 |
 | Max folder depth | 32 |
 | Max Graph pages | 20,000 |
-| Max PDF size | 25 MB |
-| Max PDF pages | 500 |
-| Max chunks per PDF | 2,000 |
+| Max source file size | 100 MB |
+| Max rendered Office-to-PDF derivative | 200 MB |
+| Max document units | 300 |
+| Max chunks per source document | 2,000 |
+
+The `MAX_PDF_PAGES` runtime setting defaults to 500, but the shared 300-unit
+application limit is the effective upper bound. Document Intelligence S0
+separately supports up to 500 MB and 2,000 PDF/TIFF pages; F0 supports 4 MB and
+processes only the first two pages. Native Office input is limited by the
+service to 8 million characters, and embedded Office images are not analyzed.
+The lower applicable application, tier, format, and regional quota limit
+governs.
 
 ## Retry Strategy
 
 | Layer | Mechanism | Configuration |
-|-------|-----------|---------------|
+| --- | --- | --- |
 | Document activity | Activity-local retry | 5 attempts; failed→discovered ETag reset; 60s base delay + stable document jitter |
 | Graph HTTP transport | `httpx.HTTPTransport(retries=3)` | Transport-level retry on connection errors |
 | Cosmos 429 throttling | Repository exponential backoff | 5 retries, 1s × 2^n delay |
@@ -610,10 +694,12 @@ Full sync re-discovers the drive. Before creating a new document record, discove
 - **Ingestion runtime**: Azure Functions Flex Consumption, Python 3.12
 - **Retrieval runtime**: Azure Container Apps, FastAPI + Uvicorn, Python 3.12
 - **Orchestration**: Durable Task Scheduler (MI-based auth), task hub name derived from `INGESTION_SOURCE_ID` (`${sourceId}-sync`, truncated to 45 chars)
+- **Orchestration retention**: no explicit scheduler retention is deployed, so terminal instances use the 30-day default; status history is not permanent release evidence
+- **Termination boundary**: termination is queued and does not cancel already-running activities or suborchestrations; repository reconciliation remains required after operator termination
 - **Function timeout**: 30 minutes (`host.json`)
 - **IaC and deployment controller**: Bicep executed by `scripts/deploy.ps1`, which validates target authority and runs Foundation, Build, Operations, Catalog, CatalogVerify, Final, and Function; after E2E validation and explicit approval, OperationsCleanup removes the temporary publisher job
 - **Networking**: VNet-integrated Function and internal ACA managed environment; private endpoints for Cosmos, Storage, the existing Key Vault, Document Intelligence, and Language AI
-- **Artifacts**: Retrieval image is built by ACR and deployed as `repository@sha256:<digest>`; retrieval configuration is pinned by immutable catalog digest
+- **Artifacts**: Retrieval image is built by ACR and deployed as `repository@sha256:<digest>`; current catalog generations are verified by ETag and config digest
 
 ## Observability
 
@@ -662,7 +748,7 @@ flowchart TB
 The Function App uses one environment-neutral App Service Authentication contract:
 
 | Setting | Configured behavior |
-|---|---|
+| --- | --- |
 | `openIdIssuer` | Tenant-specific Microsoft Entra v2 issuer |
 | `allowedAudiences` | Exactly `FUNCTION_API_AUDIENCE` |
 | `allowedApplications` | Required nonempty `FUNCTION_ALLOWED_CALLER_CLIENT_ID` list supplied through Bicep |
@@ -673,7 +759,13 @@ The query gateway validates the EasyAuth user principal's tenant, exact audience
 
 ## Infrastructure Bootstrap
 
-The guarded deployment is multi-phase because serving resources require immutable artifacts. Foundation provisioning creates shared infrastructure without the Function or retrieval app. Build produces an ACR image digest. A temporary private ACA job publishes and verifies the immutable retrieval catalog. Final provisioning requires both `repository@sha256:<digest>` and `sha256:<catalog-digest>`, then Function deployment publishes the ingestion package. No placeholder serving image is used.
+The guarded deployment is multi-phase because serving requires reviewed
+artifacts. Foundation creates shared infrastructure without serving apps.
+Build produces an immutable ACR image. The private operations job creates a
+seed only on explicit initialization; read-only current-catalog verification
+is required before Final. Function deployment publishes the ingestion package.
+No placeholder serving image is used. [Azure setup](AZURE_SETUP.md) owns the
+exact sequence and job-retention requirements.
 
 ## Inactive AKS Manifest
 
@@ -691,12 +783,12 @@ AKS manifests remain under `app/retrieval/kubernetes/`, but `infra/main.bicep` h
 ### Ingestion
 
 | # | Use Case | Description |
-|---|---|---|
+| --- | --- | --- |
 | UC-1 | Full-sync ingestion | BFS discovery of all files in a SharePoint drive with parallel fan-out processing in configurable waves |
 | UC-2 | Incremental delta-sync | Process only added, modified, or deleted files since the last cursor via Microsoft Graph Delta API |
 | UC-3 | Webhook-driven real-time sync | Graph change notifications trigger delta-sync immediately; daily reconciliation timer as safety net |
-| UC-4 | PDF extraction to Markdown | Document Intelligence `prebuilt-layout` model converts PDF pages to structured Markdown |
-| UC-5 | Token-based page-aware chunking | cl100k_base tokenizer splits content into 800-token chunks with 100-token overlap, respecting page boundaries |
+| UC-4 | Five-format semantic and visual extraction | Direct Markdown plus one selected provider: Content Understanding takes precedence when enabled; otherwise Document Intelligence handles PDF and native Office semantics with rendered Office visual augmentation |
+| UC-5 | Token-based source-unit-aware chunking | cl100k_base tokenizer splits content into 800-token chunks with 100-token overlap without crossing incompatible page, section, slide, or worksheet units |
 | UC-6 | Language AI enrichment | Key phrases, named entities, and abstractive summary — each independently toggleable via env vars |
 | UC-7 | OpenAI embedding | text-embedding-3-large at 3072 dimensions, batched (default 100 texts per call) |
 | UC-8 | ACL verification (direct Entra groups) | Read `/permissions` per file, verify each group's `securityEnabled=true` via Graph, reject sharing links |
@@ -715,7 +807,7 @@ AKS manifests remain under `app/retrieval/kubernetes/`, but `infra/main.bicep` h
 ### Retrieval
 
 | # | Use Case | Description |
-|---|---|---|
+| --- | --- | --- |
 | UC-20 | LLM query planning | Decompose user question into 1–3 focused sub-queries for targeted evidence retrieval |
 | UC-21 | Standard RAG path | Fixed pipeline: embed query → ACL-filtered Cosmos search → LLM answer generation (1 planned query) |
 | UC-22 | Agentic RAG path | Agent Framework agent with iterative `search_knowledge_base` tool calls (2+ planned queries) |
@@ -727,14 +819,14 @@ AKS manifests remain under `app/retrieval/kubernetes/`, but `infra/main.bicep` h
 | UC-28 | Synonym expansion | Apply the profile's Solr synonym map when deployment, profile, and request controls enable it |
 | UC-29 | Prompt injection defense | Hardened system prompt + regex chunk sanitization + `[S#]` input segmentation |
 | UC-30 | Per-user rate limiting | Sliding-window limiter (default 30 RPM per user per ACA replica), returns HTTP 429. Effective ceiling is approximately `RATE_LIMIT_RPM × replicaCount` (see L8). |
-| UC-31 | Citations with page references | Each `[S#]` marker maps to `source_url#page=N` with source name |
+| UC-31 | Typed source citations | Each `[S#]` marker carries a page, section, slide, or worksheet label; only PDF page citations append `#page=N` |
 | UC-32 | Multi-turn conversation | The latest 10 validated history messages are passed to the query planner for context-aware decomposition |
 | UC-33 | Query gateway | Function validates delegated user claims, then calls ACA with its UAMI token, bounded gateway context, and owned request ID |
 
 ### Operations and Observability
 
 | # | Use Case | Description |
-|---|---|---|
+| --- | --- | --- |
 | UC-34 | Service audit trail | Best-effort Cosmos records for explicitly instrumented service calls and lifecycle events, retained for 90 days by default |
 | UC-35 | GenAI OpenTelemetry tracing | Optionally configure Azure Monitor and OpenAI instrumentation when the connection string is present; setup failure is nonfatal and logged |
 | UC-36 | Health probes | Liveness (`/health/live`) and readiness (`/health/ready` with Cosmos connectivity check) endpoints |
@@ -743,8 +835,8 @@ AKS manifests remain under `app/retrieval/kubernetes/`, but `infra/main.bicep` h
 ## Known Limitations and Future Work
 
 | # | Limitation | Impact | Future Direction |
-|---|---|---|---|
-| L1 | **PDF-only extraction** — Only PDF is implemented. DOCX, PPTX, XLSX, HTML, and images are not processed even though Document Intelligence supports them. | Files of other types are silently skipped during discovery | Add MIME-type dispatch in `extraction.py`; Document Intelligence already supports these formats |
+| --- | --- | --- | --- |
+| L1 | **Office extraction limits**: Document Intelligence native Office analysis does not extract embedded images and does not analyze XLSX tables. Speaker notes, comments, tracked changes, external images, OLE objects, macros, animations, audio/video, and password-protected packages are outside the extraction contract. Hidden slides and worksheets are excluded. Required OOXML visuals are paired to rendered-PDF figures by count and order because the services provide no shared object identity; any mismatch fails extraction. | Detected omissions are audited but are not searchable; password-protected or invalid packages and visual-pairing mismatches fail extraction | Validate count/order pairing against the release corpus, and add support only with an approved extraction and coverage contract for each object type |
 | L2 | **Single SharePoint drive** — One `SHAREPOINT_ASSIGNED_DRIVE_ID` per deployment. Multiple document libraries or sites need separate deployments. | Limits multi-library organizations to N deployments | Complete the source-registry, source-context propagation, webhook routing, lifecycle isolation, migration, and load design described in `MULTI_LIBRARY_DESIGN.md` |
 | L3 | **Single tenant** — Both ingestion and retrieval are locked to one Entra tenant. Cross-tenant and B2B guest scenarios are not supported. | Cannot serve users from partner tenants | Requires multi-tenant EasyAuth config and cross-tenant Graph consent |
 | L4 | **English-only full-text search** — Cosmos full-text index is hardcoded to `en-US`. Non-English documents have degraded BM25 relevance. | Multilingual corpora rank poorly on full-text queries | Make `defaultLanguage` a Bicep parameter; consider per-document language detection |
@@ -755,7 +847,7 @@ AKS manifests remain under `app/retrieval/kubernetes/`, but `infra/main.bicep` h
 | L9 | **No front-end application** — API-only. No web UI, Teams bot, or Copilot plugin. | End users need a separate client to interact with the system | Build a React SPA or Teams bot that calls `/api/query` |
 | L10 | **No CI/CD pipeline** — Releases are operator-driven through the guarded `scripts/deploy.ps1` phases; no GitHub Actions or Azure Pipelines workflow invokes that controller. | Reviews and phase execution depend on an operator, despite hash, target, preview, and immutable-artifact guards | Add CI/CD that preserves the controller's authority, approval, immutable artifact, E2E, and cleanup gates |
 | L11 | **Protected evaluation inputs are external** — Ranking generation, schemas, Precision@K, Recall@K, MRR, thresholds, and per-query regression checks exist, but approved ground truth and principal cases are intentionally not committed. | Evaluation cannot run from a fresh checkout without authorized protected artifacts | Materialize the approved private inputs and run the existing generator and evaluator as documented in `evaluation/README.md` |
-| L12 | **No image/figure extraction** — Embedded images and figures in PDFs are not captured. | Visual content (charts, diagrams) is invisible to retrieval | Use Document Intelligence figure extraction or a vision model for image-to-text |
+| L12 | **No image-vector retrieval or query-time image input**: visuals are represented by bounded factual text descriptions and use the existing text embedding path. | Pure visual-similarity searches and image queries are unsupported | Add a separate multimodal retrieval design only when requirements and evaluation evidence justify it |
 | L13 | **No individual user ACL** — Only Entra security groups are accepted. Files shared directly with a single user (not via group) are rejected. | Direct-share-only files are not retrievable | Extract `user` identities from `grantedToV2` and match against caller's `oid` |
 | L14 | **No cumulative cap across operator retries** — each `POST /api/ingestion/retry-failed` request resets `attemptCount` to zero before the bounded activity retry loop. The endpoint can be invoked repeatedly for a chronically failing document. | Repeated operator retries can incur extraction/embedding cost without a persisted cumulative limit | Persist and enforce an operator retry policy before resetting failed documents |
 | L15 | **Function App admin endpoints lack per-user role enforcement** — EasyAuth `requireAuthentication` + `allowedApplications` restrict which client apps can call the API, but no endpoint checks the caller's Entra role. `require_easy_auth_role()` exists in code but is unused in `function_app.py`. | Any user of an allowed client application can call destructive endpoints (`purge`, `terminate`) | Call `require_easy_auth_role()` with an `Ingestion.Admin` app role check at the top of each admin/destructive endpoint |

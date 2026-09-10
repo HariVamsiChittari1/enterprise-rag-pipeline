@@ -112,6 +112,11 @@ To check a periodic tick, read `currentInstanceId` from the `delta-sync-trigger`
 `acl-resync-trigger`, or `lifecycle-reconcile-trigger` control record in `ingestion-runs`
 through an approved Cosmos read path, then pass that value as `instanceId`.
 
+The deployed Durable Task Scheduler uses its default 30-day retention for
+terminal orchestration data. Status and replay history are diagnostic data, not
+permanent release evidence. This endpoint can return `404` after scheduler
+purge, and the terminate endpoint may purge its target sooner.
+
 #### Response — 200 OK
 
 ```json
@@ -142,6 +147,12 @@ through an approved Cosmos read path, then pass that value as `instanceId`.
 ### `POST /api/ingestion/terminate`
 
 Terminate a running orchestration, force-fail any stuck documents, and finalize the run as `TERMINATED`.
+
+Durable termination is asynchronous. The endpoint waits up to 30 seconds for
+the orchestration to become terminal before attempting to purge its history,
+then finalizes repository run state. Already-running activities and
+suborchestrations are not canceled and can continue to completion, so verify
+dependency side effects and lifecycle reconciliation after termination.
 
 #### Request
 
@@ -347,8 +358,8 @@ Content-Type: application/json
 | `mode` | string | No | `"hybrid"` | One of: `hybrid`, `vector`, `full_text` |
 | `history` | `array<object>` | No | `[]` | Conversation history for multi-turn queries. Each item: `{role: "user"\|"assistant", content: "..."}`. Bounded to last 10 messages. |
 | `top_k` | integer | No | `MAX_EVIDENCE_CHUNKS` env var (default 5) | Chunks to retrieve (1–20) |
-| `scoring_profile` | string \| null | No | Pinned catalog's `defaultProfile` | Name of a profile in the pinned catalog. Omitted or `null` selects the catalog default. Unknown names are rejected. |
-| `expand_synonyms` | boolean \| null | No | `null` | `false` disables expansion. `true` or `null` expands only when catalog synonyms are enabled and the selected profile references a loaded map. See [Synonym enablement truth table](#synonym-enablement-truth-table). |
+| `scoring_profile` | string \| null | No | Captured catalog's optional `defaultProfile` | Omitted or `null` selects the default, or no profile if absent. Unknown names are rejected. |
+| `expand_synonyms` | boolean \| null | No | `null` | `false` disables expansion. Otherwise only the selected profile's map applies. See [Synonym enablement truth table](#synonym-enablement-truth-table). |
 
 Freshness has no request field. The selected profile automatically applies any configured freshness functions to each candidate's `sourceModifiedAt`.
 
@@ -431,6 +442,8 @@ Receive Microsoft Graph change notifications for the subscribed drive. Triggers 
 
 **A. Subscription validation handshake** (Graph sends this when creating/renewing the subscription):
 
+Return the decoded token as plain text with HTTP 200 within 10 seconds.
+
 ```http
 POST /api/webhook/sharepoint?validationToken=<opaque-token> HTTP/1.1
 ```
@@ -464,7 +477,10 @@ Content-Type: application/json
 }
 ```
 
-**Response — 200 OK** (empty body)
+**Response — 200 OK** (empty body). Return a 2xx response within 3 seconds;
+Microsoft Graph retries failed deliveries, while slow endpoints can delay or
+drop later notifications. The Function dispatches orchestration work before
+returning and does not process the changed item inline.
 
 #### Error responses
 
@@ -480,7 +496,10 @@ Content-Type: application/json
 
 ### `POST /api/webhook/lifecycle`
 
-Receive Graph subscription lifecycle events (missed notifications, subscription removed, reauthorization required).
+Receive Microsoft Graph subscription lifecycle notifications. For the subscribed
+`driveItem` resource, Microsoft Graph supports only
+`reauthorizationRequired`; it does not send `missed` or
+`subscriptionRemoved` lifecycle events.
 
 Same validation handshake as `/api/webhook/sharepoint` (returns `validationToken` as `text/plain` when queried with `?validationToken=`).
 
@@ -494,7 +513,7 @@ Content-Type: application/json
   "value": [
     {
       "subscriptionId": "abc123-...",
-      "lifecycleEvent": "missed",  // or "removed", "reauthorizationRequired"
+      "lifecycleEvent": "reauthorizationRequired",
       "subscriptionExpirationDateTime": "..."
     }
   ]
@@ -503,7 +522,10 @@ Content-Type: application/json
 
 **Response — 200 OK** (empty body)
 
-**Behavior**: logs the event as a warning. It does not trigger immediate repair. The next renewal tick recreates the subscription only when renewal reports the persisted subscription missing.
+**Behavior**: logs the event as a warning. It does not reauthorize, renew, or
+reconcile immediately, and it does not validate `clientState`. The next renewal
+tick recreates the subscription only when renewal reports the persisted
+subscription missing.
 
 ---
 
@@ -531,7 +553,7 @@ Request headers required:
 
 | Status | Body | Reason |
 |---|---|---|
-| 400 | `unknown_scoring_profile` application envelope | Requested profile is not in the pinned catalog |
+| 400 | `unknown_scoring_profile` application envelope | Requested profile is not in the captured catalog |
 | 401 | platform or application response | Missing/invalid service identity, gateway role, context, or request ID |
 | 422 | `invalid_request` application envelope | FastAPI body validation failed |
 | 429 | `rate_limit_exceeded` application envelope | Per-user, per-replica rate limit exceeded |
@@ -576,7 +598,12 @@ ACA uses this to route traffic only to ready replicas.
 
 ## Retrieval Configuration
 
-Scoring profiles and synonym maps are loaded once at retrieval-service startup. They define application-side secondary reranking after Cosmos BM25/vector/RRF retrieval; they are not native Cosmos index scoring profiles and do not claim exact Azure AI Search scoring parity. See [ARCHITECTURE.md — Scoring profiles, freshness, and client-side rerank](ARCHITECTURE.md#scoring-profiles-freshness-and-client-side-rerank).
+Scoring profiles and synonym maps load at startup and refresh together through
+periodic whole-catalog validation. Each request retains its captured snapshot;
+see [refresh timing](CONFIGURATION.md#direct-catalog-editing).
+They define application-side secondary reranking after Cosmos BM25/vector/RRF,
+not native Cosmos index scoring profiles or exact Azure AI Search scoring parity.
+See [architecture](ARCHITECTURE.md#scoring-profiles-freshness-and-client-side-rerank).
 
 ### Cosmos catalog source
 
@@ -584,23 +611,35 @@ Retrieval requires these startup settings:
 
 | Setting | Purpose |
 |---|---|
-| `RETRIEVAL_CONFIG_CONTAINER` | Cosmos container containing immutable catalog items; default `retrieval-config` |
+| `RETRIEVAL_CONFIG_CONTAINER` | Cosmos container containing the singleton; default `retrieval-config` |
 | `DEPLOYMENT_INSTANCE_ID` | Catalog partition key |
-| `RETRIEVAL_CATALOG_DIGEST` | Exact immutable `sha256:<64 lowercase hex>` catalog version |
+| `RETRIEVAL_CATALOG_POLL_SECONDS` | Bounded refresh interval; see [configuration](CONFIGURATION.md#direct-catalog-editing) |
 
-At startup, retrieval point-reads `catalog:<digest>` from the `/deploymentInstanceId` partition. It validates the digest, deployment instance, strict schema, unique names, supported functions, finite values, required default profile, and profile-to-synonym-map references before becoming ready. The optional ETag-protected `active` pointer is publication metadata; runtime does not consult it.
+Retrieval point-reads `runtime-catalog` from the `/deploymentInstanceId`
+partition at startup and on refresh. It validates the envelope, ETag, strict
+schema, unique names, finite values, functions, optional default profile, and
+map references. When the item is absent, retrieval starts on a built-in baseline
+(neutral `1:1` hybrid RRF, `overFetchFactor` 3, `Global` scope, no profiles or
+synonym maps); a present item that is invalid fails closed, and later failures
+retain last-known-good configuration. A request captures one snapshot before
+planning, including agentic execution and standard fallback. No activation
+pointer is used.
 
 The authoritative authoring example is [app/retrieval/catalog.example.json](../app/retrieval/catalog.example.json). Its deployed profiles are listed in the query request section above.
 
 ### Catalog property reference
 
-Client environments should maintain a reviewed catalog JSON file based on `app/retrieval/catalog.example.json`. Do not add hand-written items directly to Cosmos. The publisher validates this authoring schema, computes the content digest, adds immutable metadata, writes the item, and verifies the persisted content.
+Bootstrap source files contain only `config`, based on
+[the example](../app/retrieval/catalog.example.json). For routine changes, edit
+only the existing singleton's `config` using the
+[direct-edit procedure](CONFIGURATION.md#direct-catalog-editing). The normalized,
+validated config digest plus Cosmos ETag identifies a generation; optional
+writer metadata cannot attribute subsequent direct edits.
 
 #### Top-level and retrieval properties
 
 | Property | Required | Allowed value or default | Runtime effect and configuration guidance |
 | --- | --- | --- | --- |
-| `schemaVersion` | Yes | Integer `1` only | Authoring schema version. Change only when the application adds support for another version. |
 | `config` | Yes | Object; no unknown properties | Contains all runtime retrieval configuration. |
 | `config.retrieval` | Yes | Object | Candidate retrieval settings shared by all profiles. |
 | `config.retrieval.overFetchFactor` | Yes | Integer `1`–`50`; example uses `3` | With a scoring profile, requests up to `min(top_k × overFetchFactor, 50)` candidates across planned queries and registered instances before reranking. Higher values can improve reranking recall but increase retrieval work and latency. Start with the validated example value and change it only with relevance/latency evidence. |
@@ -608,9 +647,8 @@ Client environments should maintain a reviewed catalog JSON file based on `app/r
 | `config.retrieval.hybridWeights.vector` | Yes | Finite number greater than `0`; example `2.0` | Positional weight for `VectorDistance` inside Cosmos hybrid RRF. The ratio to `text` matters; larger relative values favor vector ranking. Used only in hybrid mode. |
 | `config.retrieval.hybridWeights.text` | Yes | Finite number greater than `0`; example `1.0` | Positional weight for `FullTextScore` inside Cosmos hybrid RRF. Larger relative values favor lexical ranking. Used only in hybrid mode. |
 | `config.retrieval.fullTextScoreScope` | Yes | `"Local"` or `"Global"`; example `"Global"` | Passed to Cosmos full-text queries. `Global` uses statistics across physical partitions for more consistent cross-partition ranking; `Local` uses partition-local statistics. Use `Global` unless measured latency/cost evidence justifies `Local`. |
-| `config.defaultProfile` | Yes | Nonempty profile name | Profile used when a request omits or sets `scoring_profile=null`. It must exactly match one entry in `config.profiles`. |
-| `config.synonymsEnabled` | Yes | Boolean | Catalog-wide synonym switch. `false` disables all expansion regardless of profile or request. |
-| `config.profiles` | Yes | Array, maximum 100 entries | Scoring profiles available to requests. Names must be unique, and the array must contain `defaultProfile`. |
+| `config.defaultProfile` | No | Nonempty profile name; omit for no default | Must match a profile when supplied. Explicit `null` is invalid. |
+| `config.profiles` | Yes | Array, maximum 100 entries; may be empty | Unique definitions make profiles available; selection applies one profile. |
 | `config.synonymMaps` | Yes | Array | Named synonym maps. Names must be unique. Every profile `synonymMap` reference must resolve or startup fails closed. |
 
 #### Scoring profile properties
@@ -657,31 +695,21 @@ Supported rule forms:
 - A rule can add at most five variants per matched input term, and a query is capped at eight total variants.
 - Expanded terms are bound as Cosmos query parameters; values are not concatenated into SQL.
 
-#### Publisher-generated Cosmos properties
+#### Fixed Cosmos envelope and optional metadata
 
-Do not add these fields to the authoring JSON. The publisher creates them:
+Bootstrap creates the envelope. Keep it unchanged during routine direct editing:
 
 | Property | Generated value | Purpose |
 | --- | --- | --- |
-| `id` | `catalog:<64 lowercase hex>` | Immutable Cosmos item ID derived from canonical authoring content. |
+| `id` | `runtime-catalog` | Fixed singleton ID. |
 | `deploymentInstanceId` | `--deployment-instance-id` value | `/deploymentInstanceId` partition key; maximum 100 characters. |
-| `type` | `retrieval-catalog` | Catalog item discriminator. |
-| `version` | `sha256:<64 lowercase hex>` | Digest pinned into `RETRIEVAL_CATALOG_DIGEST`. |
-| `createdAt` | UTC timestamp | Publication metadata. |
+| `type` | `retrieval-runtime-catalog` | Fixed discriminator. |
+| `change` | Optional object | When present, requires exactly `operationId` (lowercase UUID), `changedAt` (valid UTC timestamp ending in `Z`), and `reason` (nonblank, at most 500 characters). |
 
-The publisher can also create or replace a separate publication pointer:
-
-| Active-pointer property | Generated value or constraint | Purpose |
-| --- | --- | --- |
-| `id` | `active` | Point-read identifier for publication tooling. |
-| `deploymentInstanceId` | Deployment instance, maximum 100 characters | Partition key. |
-| `type` | `active-retrieval-catalog` | Pointer discriminator. |
-| `catalogId` | `catalog:<64 lowercase hex>` | Immutable catalog item referenced by the pointer. |
-| `version` | `sha256:<64 lowercase hex>` | Referenced catalog digest. |
-| `activatedAt` | UTC timestamp | Activation metadata. |
-| `activatedBy` | Nonempty string, maximum 200 characters | Reviewed publisher/operator identity label. |
-
-Cosmos `_rid`, `_self`, `_etag`, `_attachments`, and `_ts` are service-generated system properties. Publication tooling uses the pointer's Cosmos `_etag` for optimistic replacement. The `active` item is not read by runtime catalog loading.
+There is no schema-version field, digest field, activation pointer, or catalog
+feature switch. Cosmos `_rid`, `_self`, `_etag`, `_attachments`, and `_ts` are
+service-generated. A valid new ETag is adopted even when optional `change`
+metadata is unchanged. Direct saves do not guarantee writer history or rollback.
 
 Supported text fields are `content`, `sourceName`, `sectionPath`, and `keyPhrases`. Text weights apply when normalized query terms match a configured field. The only supported scoring function is freshness over `sourceModifiedAt`. Supported interpolation modes are `constant`, `linear`, `quadratic`, and `logarithmic`; supported aggregation modes are `sum`, `average`, `minimum`, and `maximum`. Magnitude, tag, distance, arbitrary signals, and the legacy `max` alias are rejected.
 
@@ -695,20 +723,22 @@ python tools/publish_retrieval_catalog.py validate `
   --deployment-instance-id <deployment-instance-id>
 ```
 
-The command prints `catalogId` and `catalogDigest`. The guarded deployment controller publishes and verifies the immutable item through its `Operations`, `Catalog`, and `CatalogVerify` phases, then deploys serving resources through `Final` with `RETRIEVAL_CATALOG_DIGEST`. After E2E validation and explicit approval, `OperationsCleanup` removes the temporary publisher job. Rollback requires a reviewed deployment that pins the previous compatible catalog digest and image/Function release tuple; changing only the publication pointer does not change runtime selection. See the [private catalog publication decision](decisions/0001-private-catalog-publication.md) for the existing rationale.
+The command prints `catalogId` and `catalogDigest`. It does not change Azure.
+Use [Azure setup](AZURE_SETUP.md) for create-only initialization, read-only
+redeployment verification, and optional guarded writer commands. Catalog
+recovery restores a protected valid body under a new ETag, not an old image pin.
 
 ### Synonym enablement truth table
 
-Three levels combine. In order of precedence (highest first):
+Definitions and references govern expansion; there is no global enable switch.
 
-| Catalog `synonymsEnabled` | Selected `scoring_profile.synonymMap` | `expand_synonyms` (request) | Effective behavior |
-|---|---|---|---|
-| `false` | any | any | **No expansion** — deploy toggle wins |
-| `true` | not set | any | **No expansion** — nothing to expand |
-| `true` | set, map loaded | `false` | **No expansion** — request explicit `false` wins |
-| `true` | set, map loaded | `null` (default) | **Expand** using profile's map |
-| `true` | set, map loaded | `true` | **Expand** using profile's map |
-| `true` | set, map NOT loaded | any | **Startup fails closed** — invalid config, service refuses to start |
+| Selected profile | Map reference | Request `expand_synonyms` | Effective behavior |
+| --- | --- | --- | --- |
+| None | None | Any | No expansion |
+| Present | Absent | Any | No expansion |
+| Present | Loaded map | `false` | No expansion |
+| Present | Loaded map | `true` or `null` | Expand using the profile's map |
+| Any | Unresolved reference | Any | Reject catalog; fail startup or retain running last-known-good snapshot |
 
 ### Startup logs (redacted)
 
@@ -717,16 +747,8 @@ On successful load, the service logs:
 ```json
 {
   "event": "retrieval_service_started",
-  "deployment_instance_id": "aca-e2e-20260827",
   "catalog_version": "sha256:...",
-  "scoring_profiles": [
-    { "name": "hr-relevance", "weights": ["content", "keyPhrases", "sectionPath", "sourceName"], "functions": ["freshness"] }
-  ],
-  "synonym_maps": ["hr-en"],
-  "synonyms_enabled": true,
-  "default_scoring_profile": "hr-relevance",
-  "full_text_score_scope": "Global",
-  "over_fetch_factor": 5
+  "catalog_etag": "<cosmos-etag>"
 }
 ```
 
@@ -786,7 +808,7 @@ Registered retrieval handlers use the same shape. EasyAuth and ACA Authenticatio
 | `retrieval_request_failed` | Function `POST /query` | Retrieval returned a non-authentication 4xx response |
 | `retrieval_timeout` | Function `POST /query` | Function proxy timeout expired |
 | `rate_limit_exceeded` | `POST /query` | Per-user **per-replica** RPM exceeded |
-| `unknown_scoring_profile` | Internal retrieval `POST /query` | Requested profile is not in the pinned catalog |
+| `unknown_scoring_profile` | Internal retrieval `POST /query` | Requested profile is not in the captured catalog |
 | `invalid_request` | Internal retrieval `POST /query` | FastAPI request validation failed |
 | `retrieval_dependency_unavailable` | Internal retrieval `POST /query` | Every submitted retrieval task failed or timed out |
 | `operation_timeout` | Internal retrieval `POST /query` | ACA operation deadline expired |
