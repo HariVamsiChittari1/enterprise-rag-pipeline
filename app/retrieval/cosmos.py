@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Iterable, Mapping
@@ -71,13 +72,45 @@ _ORDER_BY_FULL_TEXT = "ORDER BY RANK FullTextScore(c.searchableText, @searchText
 # the SDK-verified RRF-fused pattern below.
 _MAX_TERMS_PER_QUERY = 8
 
+# FULLTEXTSCORE takes single keyword arguments, not phrases: a multi-word argument is
+# treated as one term and matches almost nothing, so multi-word queries must be
+# tokenized into keywords for lexical (full-text and hybrid) retrieval to work.
+_KEYWORD_PATTERN = re.compile(r"[a-z0-9]+")
+_STOPWORDS = frozenset({
+    "a", "an", "and", "are", "as", "at", "be", "by", "do", "does", "for", "from",
+    "how", "in", "is", "it", "of", "on", "or", "that", "the", "this", "to", "was",
+    "what", "which", "who", "why", "with",
+})
+
+
+def _tokenize_keywords(text: str) -> list[str]:
+    keywords: list[str] = []
+    seen: set[str] = set()
+    for token in _KEYWORD_PATTERN.findall(text.casefold()):
+        if len(token) < 2 or token in _STOPWORDS or token in seen:
+            continue
+        seen.add(token)
+        keywords.append(token)
+    return keywords
+
 
 def _normalize_search_terms(search_terms: list[str] | None, fallback_query: str) -> list[str]:
-    if search_terms is None or len(search_terms) == 0:
-        return [fallback_query]
-    if not all(isinstance(term, str) and term.strip() for term in search_terms):
+    sources = search_terms if search_terms else [fallback_query]
+    if not all(isinstance(term, str) and term.strip() for term in sources):
         raise ValueError("search_terms_invalid")
-    return search_terms[:_MAX_TERMS_PER_QUERY]
+    keywords: list[str] = []
+    seen: set[str] = set()
+    for source in sources:
+        for keyword in _tokenize_keywords(source):
+            if keyword in seen:
+                continue
+            seen.add(keyword)
+            keywords.append(keyword)
+            if len(keywords) >= _MAX_TERMS_PER_QUERY:
+                return keywords
+    # A query of only stopwords/short tokens yields no keywords; fall back to the
+    # trimmed raw query so FULLTEXTSCORE still receives one valid term.
+    return keywords or [fallback_query.strip()]
 
 
 def _build_full_text_score(term_count: int) -> str:

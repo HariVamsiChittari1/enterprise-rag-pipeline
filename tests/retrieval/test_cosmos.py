@@ -333,8 +333,62 @@ def test_synonym_term_would_appear_only_in_parameters_not_raw_sql() -> None:
     params = dict(
         (p["name"], p["value"]) for p in chunks.query_items.call_args.kwargs["parameters"]
     )
-    assert "acronym-expanded query" not in query
-    assert params["@searchText"] == "acronym-expanded query"
+    # The multi-word query tokenizes into single keyword terms bound as parameters;
+    # keyword values MUST NOT appear in the raw SQL text.
+    for keyword in ("acronym", "expanded", "query"):
+        assert keyword not in query
+        assert keyword in params.values()
+    assert "@t0" in query
+
+
+def test_multi_word_query_tokenizes_into_single_keyword_terms() -> None:
+    chunks = Mock()
+    chunks.query_items.return_value = []
+    retriever = SecureCosmosRetriever(chunks, Mock(), acl_enabled=False)
+
+    retriever.retrieve(
+        "What authentication topics are covered by the Password Policy?",
+        [], [], mode=RetrievalMode.FULL_TEXT,
+    )
+    query = chunks.query_items.call_args.kwargs["query"]
+    params = dict(
+        (p["name"], p["value"]) for p in chunks.query_items.call_args.kwargs["parameters"]
+    )
+    term_values = [v for k, v in params.items() if k.startswith("@t") and k != "@topK"]
+    # Stopwords are dropped; each remaining keyword becomes its own FULLTEXTSCORE term.
+    assert "ORDER BY RANK FullTextScore(c.searchableText, @t0" in query
+    assert {"authentication", "password", "policy"} <= set(term_values)
+    assert "what" not in term_values and "the" not in term_values and "by" not in term_values
+
+
+def test_keyword_tokenization_is_case_insensitive_and_deduped() -> None:
+    chunks = Mock()
+    chunks.query_items.return_value = []
+    retriever = SecureCosmosRetriever(chunks, Mock(), acl_enabled=False)
+
+    retriever.retrieve("Password password PASSWORD access", [], [], mode=RetrievalMode.FULL_TEXT)
+    params = dict(
+        (p["name"], p["value"]) for p in chunks.query_items.call_args.kwargs["parameters"]
+    )
+    term_values = [v for k, v in params.items() if k.startswith("@t") and k != "@topK"]
+    assert term_values == ["password", "access"]
+
+
+def test_expander_variants_are_tokenized_into_keywords() -> None:
+    chunks = Mock()
+    chunks.query_items.return_value = []
+    retriever = SecureCosmosRetriever(chunks, Mock(), acl_enabled=False)
+
+    # Whole-query synonym variants (as SynonymExpander emits) tokenize and dedupe to keywords.
+    retriever.retrieve(
+        "vacation policy", [0.1], [],
+        search_terms=["vacation policy", "annual leave policy"],
+    )
+    params = dict(
+        (p["name"], p["value"]) for p in chunks.query_items.call_args.kwargs["parameters"]
+    )
+    term_values = [v for k, v in params.items() if k.startswith("@t") and k != "@topK"]
+    assert term_values == ["vacation", "policy", "annual", "leave"]
 
 
 # --- Phase 2b: multi-term FullTextScore SQL generation ----------------------------
