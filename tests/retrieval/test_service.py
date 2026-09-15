@@ -5,7 +5,9 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import httpx
 import pytest
+from openai import APIStatusError, AzureOpenAI, BadRequestError
 
 from retrieval.auth import Principal
 from retrieval.catalog import RuntimeCatalogSnapshot, load_catalog_item
@@ -17,7 +19,7 @@ from retrieval.cosmos import (
 )
 from retrieval.cosmos_registry import CosmosRegistry
 from retrieval.pipeline import RetrievalDependencyError
-from retrieval.service import RagService
+from retrieval.service import ContentFilteredError, RagService, suppress_content_filter_retry
 
 
 def RetrievedChunk(
@@ -62,6 +64,165 @@ def completion(content: str) -> SimpleNamespace:
     return SimpleNamespace(
         choices=[SimpleNamespace(message=SimpleNamespace(content=content))]
     )
+
+
+@pytest.mark.parametrize(("status", "payload", "expected"), [
+    (400, {"error": {"code": "content_filter"}}, 1),
+    (400, {"error": {"code": "invalid_parameter"}}, 3),
+    (400, {"error": "content_filter"}, 3),
+    (400, [], 3),
+    (400, None, 3),
+    (429, {"error": {"code": "content_filter"}}, 3),
+    (500, {"error": {"code": "server_error"}}, 3),
+], ids=["filter", "ordinary", "malformed-error", "array", "invalid-json", "throttle", "server"])
+def test_given_sdk_retry_override_when_prompt_is_filtered_then_only_block_retries_are_suppressed(
+    status: int, payload: object, expected: int,
+) -> None:
+    requests = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        kwargs = {"content": b"invalid-json"} if payload is None else {"json": payload}
+        return httpx.Response(status, headers={"x-should-retry": "true", "retry-after-ms": "1"}, **kwargs)
+
+    with AzureOpenAI(
+        api_key="synthetic-test-key", azure_endpoint="https://sdk-test.invalid", api_version="2024-10-21",
+        max_retries=2, http_client=httpx.Client(
+            transport=httpx.MockTransport(respond), event_hooks={"response": [suppress_content_filter_retry]},
+        ),
+    ) as sdk:
+        with pytest.raises(APIStatusError):
+            sdk.chat.completions.create(model="synthetic", messages=[{"role": "user", "content": "Synthetic"}])
+
+    assert len(requests) == expected
+
+
+@pytest.mark.parametrize("stage", ["planning", "generation"])
+@pytest.mark.parametrize("outcome", ["prompt-filter", "ordinary-400", "filtered-empty", "filtered-partial", "normal", "length"])
+def test_given_sdk_safety_signal_when_service_runs_then_characterizes_current_behavior(
+    stage: str, outcome: str,
+) -> None:
+    requests = []
+    content = '{"queries":["synthetic planned"]}' if stage == "planning" else "Synthetic answer [S1]."
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if outcome in {"prompt-filter", "ordinary-400"}:
+            return httpx.Response(400, json={"error": {
+                "code": "content_filter" if outcome == "prompt-filter" else "invalid_parameter",
+                "message": "Synthetic rejection", "type": "invalid_request_error",
+            }})
+        reason = "content_filter" if outcome.startswith("filtered") else "length" if outcome == "length" else "stop"
+        return httpx.Response(200, json={
+            "id": "completion-synthetic", "object": "chat.completion", "created": 0,
+            "model": "synthetic-model", "choices": [{
+                "index": 0, "finish_reason": reason,
+                "message": {"role": "assistant", "content": None if outcome == "filtered-empty" else content},
+            }],
+        })
+
+    class SyntheticRetriever:
+        def retrieve(self, *_args, **_kwargs):
+            return [RetrievedChunk(
+                "1", "document", "Synthetic evidence", "policy.pdf", "https://example.com/policy.pdf", 1,
+            )]
+
+    with AzureOpenAI(
+        api_key="synthetic-test-key", azure_endpoint="https://sdk-test.invalid",
+        api_version="2024-10-21", max_retries=2,
+        http_client=httpx.Client(transport=httpx.MockTransport(respond)),
+    ) as sdk:
+        service = RagService(sdk, _registry(SyntheticRetriever()), "embedding", "chat", catalog_provider=_provider())
+        try:
+            if stage == "planning":
+                usage = []
+                if outcome in {"prompt-filter", "filtered-empty", "filtered-partial"}:
+                    with pytest.raises(ContentFilteredError, match="^content_filtered$"):
+                        service._plan_queries("Synthetic question", [], usage)
+                    assert usage == []
+                    assert len(requests) == 1
+                    return
+                queries = service._plan_queries("Synthetic question", [], usage)
+                assert queries == (
+                    ["Synthetic question"] if outcome in {"prompt-filter", "ordinary-400", "filtered-empty"}
+                    else ["synthetic planned"]
+                )
+                assert len(usage) == (0 if outcome in {"prompt-filter", "ordinary-400"} else 1)
+            else:
+                def generate():
+                    return service.answer_with_queries(
+                        "Synthetic question", ["synthetic"], Principal("user", "tenant", frozenset({"group"})),
+                        mode=RetrievalMode.FULL_TEXT,
+                    )
+
+                if outcome in {"prompt-filter", "filtered-empty", "filtered-partial"}:
+                    with pytest.raises(ContentFilteredError, match="^content_filtered$"):
+                        generate()
+                elif outcome == "ordinary-400":
+                    with pytest.raises(BadRequestError) as caught:
+                        generate()
+                    assert caught.value.code == ("content_filter" if outcome == "prompt-filter" else "invalid_parameter")
+                else:
+                    result = generate()
+                    assert result["answer"] == content
+                    assert len(result["citations"]) == 1
+        finally:
+            service.close()
+
+    assert len(requests) == 1
+    assert requests[0].url.path == "/openai/deployments/chat/chat/completions"
+
+
+@pytest.mark.parametrize("answer", [
+    "No reference.", "Unknown [S2].", "Zero [S0].", "Leading zero [S01].",
+    "Negative [S-1].", "Space [S 1].", "Placeholder [Sx].", "Placeholder [S#].",
+    "Unclosed [S1", "Valid [S1] and invalid [S2].", "Valid [S1] then [Sx].",
+    "Valid [S1] then [S+1].", "Valid [S1] then [S1", "Nested [S1 [S1].",
+])
+def test_given_invalid_citations_when_generating_then_rejects(answer: str) -> None:
+    from retrieval.service import AnswerCitationError
+
+    client = Mock()
+    client.chat.completions.create.return_value = completion(answer)
+    retriever = Mock()
+    retriever.retrieve.return_value = [
+        RetrievedChunk("1", "doc", "Evidence", "policy.pdf", "https://example.com/policy.pdf", 1),
+    ]
+    service = RagService(client, _registry(retriever), "embedding", "chat", catalog_provider=_provider())
+    try:
+        with pytest.raises(AnswerCitationError, match="^answer_citation_invalid$"):
+            service.answer_with_queries(
+                "question", ["question"], Principal("user", "tenant", frozenset({"group"})),
+                mode=RetrievalMode.FULL_TEXT,
+            )
+        assert client.chat.completions.create.call_count == 1
+    finally:
+        service.close()
+
+
+@pytest.mark.parametrize("answer", [
+    "Grounded [S1].", "Repeated [S1] and [S1].", "[Summary] Grounded [S1].",
+    "I could not find authorized evidence for this question.",
+])
+def test_given_valid_citations_or_refusal_when_generating_then_accepts(answer: str) -> None:
+    client = Mock()
+    client.chat.completions.create.return_value = completion(answer)
+    retriever = Mock()
+    retriever.retrieve.return_value = [
+        RetrievedChunk("1", "doc", "Evidence", "policy.pdf", "https://example.com/policy.pdf", 1),
+    ]
+    service = RagService(client, _registry(retriever), "embedding", "chat", catalog_provider=_provider())
+    try:
+        result = service.answer_with_queries(
+            "question", ["question"], Principal("user", "tenant", frozenset({"group"})),
+            mode=RetrievalMode.FULL_TEXT,
+        )
+        assert result["answer"] == answer
+        assert len(result["citations"]) == (1 if "[S1]" in answer else 0)
+        assert result["policy"]["catalog_etag"] == "etag-a"
+        assert result["usage"][-1]["operation"] == "answer_generation"
+    finally:
+        service.close()
 
 
 def test_given_raw_integral_float_catalog_when_searching_then_integer_budget_is_used() -> None:
@@ -209,19 +370,23 @@ def test_service_does_not_call_answer_model_without_evidence() -> None:
     assert client.chat.completions.create.call_count == 1
 
 
-def test_service_raises_dependency_error_when_every_retrieval_task_fails() -> None:
+def test_service_raises_dependency_error_when_every_retrieval_task_fails(capsys) -> None:
     client = Mock()
     client.chat.completions.create.return_value = completion('{"queries":["question"]}')
     client.embeddings.create.return_value = SimpleNamespace(
         data=[SimpleNamespace(embedding=[0.0] * 3072)]
     )
     retriever = Mock()
-    retriever.retrieve.side_effect = RuntimeError("cosmos unavailable")
+    retriever.retrieve.side_effect = RuntimeError("SYNTHETIC_PRIVATE_RETRIEVAL_FAILURE")
 
     with pytest.raises(RetrievalDependencyError, match="retrieval_dependency_unavailable"):
         RagService(client, _registry(retriever), "embedding", "chat", catalog_provider=_provider()).answer(
             "question", Principal("user", "tenant", frozenset({"group"})),
         )
+
+    captured_logs = capsys.readouterr()
+    assert "retrieval_task_failed" in captured_logs.out + captured_logs.err
+    assert "SYNTHETIC_PRIVATE_RETRIEVAL_FAILURE" not in captured_logs.out + captured_logs.err
 
 
 def test_full_text_mode_does_not_create_embedding() -> None:
@@ -338,6 +503,20 @@ def test_plan_queries_returns_single_for_simple_question() -> None:
 
     assert queries == ["What is RAG?"]
     assert usage[0]["operation"] == "query_planning"
+
+
+def test_given_private_planner_error_when_planning_then_fallback_log_omits_content(capsys) -> None:
+    client = Mock()
+    client.chat.completions.create.side_effect = RuntimeError("SYNTHETIC_PRIVATE_PLANNER_FAILURE")
+    service = RagService(client, _registry(Mock()), "embedding", "chat", catalog_provider=_provider())
+
+    queries, usage = service.plan_queries("Synthetic original question")
+
+    assert queries == ["Synthetic original question"]
+    assert usage == []
+    captured_logs = capsys.readouterr()
+    assert "falling back to original question" in captured_logs.out + captured_logs.err
+    assert "SYNTHETIC_PRIVATE_PLANNER_FAILURE" not in captured_logs.out + captured_logs.err
 
 
 def test_plan_queries_decomposes_complex_question() -> None:
@@ -492,7 +671,7 @@ def test_service_bounds_candidate_pool_across_sub_queries() -> None:
     client = Mock()
     client.chat.completions.create.side_effect = [
         completion('{"queries":["a","b","c"]}'),
-        completion("Answer."),
+        completion("Answer [S1]."),
     ]
     client.embeddings.create.return_value = SimpleNamespace(
         data=[SimpleNamespace(embedding=[0.0] * 3072)]

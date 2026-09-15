@@ -414,6 +414,21 @@ def query_endpoint(req: func.HttpRequest) -> func.HttpResponse:
             )
             return error_response("retrieval_auth_failed", "Retrieval is unavailable.", 502)
         if resp.status_code >= 500:
+            if resp.status_code == 502 and len(resp.content) <= 1_048_576:
+                try:
+                    payload = resp.json()
+                except ValueError:
+                    payload = None
+                if (
+                    isinstance(payload, dict)
+                    and isinstance(payload.get("error"), dict)
+                    and payload["error"].get("code") == "answer_citation_invalid"
+                ):
+                    return error_response(
+                        "answer_citation_invalid",
+                        "The generated answer could not be validated.",
+                        502,
+                    )
             return error_response("retrieval_unavailable", "Retrieval is unavailable.", 502)
         if len(resp.content) > 1_048_576:
             return error_response("invalid_retrieval_response", "Retrieval returned an invalid response.", 502)
@@ -422,6 +437,17 @@ def query_endpoint(req: func.HttpRequest) -> func.HttpResponse:
         except ValueError:
             return error_response("invalid_retrieval_response", "Retrieval returned an invalid response.", 502)
         if resp.status_code >= 400:
+            if (
+                resp.status_code == 422
+                and isinstance(payload, dict)
+                and isinstance(payload.get("error"), dict)
+                and payload["error"].get("code") == "content_filtered"
+            ):
+                return error_response(
+                    "content_filtered",
+                    "The request could not be completed under the content safety policy.",
+                    422,
+                )
             return error_response("retrieval_request_failed", "The retrieval request failed.", resp.status_code)
         if (
             not isinstance(payload, dict)

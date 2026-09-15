@@ -23,6 +23,10 @@ DEFAULT_AGENTIC_QUESTION = (
     "Compare the password requirements from the identity policy with the access "
     "control requirements from the information security policy."
 )
+# Mirrors retrieval.service.NO_EVIDENCE_ANSWER. A grounded refusal (zero citations with
+# this exact answer) is a valid RAG outcome, so the matrix accepts it instead of
+# asserting recall: https://learn.microsoft.com/en-us/azure/ai-foundry/concepts/evaluation-evaluators/rag-evaluators
+NO_EVIDENCE_ANSWER = "I could not find authorized evidence for this question."
 
 
 class ScriptError(RuntimeError):
@@ -164,6 +168,7 @@ def _validate_matrix_audit(
     expected_profile: str | None,
     expected_catalog_sha: str | None,
     expected_catalog_etag: str | None = None,
+    grounded_refusal: bool = False,
 ) -> list[str]:
     failures = []
     if audit.get("path") != expected_path:
@@ -181,7 +186,14 @@ def _validate_matrix_audit(
             f"{audit.get('retrieval_degraded')!r}"
         )
     citations_count = audit.get("citations_count")
-    if not isinstance(citations_count, int) or isinstance(citations_count, bool) or citations_count < 1:
+    citations_missing = (
+        not isinstance(citations_count, int)
+        or isinstance(citations_count, bool)
+        or citations_count < 1
+    )
+    # A grounded refusal legitimately returns zero citations; accept it rather than
+    # asserting retrieval recall, which belongs in a separate retrieval-quality eval.
+    if citations_missing and not grounded_refusal:
         failures.append(
             f"expected citations_count>=1, observed {citations_count!r}"
         )
@@ -242,6 +254,11 @@ def _run_matrix(
                 request_id = response.get("request_id")
                 if not isinstance(request_id, str) or not request_id:
                     raise ScriptError("Query response has no request_id.")
+                # Detected from the live response only; never persisted to the report.
+                answer = response.get("answer")
+                grounded_refusal = (
+                    isinstance(answer, str) and answer.strip() == NO_EVIDENCE_ANSWER
+                )
                 audit = _wait_for_query_audit(
                     base_url,
                     token=token,
@@ -256,6 +273,7 @@ def _run_matrix(
                     expected_profile=expected_scoring_profile,
                     expected_catalog_sha=expected_catalog_sha,
                     expected_catalog_etag=expected_catalog_etag,
+                    grounded_refusal=grounded_refusal,
                 )
                 scenario.update({
                     "requestId": request_id,
@@ -264,6 +282,7 @@ def _run_matrix(
                     "effectiveRetrievalModes": audit.get("effective_retrieval_modes"),
                     "retrievalDegraded": audit.get("retrieval_degraded"),
                     "citationsCount": audit.get("citations_count"),
+                    "groundedRefusal": grounded_refusal,
                     "catalogVersion": audit.get("catalog_version"),
                     "catalogEtag": audit.get("catalog_etag"),
                     "scoringProfile": audit.get("scoring_profile"),
@@ -402,7 +421,9 @@ def main() -> int:
         _write_matrix_report(args.report, args.function_app, results)
         print(json.dumps(results, indent=2, ensure_ascii=False))
         failed = sum(result["status"] != "passed" for result in results)
-        print(f"\nScenario matrix: {len(results) - failed} passed, {failed} failed")
+        refusals = sum(1 for result in results if result.get("groundedRefusal"))
+        note = f" ({refusals} grounded refusal)" if refusals else ""
+        print(f"\nScenario matrix: {len(results) - failed} passed, {failed} failed{note}")
         print(f"Report: {args.report}")
         return 1 if failed else 0
 

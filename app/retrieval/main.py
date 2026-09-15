@@ -6,10 +6,11 @@ import asyncio
 import collections
 import hashlib
 import os
+import re
 import time
 import threading
 import uuid
-from contextlib import ExitStack, asynccontextmanager
+from contextlib import AsyncExitStack, ExitStack, asynccontextmanager
 from dataclasses import asdict
 from typing import Any, Mapping
 
@@ -20,7 +21,7 @@ from azure.identity import ManagedIdentityCredential
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from openai import AzureOpenAI
+from openai import AzureOpenAI, DefaultAsyncHttpxClient, DefaultHttpxClient
 from pydantic import BaseModel, Field
 
 from retrieval.auth import (
@@ -42,7 +43,10 @@ from retrieval.pipeline import (
     citation_location,
     citation_url,
 )
-from retrieval.service import RagService, UnknownScoringProfileError
+from retrieval.service import (
+    AnswerCitationError, ContentFilteredError, RagService, UnknownScoringProfileError,
+    accept_answer, suppress_content_filter_retry, suppress_content_filter_retry_async,
+)
 from retrieval.runtime_catalog import RuntimeCatalogProvider
 from retrieval.telemetry import CATALOG_LOGGER_NAME, catalog_event_emitter, write_audit_records
 
@@ -85,32 +89,31 @@ _state = _AppState()
 
 
 def _configure_tracing(config: RetrievalConfig, *, credential: ManagedIdentityCredential | None = None) -> None:
-    """Best-effort GenAI OpenTelemetry tracing (gen_ai.usage.* spans in App Insights).
+    """Disable GenAI capture and configure optional Azure Monitor telemetry."""
+    if _AGENT_AVAILABLE:
+        from agent_framework.observability import disable_instrumentation
 
-    No-ops if APPLICATIONINSIGHTS_CONNECTION_STRING isn't configured, so existing
-    deployments without it wired keep working unchanged.
-    """
+        disable_instrumentation()
     if not config.app_insights_connection_string:
         logger.info("tracing_not_configured", reason="APPLICATIONINSIGHTS_CONNECTION_STRING unset")
         return
     try:
         from azure.monitor.opentelemetry import configure_azure_monitor
-        from opentelemetry.instrumentation.openai_v2 import OpenAIInstrumentor
 
         configure_azure_monitor(
             connection_string=config.app_insights_connection_string,
             logger_name=CATALOG_LOGGER_NAME,
             credential=credential,
         )
-        OpenAIInstrumentor().instrument()
         logger.info("tracing_configured")
     except Exception:
-        logger.warning("tracing_configuration_failed", exc_info=True)
+        logger.warning("tracing_configuration_failed")
 
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
     resources = ExitStack()
+    async_resources = AsyncExitStack()
     provider: RuntimeCatalogProvider | None = None
     try:
         config = load_retrieval_config()
@@ -140,11 +143,14 @@ async def _lifespan(app: FastAPI):
         def _openai_token_provider() -> str:
             return credential.get_token("https://cognitiveservices.azure.com/.default").token
 
+        openai_http_client = DefaultHttpxClient(event_hooks={"response": [suppress_content_filter_retry]})
+        resources.callback(openai_http_client.close)
         _state.openai_client = AzureOpenAI(
             azure_endpoint=config.openai_endpoint,
             azure_ad_token_provider=_openai_token_provider,
             api_version=config.openai_api_version,
             max_retries=2,
+            http_client=openai_http_client,
         )
         resources.callback(_close_resource, _state.openai_client)
 
@@ -161,8 +167,15 @@ async def _lifespan(app: FastAPI):
                     api_version=config.agent_api_version,
                     api_key=_agent_token_provider,
                 )
+                original_client = _state.agent_chat_client.client
+                async_resources.push_async_callback(original_client.close)
+                agent_http_client = DefaultAsyncHttpxClient(
+                    event_hooks={"response": [suppress_content_filter_retry_async]},
+                )
+                async_resources.push_async_callback(agent_http_client.aclose)
+                _state.agent_chat_client.client = original_client.with_options(http_client=agent_http_client)
             except Exception:
-                logger.warning("agent_chat_client_init_failed", exc_info=True)
+                logger.warning("agent_chat_client_init_failed")
                 _state.agent_chat_client = None
         else:
             _state.agent_chat_client = None
@@ -211,9 +224,14 @@ async def _lifespan(app: FastAPI):
         )
         yield
     finally:
-        if provider is not None:
-            await provider.close()
-        resources.close()
+        try:
+            if provider is not None:
+                await provider.close()
+        finally:
+            try:
+                await async_resources.aclose()
+            finally:
+                resources.close()
         logger.info("retrieval_service_stopped")
 
 
@@ -295,6 +313,30 @@ async def _retrieval_dependency_handler(
         status_code=503,
         code="retrieval_dependency_unavailable",
         message="Retrieval is temporarily unavailable.",
+    )
+
+
+@app.exception_handler(AnswerCitationError)
+async def _answer_citation_handler(
+    request: Request, error: AnswerCitationError,
+) -> JSONResponse:
+    return _error_response(
+        request,
+        status_code=502,
+        code="answer_citation_invalid",
+        message="The generated answer could not be validated.",
+    )
+
+
+@app.exception_handler(ContentFilteredError)
+async def _content_filtered_handler(
+    request: Request, error: ContentFilteredError,
+) -> JSONResponse:
+    return _error_response(
+        request,
+        status_code=422,
+        code="content_filtered",
+        message="The request could not be completed under the content safety policy.",
     )
 
 
@@ -464,7 +506,7 @@ async def query(request: Request, body: QueryRequest, background_tasks: Backgrou
         _write_query_summary,
         _state.audit_container,
         request_id, principal.user_id, principal.tenant_id,
-        body.question, answer_text, len(result["citations"]),
+        len(result["citations"]),
         path, body.mode, len(queries), int(elapsed * 1000),
         policy.snapshot.digest,
         policy.profile.name if policy.profile is not None else None,
@@ -475,8 +517,11 @@ async def query(request: Request, body: QueryRequest, background_tasks: Backgrou
         policy.snapshot.operation_id,
     )
 
+    if not _state.config.include_citations:
+        answer_text = re.sub(r"[ \t]*\[S[1-9][0-9]*\]", "", answer_text).strip()
+
     return QueryResponse(
-        answer=result["answer"],
+        answer=answer_text,
         citations=[
             _citation_from_result(i, c)
             for i, c in enumerate(result["citations"], start=1)
@@ -487,7 +532,7 @@ async def query(request: Request, body: QueryRequest, background_tasks: Backgrou
 
 def _write_query_summary(
     container: Any, request_id: str, user_id: str, tenant_id: str,
-    question: str, answer: str, citations_count: int,
+    citations_count: int,
     path: str, mode: str, planned_queries: int, e2e_latency_ms: int,
     catalog_version: str | None, scoring_profile: str | None,
     synonym_map: str | None, retrieval_degraded: bool,
@@ -496,10 +541,6 @@ def _write_query_summary(
     from retrieval.telemetry import write_audit_records
     write_audit_records(container, request_id, user_id, tenant_id, mode, [{
         "operation": "query_request",
-        "question": question[:2000],
-        "question_truncated": len(question) > 2000,
-        "answer_preview": answer[:500],
-        "answer_truncated": len(answer) > 500,
         "citations_count": citations_count,
         "path": path,
         "planned_queries": planned_queries,
@@ -559,6 +600,8 @@ async def _run_agentic_path(
             log.warning("agent_empty_response")
             return None
 
+        answer_text, retrieved_chunks = accept_answer(answer_text, retrieved_chunks)
+
         # Opportunistically capture agent LLM token usage
         agent_usage = getattr(response, "usage", None)
         if agent_usage:
@@ -579,10 +622,10 @@ async def _run_agentic_path(
     except asyncio.TimeoutError:
         log.warning("agent_timeout", timeout=_state.config.agent_timeout_seconds)
         return None
-    except RetrievalDependencyError:
+    except (RetrievalDependencyError, AnswerCitationError, ContentFilteredError):
         raise
     except Exception:
-        log.warning("agent_error", exc_info=True)
+        log.warning("agent_error")
         return None
 
 

@@ -305,7 +305,7 @@ values come exclusively from the validated runtime catalog snapshot.
 | `DEPLOYMENT_INSTANCE_ID` | Yes | Client target | Catalog partition key. |
 | `RETRIEVAL_CATALOG_POLL_SECONDS` | No | `7200` | Bounded runtime refresh interval; see direct-edit timing above. |
 | `RETRIEVAL_CONFIG_CONTAINER` | No | `retrieval-config` | Catalog container. |
-| `APPLICATIONINSIGHTS_CONNECTION_STRING` | No | Generated; empty disables tracing setup | Sensitive telemetry connection string. Do not print. |
+| `APPLICATIONINSIGHTS_CONNECTION_STRING` | No | Generated; empty skips Azure Monitor setup | Sensitive telemetry connection string. Do not print. GenAI suppression is independent of this value; see [observability](ARCHITECTURE.md#observability). |
 
 ### Retrieval behavior and limits
 

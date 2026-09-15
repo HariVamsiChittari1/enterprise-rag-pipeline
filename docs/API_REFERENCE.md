@@ -1,4 +1,7 @@
-# API Reference
+---
+title: API Reference
+description: HTTP routes, response contracts, and errors for the Enterprise RAG Pipeline
+---
 
 Complete HTTP API for the Enterprise RAG Pipeline. All routes exposed by the Function App and the retrieval service, with headers, request bodies, responses, and error codes.
 
@@ -244,7 +247,11 @@ Authorization: Bearer <token>
 
 For `ingestion-runs`, `search-chunks`, and `service-audit`, omit `runId`; their partition keys are not `/sourceRunId`, and supplying it can return an empty result that does not prove absence. Without `runId`, `service-audit` is queried cross-partition and ordered by `recordedAt DESC`, so the result is the most recent rows. `search-chunks` has no equivalent ordering.
 
-Inspect removes Cosmos `_` system properties only. Source documents, chunk content, audit user/tenant IDs, questions, and answer previews can remain in the response. Restrict endpoint access and handle diagnostic output according to its data classification.
+Inspect removes Cosmos `_` system properties only. Source documents, chunk content, audit user/tenant IDs, and historical questions and answer previews can remain in the response. Restrict endpoint access and handle diagnostic output according to its data classification.
+
+Query summaries written by the current implementation omit question text, answer previews,
+and their truncation flags. Identity and operational metadata remain; existing records
+are not modified. This change does not establish content-free logs or traces.
 
 #### Response — 200 OK
 
@@ -375,7 +382,7 @@ The deployed example catalog defines:
 **Path selection is automatic** based on LLM query planner output:
 
 - 1 planned query → **Standard RAG path**
-- 2–3 planned queries → **Agentic RAG path**, with automatic fallback to standard on timeout or agent failure
+- 2–3 planned queries → **Agentic RAG path**, with automatic fallback to standard on timeout or ordinary agent failure, but not citation-validation failure or a recognized safety block
 
 #### Response — 200 OK
 
@@ -402,12 +409,33 @@ The deployed example catalog defines:
 
 | Field | Type | Description |
 |---|---|---|
-| `answer` | string | Grounded answer with `[S#]` citation markers |
-| `citations` | `array<object>` | One per unique source chunk. Empty when `INCLUDE_CITATIONS=false`. |
-| `citations[].ref` | string | Matches `[S#]` markers in `answer` |
+| `answer` | string | Accepted answer or canonical refusal. Validated `[S#]` markers are removed when `INCLUDE_CITATIONS=false`. |
+| `citations` | `array<object>` | Ordered evidence metadata, including sources not referenced in the answer. Empty for refusal or when `INCLUDE_CITATIONS=false`. |
+| `citations[].ref` | string | Stable source label available to `[S#]` references in `answer` |
 | `citations[].source_name` | string | Original file name |
 | `citations[].url` | string | SharePoint URL with `#page=N` fragment |
 | `request_id` | string | UUID for log correlation |
+
+Both generation paths validate references before applying `INCLUDE_CITATIONS`.
+With evidence, a non-refusal answer must contain at least one canonical reference
+such as `[S1]`; every citation candidate must resolve to that request's evidence.
+Candidates begin with `[S` followed by an ASCII digit, whitespace, `+`, `-`, or `#`,
+or are the exact placeholder `[Sx]`. Malformed, unclosed, and unknown candidates
+fail validation. Ordinary bracketed text such as `[Summary]` is unaffected, and
+repeated valid references are allowed. Source metadata is not filtered or relabeled.
+
+No evidence returns `I could not find authorized evidence for this question.`
+with no citations. The exact same refusal is also accepted when evidence exists.
+Invalid references return the fixed error below without answer repair or fallback
+generation. These checks establish reference syntax and membership, not factual
+support or a citation for every claim.
+
+Recognized provider safety blocks terminate query planning or generation before
+returned text is accepted, including empty or partial filtered completions and
+intermediate agent responses. A recognized tool-originated block also terminates
+the agent run. Blocks are not retried, repaired, or routed to fallback generation;
+ordinary errors retain existing retry and fallback behavior. This handling does
+not establish the model deployment's effective filter policy.
 
 #### Error responses
 
@@ -415,8 +443,10 @@ The deployed example catalog defines:
 |---|---|---|
 | 400 | `{"error":{"code":"question_required","message":"A question is required."},"request_id":"..."}` | Missing or empty `question` |
 | 400/422/429 | `retrieval_request_failed` Function envelope | Retrieval rejected the body, profile, or rate limit |
+| 422 | `content_filtered` retrieval and Function envelope | Recognized safety block; message: `The request could not be completed under the content safety policy.` No answer or provider detail is returned. |
 | 401 | `unauthorized` Function envelope | Delegated user claims are missing or invalid |
 | 502 | `retrieval_auth_failed` Function envelope | ACA or retrieval rejected Function service authentication |
+| 502 | `answer_citation_invalid` retrieval and Function envelope | Generated references failed validation; message: `The generated answer could not be validated.` |
 | 502 | `retrieval_unavailable` Function envelope | Retrieval returned a server error |
 | 502 | `invalid_retrieval_response` Function envelope | Retrieval returned malformed, oversized, or contract-incompatible JSON |
 | 503 | `gateway_not_configured` or `service_unavailable` Function envelope | Gateway settings are invalid or the proxy failed |
@@ -803,6 +833,7 @@ Registered retrieval handlers use the same shape. EasyAuth and ACA Authenticatio
 | `unauthorized` | Function `POST /query` | Delegated user claims failed gateway validation |
 | `gateway_not_configured` | Function `POST /query` | Retrieval URL or service scope is missing/invalid |
 | `retrieval_auth_failed` | Function `POST /query` | ACA/retrieval rejected the Function service identity |
+| `answer_citation_invalid` | Function and internal retrieval `POST /query` | See [query response validation](#response-schema) |
 | `retrieval_unavailable` | Function `POST /query` | Retrieval returned a server error |
 | `invalid_retrieval_response` | Function `POST /query` | Retrieval returned malformed, oversized, or incompatible JSON |
 | `retrieval_request_failed` | Function `POST /query` | Retrieval returned a non-authentication 4xx response |

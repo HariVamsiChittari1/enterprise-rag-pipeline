@@ -80,7 +80,8 @@ Required coverage:
 - Standard and agentic paths.
 - Hybrid, vector, and full-text modes.
 - Correct effective mode in audit.
-- At least one citation for corpus-supported questions.
+- At least one citation, or a grounded refusal (zero citations with the canonical
+  no-evidence answer) when a mode cannot ground the question.
 - `retrieval_degraded=false`.
 - Exact captured catalog digest and ETag in request audit evidence.
 

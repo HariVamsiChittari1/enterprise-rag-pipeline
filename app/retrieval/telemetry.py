@@ -58,5 +58,4 @@ def write_audit_records(
                 "audit_write_failed",
                 request_id=request_id,
                 operation=record.get("operation"),
-                exc_info=True,
             )

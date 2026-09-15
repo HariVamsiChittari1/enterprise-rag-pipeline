@@ -207,6 +207,81 @@ def test_query_gateway_rejects_malformed_or_oversized_response(
     assert _body(result)["error"]["code"] == "invalid_retrieval_response"
 
 
+@pytest.mark.parametrize(
+    ("status", "payload", "content", "expected_code"),
+    [
+        (502, {"error": {"code": "answer_citation_invalid", "message": "upstream-private"},
+               "request_id": "upstream-id", "answer": "upstream-private"}, None, "answer_citation_invalid"),
+        (502, {"error": {"code": "other", "message": "upstream-private"}}, None, "retrieval_unavailable"),
+        (502, {"error": "answer_citation_invalid"}, None, "retrieval_unavailable"),
+        (502, {"error": None}, None, "retrieval_unavailable"),
+        (502, ["answer_citation_invalid"], None, "retrieval_unavailable"),
+        (502, ValueError("upstream-private"), b"not json", "retrieval_unavailable"),
+        (502, {"error": {"code": "answer_citation_invalid"}}, b"x" * 1_048_577, "retrieval_unavailable"),
+        (503, {"error": {"code": "answer_citation_invalid"}}, None, "retrieval_unavailable"),
+        (400, {"error": {"code": "answer_citation_invalid"}}, None, "retrieval_request_failed"),
+        (401, {"error": {"code": "answer_citation_invalid"}}, None, "retrieval_auth_failed"),
+        (403, {"error": {"code": "answer_citation_invalid"}}, None, "retrieval_auth_failed"),
+    ],
+    ids=["citation", "unknown", "string-error", "null-error", "array", "invalid-json",
+         "oversized", "wrong-server-status", "client-status", "unauthorized", "forbidden"],
+)
+def test_given_upstream_citation_error_when_proxying_then_only_allowlists_exact_contract(
+    status: int, payload: Any, content: bytes | None, expected_code: str,
+) -> None:
+    FakeClient.response = FakeResponse(status, payload, content=content)
+
+    response = function_app.query_endpoint(FakeRequest(_principal()))
+
+    body = _body(response)
+    assert response.status_code == (400 if status == 400 else 502)
+    assert body["error"]["code"] == expected_code
+    if expected_code == "answer_citation_invalid":
+        assert body["error"]["message"] == "The generated answer could not be validated."
+    assert body["request_id"] == FakeClient.calls[0]["headers"][GATEWAY_REQUEST_ID_HEADER]
+    assert body["request_id"] != "upstream-id"
+    assert "answer" not in body
+    assert "upstream-private" not in response.get_body().decode()
+
+
+@pytest.mark.parametrize(
+    ("status", "payload", "content", "expected_status", "expected_code"),
+    [
+        (422, {"error": {"code": "content_filtered", "message": "upstream-private"},
+               "request_id": "upstream-id", "answer": "upstream-private"}, None, 422, "content_filtered"),
+        (422, {"error": {"code": "other"}}, None, 422, "retrieval_request_failed"),
+        (422, {"error": "content_filtered"}, None, 422, "retrieval_request_failed"),
+        (422, {"error": None}, None, 422, "retrieval_request_failed"),
+        (422, ["content_filtered"], None, 422, "retrieval_request_failed"),
+        (422, ValueError("upstream-private"), b"not json", 502, "invalid_retrieval_response"),
+        (422, {"error": {"code": "content_filtered"}}, b"x" * 1_048_577, 502, "invalid_retrieval_response"),
+        (502, {"error": {"code": "content_filtered"}}, None, 502, "retrieval_unavailable"),
+        (400, {"error": {"code": "content_filtered"}}, None, 400, "retrieval_request_failed"),
+        (401, {"error": {"code": "content_filtered"}}, None, 502, "retrieval_auth_failed"),
+        (403, {"error": {"code": "content_filtered"}}, None, 502, "retrieval_auth_failed"),
+        (422, {"error": {"code": "answer_citation_invalid"}}, None, 422, "retrieval_request_failed"),
+    ],
+    ids=["filter", "unknown", "string-error", "null-error", "array", "invalid-json",
+         "oversized", "wrong-server-status", "client-status", "unauthorized", "forbidden", "citation-wrong-status"],
+)
+def test_given_upstream_filter_error_when_proxying_then_only_allowlists_exact_contract(
+    status: int, payload: Any, content: bytes | None, expected_status: int, expected_code: str,
+) -> None:
+    FakeClient.response = FakeResponse(status, payload, content=content)
+
+    response = function_app.query_endpoint(FakeRequest(_principal()))
+
+    body = _body(response)
+    assert response.status_code == expected_status
+    assert body["error"]["code"] == expected_code
+    if expected_code == "content_filtered":
+        assert body["error"]["message"] == "The request could not be completed under the content safety policy."
+    assert body["request_id"] == FakeClient.calls[0]["headers"][GATEWAY_REQUEST_ID_HEADER]
+    assert body["request_id"] != "upstream-id"
+    assert "answer" not in body
+    assert "upstream-private" not in response.get_body().decode()
+
+
 def test_retrieval_service_credential_is_reused(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

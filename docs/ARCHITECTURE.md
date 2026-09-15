@@ -707,11 +707,11 @@ Full sync re-discovers the drive. Before creating a new document record, discove
 flowchart LR
     Ingestion[Ingestion Service] -->|write_audit_record| Audit[(service-audit<br/>Cosmos container)]
     Retrieval[Retrieval Service] -->|write_audit_records| Audit
-    Retrieval -->|optional OpenAI instrumentation| AppInsights[Application Insights]
+    Retrieval -->|optional Azure Monitor telemetry| AppInsights[Application Insights]
 ```
 
 - **Service audit** (Cosmos `service-audit`): Best-effort records for explicitly instrumented LLM calls, retrieval batches, extractions, enrichments, query summaries, and lifecycle events; items have a 90-day TTL
-- **GenAI OpenTelemetry tracing** (optional): When `APPLICATIONINSIGHTS_CONNECTION_STRING` is set, startup attempts to configure Azure Monitor and `opentelemetry-instrumentation-openai-v2`; configuration failures are logged and do not stop the service
+- **Azure Monitor telemetry** (optional): When `APPLICATIONINSIGHTS_CONNECTION_STRING` is set, startup attempts to configure Azure Monitor with the catalog logger; Monitor configuration failures are logged without exception details and do not stop the service. Startup disables Agent Framework instrumentation independently of this setting and does not enable `openai_v2`, because message-content controls alone do not suppress exception content. This removes GenAI spans and instrumentation-produced metrics; application-recorded usage and audit metadata remain. External instrumentation and historical telemetry require separate verification.
 - **Logging**: Ingestion uses Python `logging`; retrieval uses `structlog` and binds `request_id` to query logs
 
 ## Network Security
@@ -828,7 +828,7 @@ AKS manifests remain under `app/retrieval/kubernetes/`, but `infra/main.bicep` h
 | # | Use Case | Description |
 | --- | --- | --- |
 | UC-34 | Service audit trail | Best-effort Cosmos records for explicitly instrumented service calls and lifecycle events, retained for 90 days by default |
-| UC-35 | GenAI OpenTelemetry tracing | Optionally configure Azure Monitor and OpenAI instrumentation when the connection string is present; setup failure is nonfatal and logged |
+| UC-35 | Azure Monitor telemetry | Retain optional Monitor setup with GenAI instrumentation disabled; see [Observability](#observability) |
 | UC-36 | Health probes | Liveness (`/health/live`) and readiness (`/health/ready` with Cosmos connectivity check) endpoints |
 | UC-37 | Inspect endpoint | Read up to 200 rows from `ingestion-runs`, `source-documents`, `search-chunks`, or `service-audit` with Cosmos `_` system properties removed; optional `runId` filtering is valid only for the `source-documents` `/sourceRunId` partition |
 

@@ -15,19 +15,24 @@ sys.modules[SPEC.name] = query_script
 SPEC.loader.exec_module(query_script)
 
 
-def test_matrix_audit_accepts_matching_non_degraded_request() -> None:
+@pytest.mark.parametrize("path", ["standard", "agentic"])
+def test_matrix_audit_accepts_matching_non_degraded_request(path: str) -> None:
     failures = query_script._validate_matrix_audit(
         {
-            "path": "agentic",
+            "path": path,
             "mode": "vector",
             "effective_retrieval_modes": ["vector"],
             "retrieval_degraded": False,
             "citations_count": 1,
+            "catalog_version": "sha256:" + "a" * 64,
+            "catalog_etag": "etag-a",
+            "scoring_profile": "test-profile",
         },
-        expected_path="agentic",
+        expected_path=path,
         expected_mode="vector",
-        expected_profile=None,
-        expected_catalog_sha=None,
+        expected_profile="test-profile",
+        expected_catalog_sha="sha256:" + "a" * 64,
+        expected_catalog_etag="etag-a",
     )
 
     assert failures == []
@@ -115,6 +120,25 @@ def test_matrix_audit_rejects_missing_citations() -> None:
     )
 
     assert failures == ["expected citations_count>=1, observed 0"]
+
+
+def test_matrix_audit_accepts_grounded_refusal_with_zero_citations() -> None:
+    failures = query_script._validate_matrix_audit(
+        {
+            "path": "agentic",
+            "mode": "vector",
+            "effective_retrieval_modes": ["vector"],
+            "retrieval_degraded": False,
+            "citations_count": 0,
+        },
+        expected_path="agentic",
+        expected_mode="vector",
+        expected_profile=None,
+        expected_catalog_sha=None,
+        grounded_refusal=True,
+    )
+
+    assert failures == []
 
 
 def test_matrix_runs_all_six_path_mode_combinations(monkeypatch) -> None:
