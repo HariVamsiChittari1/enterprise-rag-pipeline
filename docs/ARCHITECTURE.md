@@ -134,6 +134,20 @@ sequenceDiagram
     Orch->>Cosmos: Finalize run: recount from source-documents, set terminal status
 ```
 
+### Extraction by File Type
+
+One provider is selected per run: **Content Understanding takes precedence when enabled; otherwise Document Intelligence** (the default). Markdown is always extracted directly, independent of the provider. See [CONFIGURATION.md](CONFIGURATION.md#content-understanding) for the selecting flags and [TROUBLESHOOTING.md](TROUBLESHOOTING.md#extraction-rejection-or-incomplete-visuals) for size and tier limits.
+
+| File type | Direct (provider-independent) | Content Understanding (`prebuilt-documentSearch`) | Document Intelligence (`prebuilt-layout`, default) |
+| --- | --- | --- | --- |
+| **Markdown** (`.md`) | UTF-8 text preserved; authorized linked PNGs downloaded (ACL-verified) and described by Azure OpenAI vision | not used | not used |
+| **PDF** (`.pdf`) | not applicable | Original bytes analyzed once, yielding Markdown plus described figures in a single pass | `prebuilt-layout` yields Markdown plus figure crops; required figures described by Azure OpenAI vision |
+| **Office** (`.docx`, `.pptx`, `.xlsx`) | not applicable | OOXML visuals inventoried; a rendered PDF derivative (via Microsoft Graph) analyzed once; results bound back to source Office locators | Native Office semantics extracted directly (no embedded images); when required visuals exist, a rendered PDF derivative supplies figure crops only, described by vision and merged onto source locators |
+
+- **Provider precedence and flags** are owned by [CONFIGURATION.md](CONFIGURATION.md#content-understanding); they are not restated here.
+- **Native Office analysis (Document Intelligence) does not extract embedded images** — this is why the Office/Document Intelligence path renders a PDF derivative solely for visual augmentation (limitation L1).
+- **Coverage is enforced**: a document whose required visuals are not fully described is rejected before chunking.
+
 ## Delta Sync Flow
 
 Incremental sync via Microsoft Graph delta query. Triggered primarily by SharePoint webhooks (near-real-time); a daily reconciliation timer (default 04:00 UTC) runs the same delta query as a safety net. Each run processes only changed files since the last saved cursor.
