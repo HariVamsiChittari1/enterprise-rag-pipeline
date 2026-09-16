@@ -46,6 +46,36 @@ The current permission-scanning implementation requests Microsoft Graph permissi
 
 `SHAREPOINT_SITE_URL` and `SHAREPOINT_ASSIGNED_DRIVE_ID` are both required. At runtime, the Function resolves the site and verifies that its Graph `/drives` relationship contains the configured document-library drive before SharePoint REST group expansion is enabled.
 
+#### Reference procedure: application, certificate, and drive ID
+
+An authorized operator performs these steps once. Keep the certificate's private key on the approved administrative path; never commit or print a secret value. The self-signed example is for non-production; use a managed or CA-issued certificate in production.
+
+```powershell
+# 1. Create the ingestion application (single tenant)
+az ad app create --display-name "rag-sharepoint-ingestion" --sign-in-audience AzureADMyOrg
+$appId = az ad app list --display-name "rag-sharepoint-ingestion" --query "[0].appId" -o tsv
+
+# 2. Create a certificate and private key
+openssl req -x509 -newkey rsa:2048 -keyout sp-key.pem -out sp-cert.pem -days 730 -nodes -subj "/CN=rag-sharepoint-ingestion"
+
+# 3. Upload the PUBLIC certificate as the app credential (the app authenticates with the private key)
+az ad app credential reset --id $appId --cert "@sp-cert.pem" --append
+
+# 4. Package a PASSWORD-LESS PFX for Key Vault (the connector calls CertificateCredential without a password)
+openssl pkcs12 -export -out sp.pfx -inkey sp-key.pem -in sp-cert.pem -passout pass:
+```
+
+Grant and admin-consent the Graph and SharePoint application permissions listed above (`az ad app permission add` then `az ad app permission admin-consent`, or the portal), then complete the `Sites.Selected` site grant per the linked guidance. Store the PFX as described in [Existing Key Vault](#existing-key-vault), and set `SHAREPOINT_APP_CLIENT_ID` to the created `appId`.
+
+Resolve `SHAREPOINT_ASSIGNED_DRIVE_ID` from the target site's document library (the signed-in operator needs Graph read access to the site):
+
+```powershell
+$siteId = az rest --method get --url "https://graph.microsoft.com/v1.0/sites/<tenant>.sharepoint.com:/sites/<site>?`$select=id" --query id -o tsv
+az rest --method get --url "https://graph.microsoft.com/v1.0/sites/$siteId/drives?`$select=id,name,driveType" -o table
+```
+
+The `id` of the `documentLibrary` drive is `SHAREPOINT_ASSIGNED_DRIVE_ID`.
+
 ### Function API Application
 
 - Configure a single-tenant application ID URI.
@@ -71,6 +101,14 @@ ACA Authentication and retrieval application code both restrict access to the Fu
 The certificate Key Vault is externally supplied. Use an approved private-connected administrative path to upload or renew the PFX. Do not delete its private endpoint or temporarily enable public access as part of this workflow.
 
 The Bicep deployment creates a private endpoint/private DNS integration and assigns Key Vault Secrets User to the Function UAMI. It does not alter the existing vault's public-access policy.
+
+Store the connector certificate as a base64-encoded, password-less PFX in the secret named by `SHAREPOINT_CERTIFICATE_SECRET_NAME` (default `sharepoint-app-cert`). The connector base64-decodes the secret value and loads it with `CertificateCredential` (no password). Run this over the vault's approved private path, then delete local key material:
+
+```powershell
+$pfxB64 = [Convert]::ToBase64String([IO.File]::ReadAllBytes("sp.pfx"))
+az keyvault secret set --vault-name <vault-name> --name sharepoint-app-cert --value $pfxB64 | Out-Null
+Remove-Item sp.pfx, sp-key.pem, sp-cert.pem
+```
 
 ## Configure the azd Environment
 

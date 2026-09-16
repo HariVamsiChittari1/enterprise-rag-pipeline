@@ -390,7 +390,7 @@ Best-effort audit records for explicitly instrumented service calls and document
 | `retrieval_batch` | retrieval/pipeline.py | Per retrieval batch | submitted, succeeded, failed, timed_out, degraded, candidate_budget |
 | `tool_invocation` | retrieval/tools.py | Per agent search tool call | retrieval mode and usage |
 | `agent_generation` | retrieval/main.py | Per successful agent response when usage is available | model, tokens, latency |
-| `query_request` | retrieval/main.py | Per query | question, answer_preview, citations_count, path, planned_queries, e2e_latency_ms, catalog_version, scoring_profile, synonym_map, retrieval_degraded |
+| `query_request` | retrieval/main.py | Per query | citations_count, path, planned_queries, e2e_latency_ms, catalog_version, catalog_etag, catalog_operation_id, scoring_profile, synonym_map, retrieval_degraded |
 | `acl_resynced` | services.py | Per delta ACL event | documentId, result, method, previousGroupIds |
 | `document_retired` | services.py | Per ACL revocation (soft-retire only) | documentId, retiredReason, sourceName, sourceUrl |
 | `document_deleted` | services.py, function_app.py | Per delta deletion or version supersession (full-sync or delta-sync) | documentId, reason (deleted\|superseded), method, replacedDocumentKey |
@@ -570,6 +570,8 @@ fallback execution share one request snapshot. The optional writer's assurance
 is separate from ordinary direct editing; see [Azure setup](AZURE_SETUP.md#catalog-observation-and-optional-writer).
 
 **Solr synonym expansion** — [app/retrieval/synonyms.py](../app/retrieval/synonyms.py) parses equivalency and explicit replacement rules, including escaped commas/backslashes. Rewritten query variants are capped at eight, with five additions per matched rule. Cosmos receives one parameterized `FullTextScore(c.searchableText, @t0, ...)` and the hybrid RRF weights remain the stable two-component vector/text pair. No synonym value is concatenated into SQL.
+
+**Multi-word query tokenization** — [app/retrieval/cosmos.py](../app/retrieval/cosmos.py) tokenizes each query, and any synonym variant, into single keywords before binding them as `FullTextScore` arguments, because `FullTextScore` scores individual keyword terms rather than phrases. Tokens shorter than two characters and common English stopwords are dropped, duplicates are removed in order, and the result is capped at eight terms (`_MAX_TERMS_PER_QUERY`); a query that yields no keywords falls back to the trimmed original text.
 
 **Offline relevance evaluation** — [evaluation/retrieval_metrics.py](../evaluation/retrieval_metrics.py) compares protected baseline and candidate rankings against SME judgments using Precision@K, Recall@K, MRR, and per-query regressions. Protected questions, contexts, and raw outputs remain ignored and are not runtime state.
 
