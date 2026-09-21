@@ -12,6 +12,11 @@ import ingestion.repository as repository_module
 from azure.core import MatchConditions
 
 from ingestion.models import (
+    AudioMetadata,
+    AudioOperationRecord,
+    AudioOperationState,
+    AudioTranscriptPage,
+    AudioTranscriptSegment,
     ContentModality,
     DocumentStage,
     DocumentStatus,
@@ -35,6 +40,7 @@ from ingestion.models import (
     VisualManifestEntry,
     VisualRelevance,
     content_sha256,
+    create_audio_control_partition_id,
     create_chunk_id,
     create_document_id,
     create_document_key,
@@ -1016,6 +1022,366 @@ def test_run_history_is_ordered_by_started_at_descending() -> None:
     assert "ORDER BY c.startedAt DESC" in runs.query_calls[-1]["query"]
 
 
+def build_audio_operation(**overrides: Any) -> AudioOperationRecord:
+    return AudioOperationRecord(**({
+        "source_id": "source", "drive_id": "drive", "item_id": "item", "owner_id": "owner",
+        "audio": AudioMetadata(3000, 1, "en-US", "fast", "2025-10-15", "1", "etag", "a" * 64),
+    } | overrides))
+
+
+def build_audio_page() -> AudioTranscriptPage:
+    return AudioTranscriptPage(
+        operation=build_audio_operation(), source_run_id="source:original-run",
+        page_index=0, page_count=1,
+        segments=(AudioTranscriptSegment(0, 'hello\n"world"', 100, 1000),
+                  AudioTranscriptSegment(1, "overlap", 200, 900)),
+    )
+
+
+def test_audio_page_read_round_trip_preserves_original_address_and_state_independence() -> None:
+    page = build_audio_page()
+    documents = PointReadContainer({
+        (page.source_run_id, page.id): page.to_cosmos_item() | {"_etag": "unused", "_ts": 1},
+    })
+    repo = IngestionRepository(None, documents, None)
+    expected = replace(page.operation, state=AudioOperationState.UNKNOWN)
+    stored = repo.get_audio_transcript_page(page.source_run_id, page.id, expected_operation=expected)
+    assert stored == replace(page, operation=expected)
+    assert stored.to_cosmos_item() == page.to_cosmos_item()
+    assert documents.reads == [(page.id, page.source_run_id)]
+
+
+@pytest.mark.parametrize("field,value", [
+    ("schemaVersion", True), ("schemaVersion", 1.0), ("schemaVersion", 2),
+    ("ownershipEpoch", True), ("ownershipEpoch", 1.0), ("ownershipEpoch", 2),
+    ("recordType", "source_document"), ("operationId", "wrong"), ("ownerId", "other"),
+    ("id", "wrong"), ("sourceRunId", "source:wrong"), ("pageHash", "a" * 64),
+    ("pageIndex", True), ("pageIndex", 0.0), ("pageCount", "1"), ("pageCount", 2),
+    ("audio", None), ("audio", []), ("audio", {1: "invalid"}),
+    ("segments", None), ("segments", {}), ("segments", []), ("segments", [None]),
+    ("segments", [{}]), ("ttl", 60), ("committed", True),
+])
+def test_audio_page_read_rejects_malformed_fields(field: str, value: Any) -> None:
+    page = build_audio_page()
+    documents = PointReadContainer({
+        (page.source_run_id, page.id): page.to_cosmos_item() | {field: value},
+    })
+    repo = IngestionRepository(None, documents, None)
+    with pytest.raises(RepositoryDataError, match="^audio transcript page does not match schema version 1$"):
+        repo.get_audio_transcript_page(page.source_run_id, page.id, expected_operation=page.operation)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("ordinal", True), ("ordinal", 2), ("text", "changed"), ("text", None),
+    ("startMs", 100.0), ("endMs", 3001), ("endMs", 999), ("unexpected", "value"),
+])
+def test_audio_page_read_rejects_changed_or_invalid_segment(field: str, value: Any) -> None:
+    page = build_audio_page()
+    item = page.to_cosmos_item()
+    item["segments"][0][field] = value
+    documents = PointReadContainer({(page.source_run_id, page.id): item})
+    with pytest.raises(RepositoryDataError):
+        IngestionRepository(None, documents, None).get_audio_transcript_page(
+            page.source_run_id, page.id, expected_operation=page.operation,
+        )
+
+
+@pytest.mark.parametrize("missing", ["pageHash", "audio", "segments", "schemaVersion"])
+def test_audio_page_read_rejects_missing_fields(missing: str) -> None:
+    page = build_audio_page()
+    item = page.to_cosmos_item()
+    del item[missing]
+    documents = PointReadContainer({(page.source_run_id, page.id): item})
+    with pytest.raises(RepositoryDataError):
+        IngestionRepository(None, documents, None).get_audio_transcript_page(
+            page.source_run_id, page.id, expected_operation=page.operation,
+        )
+
+
+@pytest.mark.parametrize("item", [[], "invalid", {1: "invalid"}])
+def test_audio_page_read_rejects_nonobject_payload(item: Any) -> None:
+    page = build_audio_page()
+    documents = PointReadContainer({(page.source_run_id, page.id): item})
+    with pytest.raises(RepositoryDataError):
+        IngestionRepository(None, documents, None).get_audio_transcript_page(
+            page.source_run_id, page.id, expected_operation=page.operation,
+        )
+
+
+@pytest.mark.parametrize("field,value", [
+    ("source_id", "other"), ("drive_id", "other"), ("item_id", "other"),
+    ("owner_id", "other"), ("ownership_epoch", 2),
+    ("profile_version", "other"), ("duration_ms", 3001), ("channel_count", 2),
+])
+def test_audio_page_read_rejects_wrong_independent_operation(field: str, value: Any) -> None:
+    page = build_audio_page()
+    expected = (
+        replace(page.operation, audio=replace(page.operation.audio, **{field: value}))
+        if field in ("profile_version", "duration_ms", "channel_count")
+        else replace(page.operation, **{field: value})
+    )
+    documents = PointReadContainer({(page.source_run_id, page.id): page.to_cosmos_item()})
+    with pytest.raises(RepositoryDataError):
+        IngestionRepository(None, documents, None).get_audio_transcript_page(
+            page.source_run_id, page.id, expected_operation=expected,
+        )
+
+
+@pytest.mark.parametrize("wrong_address", ["partition", "id"])
+def test_audio_page_read_rejects_valid_rehashed_page_at_wrong_address(wrong_address: str) -> None:
+    page = build_audio_page()
+    partition = "source:other" if wrong_address == "partition" else page.source_run_id
+    page_id = "audio-transcript:" + "0" * 64 if wrong_address == "id" else page.id
+    documents = PointReadContainer({(partition, page_id): page.to_cosmos_item()})
+    with pytest.raises(RepositoryDataError, match="address does not match point read"):
+        IngestionRepository(None, documents, None).get_audio_transcript_page(
+            partition, page_id, expected_operation=page.operation,
+        )
+    assert documents.reads == [(page_id, partition)]
+
+
+@pytest.mark.parametrize("field,value", [
+    ("source_run_id", None), ("source_run_id", " "), ("source_run_id", "x" * 302),
+    ("page_id", None), ("page_id", "wrong"), ("page_id", "audio-transcript:" + "A" * 64),
+    ("page_id", "audio-transcript:" + "a" * 64 + "\n"), ("expected_operation", {}),
+])
+def test_audio_page_read_rejects_invalid_inputs_before_io(field: str, value: Any) -> None:
+    page = build_audio_page()
+    documents = PointReadContainer()
+    arguments = {"source_run_id": page.source_run_id, "page_id": page.id, "expected_operation": page.operation}
+    arguments[field] = value
+    with pytest.raises(ValueError):
+        IngestionRepository(None, documents, None).get_audio_transcript_page(**arguments)
+    assert not documents.reads
+
+
+def test_audio_page_read_missing_returns_none() -> None:
+    page = build_audio_page()
+    documents = PointReadContainer()
+    assert IngestionRepository(None, documents, None).get_audio_transcript_page(
+        page.source_run_id, page.id, expected_operation=page.operation,
+    ) is None
+    assert documents.reads == [(page.id, page.source_run_id)]
+
+
+@pytest.mark.parametrize("status", [403, 429, 500])
+def test_audio_page_read_sanitizes_sdk_failure(status: int, monkeypatch: pytest.MonkeyPatch) -> None:
+    page = build_audio_page()
+    documents = PointReadContainer()
+
+    def fail_read(*, item: str, partition_key: str) -> None:
+        documents.reads.append((item, partition_key))
+        raise FakeCosmosError(status)
+
+    monkeypatch.setattr(documents, "read_item", fail_read)
+    with pytest.raises(RepositoryError, match="^Cosmos point read failed$"):
+        IngestionRepository(None, documents, None).get_audio_transcript_page(
+            page.source_run_id, page.id, expected_operation=page.operation,
+        )
+    assert documents.reads == [(page.id, page.source_run_id)]
+
+
+@pytest.mark.parametrize("prefix", ["a", "\u00e9\U0001f642", '\"\\\n'])
+def test_audio_page_read_enforces_exact_byte_limit(prefix: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    import ingestion.models as models
+
+    page = replace(build_audio_page(), segments=(AudioTranscriptSegment(0, prefix, 0, 3000),))
+    remaining = 128 * 1024 - serialized_size_bytes(page.to_cosmos_item())
+    exact = replace(page, segments=(replace(page.segments[0], text=prefix + "a" * remaining),))
+    assert serialized_size_bytes(exact.to_cosmos_item()) == 128 * 1024
+    documents = PointReadContainer({(exact.source_run_id, exact.id): exact.to_cosmos_item()})
+    repo = IngestionRepository(None, documents, None)
+    assert repo.get_audio_transcript_page(
+        exact.source_run_id, exact.id, expected_operation=exact.operation,
+    ) == exact
+    with monkeypatch.context() as patch:
+        patch.setattr(models, "MAX_DOCUMENT_ITEM_BYTES", 128 * 1024 + 1)
+        oversized = replace(exact, segments=(replace(exact.segments[0], text=exact.segments[0].text + "a"),))
+        documents.items[(exact.source_run_id, exact.id)] = oversized.to_cosmos_item()
+    assert serialized_size_bytes(documents.items[(exact.source_run_id, exact.id)]) == 128 * 1024 + 1
+    with pytest.raises(RepositoryDataError):
+        repo.get_audio_transcript_page(exact.source_run_id, exact.id, expected_operation=exact.operation)
+
+
+def test_audio_page_read_accepts_max_partition_and_later_page_without_claiming_completeness() -> None:
+    page = replace(
+        build_audio_page(), source_run_id="x" * 301, page_index=1, page_count=2,
+        segments=(AudioTranscriptSegment(4, "later", 0, 3000),),
+    )
+    documents = PointReadContainer({(page.source_run_id, page.id): page.to_cosmos_item()})
+    assert IngestionRepository(None, documents, None).get_audio_transcript_page(
+        page.source_run_id, page.id, expected_operation=page.operation,
+    ) == page
+
+
+@pytest.mark.parametrize("field,value", [
+    ("durationMs", 3000.0), ("channelCount", True), ("locale", None), ("unexpected", 1),
+])
+def test_audio_page_read_rejects_invalid_nested_audio(field: str, value: Any) -> None:
+    page = build_audio_page()
+    item = page.to_cosmos_item()
+    item["audio"][field] = value
+    documents = PointReadContainer({(page.source_run_id, page.id): item})
+    with pytest.raises(RepositoryDataError):
+        IngestionRepository(None, documents, None).get_audio_transcript_page(
+            page.source_run_id, page.id, expected_operation=page.operation,
+        )
+
+
+def test_audio_ownership_claim_intent_and_unknown_hold_source_permit() -> None:
+    documents = StatefulContainer("sourceRunId")
+    repo = IngestionRepository(None, documents, None, audio_pilot_source_id="source")
+    operation = build_audio_operation()
+
+    claimed = repo.claim_audio_operation(operation)
+    submitted = repo.mark_audio_submission_intent(claimed)
+    unknown = repo.mark_audio_operation_unknown(submitted)
+
+    assert unknown.record.state is AudioOperationState.UNKNOWN
+    assert documents.items[(operation.source_run_id, "audio-permit")]["state"] == "unknown"
+    assert len(documents.items) == 2
+    assert len({claimed.etag, submitted.etag, unknown.etag}) == 3
+    assert all(partition == operation.source_run_id for partition, _ in documents.batch_calls)
+    for candidate in (operation, replace(operation, owner_id="other"), replace(operation, item_id="other")):
+        with pytest.raises(RepositoryConflictError):
+            repo.claim_audio_operation(candidate)
+    with pytest.raises(RepositoryConflictError):
+        repo.mark_audio_submission_intent(unknown)
+    assert len(documents.items) == 2
+    assert not documents.delete_calls
+
+
+@pytest.mark.parametrize("pilot", [None, "other-source"])
+def test_audio_ownership_disabled_or_nonpilot_never_writes(pilot: str | None) -> None:
+    documents = StatefulContainer("sourceRunId")
+    repo = IngestionRepository(None, documents, None, audio_pilot_source_id=pilot)
+    with pytest.raises(RepositoryConflictError, match="configured pilot"):
+        repo.claim_audio_operation(build_audio_operation())
+    assert not documents.batch_calls
+
+
+def test_audio_ownership_replay_never_grants_second_submission() -> None:
+    documents = StatefulContainer("sourceRunId")
+    repo = IngestionRepository(None, documents, None, audio_pilot_source_id="source")
+    operation = build_audio_operation()
+    claimed = repo.claim_audio_operation(operation)
+    with pytest.raises(RepositoryConflictError):
+        repo.claim_audio_operation(operation)
+    submitted = repo.mark_audio_submission_intent(claimed)
+    for replay in (claimed, submitted, repo.get_audio_operation("source", operation.id)):
+        with pytest.raises(RepositoryConflictError):
+            repo.mark_audio_submission_intent(replay)
+
+
+@pytest.mark.parametrize("raced_id", ["operation", "permit"])
+def test_audio_ownership_lost_cas_cannot_partially_update(raced_id: str) -> None:
+    documents = StatefulContainer("sourceRunId")
+    repo = IngestionRepository(None, documents, None, audio_pilot_source_id="source")
+    claimed = repo.claim_audio_operation(build_audio_operation())
+    key = (claimed.record.source_run_id, claimed.record.id if raced_id == "operation" else "audio-permit")
+
+    def concurrent_write() -> None:
+        documents._store(documents.items[key] | {"ownerId": "winner"})
+
+    documents.before_batch = concurrent_write
+    with pytest.raises(RepositoryConflictError):
+        repo.mark_audio_submission_intent(claimed)
+    assert all(item["state"] == "validated" for item in documents.items.values())
+    assert documents.items[key]["ownerId"] == "winner"
+
+
+@pytest.mark.parametrize("status", [409, 412, 429, 500])
+@pytest.mark.parametrize("raised", [False, True])
+def test_audio_ownership_transaction_failure_never_retries(status: int, raised: bool) -> None:
+    documents = StatefulContainer("sourceRunId")
+    if raised:
+        documents.batch_error = FakeCosmosError(status)
+    else:
+        documents.batch_status_override = status
+    repo = IngestionRepository(None, documents, None, audio_pilot_source_id="source")
+    error_type = RepositoryConflictError if status in (409, 412) else RepositoryError
+    with pytest.raises(error_type) as failure:
+        repo.claim_audio_operation(build_audio_operation())
+    assert "sensitive" not in str(failure.value)
+    assert len(documents.batch_calls) == 1
+    assert not documents.items
+
+
+@pytest.mark.parametrize("field,value", [
+    ("schemaVersion", 2), ("recordType", "source_document"), ("state", "ready"),
+    ("sourceRunId", "source:run-a"), ("id", "wrong"), ("ownershipEpoch", True),
+    ("_etag", ""), ("audio", None), ("audio", []), ("audio", "invalid"),
+])
+def test_audio_ownership_rejects_malformed_persisted_controls(field: str, value: Any) -> None:
+    operation = build_audio_operation()
+    documents = StatefulContainer("sourceRunId")
+    documents._store(operation.to_cosmos_item())
+    documents.items[(operation.source_run_id, operation.id)][field] = value
+    repo = IngestionRepository(None, documents, None)
+    with pytest.raises(RepositoryDataError):
+        repo.get_audio_operation(operation.source_id, operation.id)
+
+
+@pytest.mark.parametrize("stage", ["claim", "intent", "unknown"])
+@pytest.mark.parametrize("failure_mode", ["response", "read"])
+def test_audio_ownership_committed_but_response_lost_blocks_replay(
+    stage: str, failure_mode: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    documents = StatefulContainer("sourceRunId")
+    repo = IngestionRepository(None, documents, None, audio_pilot_source_id="source")
+    operation = build_audio_operation()
+    current = None
+    if stage == "claim":
+        expected = AudioOperationState.VALIDATED
+    else:
+        current = repo.claim_audio_operation(operation)
+        if stage == "intent":
+            expected = AudioOperationState.SUBMITTING
+        else:
+            current = repo.mark_audio_submission_intent(current)
+            expected = AudioOperationState.UNKNOWN
+
+    def invoke() -> None:
+        if stage == "claim":
+            repo.claim_audio_operation(operation)
+        else:
+            assert current is not None
+            if stage == "intent":
+                repo.mark_audio_submission_intent(current)
+            else:
+                repo.mark_audio_operation_unknown(current)
+
+    original_batch = documents.execute_item_batch
+    original_read = documents.read_item
+
+    def failed_read(**kwargs: Any) -> dict[str, Any]:
+        monkeypatch.setattr(documents, "read_item", original_read)
+        raise FakeCosmosError(500)
+
+    def committed_batch(**kwargs: Any) -> list[dict[str, int]]:
+        result = original_batch(**kwargs)
+        monkeypatch.setattr(documents, "execute_item_batch", original_batch)
+        if failure_mode == "response":
+            raise FakeCosmosError(500)
+        monkeypatch.setattr(documents, "read_item", failed_read)
+        return result
+
+    monkeypatch.setattr(documents, "execute_item_batch", committed_batch)
+    before = len(documents.batch_calls)
+    with pytest.raises(RepositoryError) as failure:
+        invoke()
+    assert "sensitive" not in str(failure.value)
+    assert len(documents.batch_calls) == before + 1
+    assert len(documents.items) == 2
+    assert {item["state"] for item in documents.items.values()} == {expected.value}
+    assert not documents.delete_calls
+    with pytest.raises(RepositoryConflictError):
+        invoke()
+    with pytest.raises(RepositoryConflictError):
+        repo.claim_audio_operation(replace(operation, owner_id="new-run"))
+    assert {item["state"] for item in documents.items.values()} == {expected.value}
+
+
 def test_bounded_cleanup_never_deletes_the_current_run() -> None:
     runs = StatefulContainer("sourceId")
     documents = StatefulContainer("sourceRunId")
@@ -1026,6 +1392,14 @@ def test_bounded_cleanup_never_deletes_the_current_run() -> None:
     repository.create_discovered_document(old_document)
     repository.write_chunks(build_chunks(3, document=old_document))
     repository.write_visual_manifest_pages(build_manifest_pages(old_document))
+    control_partition = create_audio_control_partition_id("source")
+    audio_control = documents.create_item(body={
+        "id": "audio-operation:sentinel",
+        "sourceId": "source",
+        "sourceRunId": control_partition,
+        "recordType": "audio_operation",
+        "status": "unknown",
+    })
     later = "2026-08-05T12:01:00Z"
     repository.activate_run(build_run("run-b", later), build_control("run-b", later))
 
@@ -1034,7 +1408,8 @@ def test_bounded_cleanup_never_deletes_the_current_run() -> None:
 
     assert first == repository_module.CleanupPage(0, 2, False)
     assert second == repository_module.CleanupPage(1, 1, True)
-    assert not documents.items
+    assert documents.items == {(control_partition, audio_control["id"]): audio_control}
+    assert all(partition != control_partition for partition, _ in documents.delete_calls)
     assert not chunks.items
     with pytest.raises(RepositoryConflictError, match="current run"):
         repository.cleanup_run_page("source", "run-b", page_size=2)

@@ -13,6 +13,8 @@ services:
     project: ./app
     language: py
     host: function
+    resourceGroup: ${FUNCTION_DEPLOY_RESOURCE_GROUP}
+    resourceName: ${FUNCTION_DEPLOY_APP_NAME}
 
 # Pipeline configuration for CI/CD
 pipeline:

@@ -14,6 +14,7 @@ from ingestion.lifecycle_repository import (
     LifecycleRepositoryError,
     ReadyDocumentRef,
 )
+from ingestion.models import create_audio_control_partition_id
 
 
 class FakeCosmosError(Exception):
@@ -993,7 +994,10 @@ def test_delete_document_and_chunks_conflict_on_stale_etag() -> None:
     assert ("source:run-a", "doc-1") in documents.items
 
 
-def test_list_ready_documents_page_and_find_by_document_id() -> None:
+@pytest.mark.parametrize("record_type", ["audio_operation", "audio_permit", "audio_transcript"])
+@pytest.mark.parametrize("status", ["ready", "acl_refreshing", "retired"])
+def test_list_ready_documents_page_and_find_by_document_id(record_type: str, status: str) -> None:
+    control_partition = create_audio_control_partition_id("source")
     documents = FakeContainer(
         "sourceRunId",
         {
@@ -1010,8 +1014,20 @@ def test_list_ready_documents_page_and_find_by_document_id() -> None:
                 "sourceRunId": "source:run-a",
                 "status": "ready",
             },
+            (control_partition, "audio-operation:sentinel"): _ready_document(
+                "audio-operation:sentinel", recordType=record_type,
+                sourceRunId=control_partition, status=status, retiredReason="acl_revoked",
+            ),
         },
     )
+    captured: list[dict[str, Any]] = []
+    original_query = documents.query_items
+
+    def capture_query(**kwargs: Any) -> FakeQueryIterator:
+        captured.append(kwargs)
+        return original_query(**kwargs)
+
+    documents.query_items = capture_query  # type: ignore[method-assign]
     repo = DocumentLifecycleRepository(FakeContainer("sourceId"), documents, FakeContainer("documentKey"))
 
     page = repo.list_ready_documents_page(page_size=10)
@@ -1022,6 +1038,11 @@ def test_list_ready_documents_page_and_find_by_document_id() -> None:
     assert found.source_run_id == "source:run-b"
 
     assert repo.find_ready_document_by_document_id("doc-missing") is None
+    assert repo.find_ready_document_by_document_id("audio-operation:sentinel") is None
+    assert len(captured) == 4
+    for query in captured:
+        assert "WHERE c.recordType = @recordType" in query["query"]
+        assert {"name": "@recordType", "value": "source_document"} in query["parameters"]
 
 
 def test_acl_revoked_lookup_and_authority_select_latest_matching_version() -> None:

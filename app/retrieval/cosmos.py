@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from enum import StrEnum
 from typing import Any, Iterable, Mapping
 
@@ -21,12 +22,14 @@ class RetrievalLocatorKind(StrEnum):
     SECTION = "section"
     SLIDE = "slide"
     WORKSHEET = "worksheet"
+    TIME = "time"
 
 
 # Reranker input cap; matches AI Search's semantic-ranker top-50 rerank cap.
 MAX_CANDIDATE_POOL_TOTAL = 50
 SOURCE_DOCUMENT_SCHEMA_VERSION = 1
 SOURCE_DOCUMENT_RECORD_TYPE = "source_document"
+_AUDIO_MIME_TYPES = ("audio/wav", "audio/mpeg", "audio/flac")
 
 
 @dataclass(frozen=True)
@@ -41,19 +44,28 @@ class RetrievedChunk:
     locator_ordinal_start: int
     locator_ordinal_end: int
     source_modified_at: str | None = None
+    start_ms: int | None = None
+    end_ms: int | None = None
+    evidence_version: str | None = None
 
 
 _PROJECTION = (
-    "c.id, c.documentId, c.sourceRunId, c.content, "
+    "c.id, c.schemaVersion, c.documentId, c.sourceRunId, c.content, "
     "c.sourceName, c.sourceUrl, c.locatorKind, c.locatorLabel, "
     "c.locatorOrdinalStart, c.locatorOrdinalEnd, c.sourceModifiedAt, "
-    "c.sectionPath, c.keyPhrases, c.createdAt"
+    "c.sectionPath, c.keyPhrases, c.createdAt, c.lifecycleGeneration, "
+    "c.documentKey, c.audio, c.startMs, c.endMs"
 )
 _ACL_FILTER = (
     "EXISTS(SELECT VALUE gid FROM gid IN c.allowedGroupIds "
     "WHERE ARRAY_CONTAINS(@principalIds, gid))"
 )
 _RETRIEVABLE_FILTER = "c.isRetrievable = true"
+_DOCUMENT_FILTER = (
+    "(c.schemaVersion = 1 AND "
+    "c.locatorKind IN ('page', 'section', 'slide', 'worksheet'))"
+)
+_AUDIO_FILTER = "(c.schemaVersion = 1 AND c.locatorKind = 'time')"
 # Positional weight order MUST match the argument order of the two RRF scoring
 # functions below: index 0 = VectorDistance (vector weight), index 1 = FullTextScore
 # (BM25 weight). See https://learn.microsoft.com/en-us/azure/cosmos-db/nosql/query/rrf.
@@ -132,10 +144,25 @@ def _build_full_text_multi_term_clause(term_count: int) -> str:
 
 
 class SecureCosmosRetriever:
-    def __init__(self, chunks: Any, manifests: Any, *, acl_enabled: bool = True) -> None:
+    def __init__(
+        self, chunks: Any, manifests: Any, *, acl_enabled: bool = True,
+        audio_retrieval_enabled: bool = False,
+        audio_max_acl_age_seconds: int | None = None,
+        audio_max_source_age_seconds: int | None = None,
+    ) -> None:
+        if audio_retrieval_enabled and (
+            not acl_enabled
+            or any(type(value) is not int or value <= 0 for value in (
+                audio_max_acl_age_seconds, audio_max_source_age_seconds,
+            ))
+        ):
+            raise ValueError("audio_requires_acl_and_freshness_limits")
         self._chunks = chunks
         self._manifests = manifests
         self._acl_enabled = acl_enabled
+        self._audio_enabled = audio_retrieval_enabled
+        self._audio_max_acl_age_seconds = audio_max_acl_age_seconds
+        self._audio_max_source_age_seconds = audio_max_source_age_seconds
 
     def retrieve(
         self,
@@ -172,7 +199,11 @@ class SecureCosmosRetriever:
         parameters: list[dict[str, Any]] = [
             {"name": "@topK", "value": effective_top},
         ]
-        filters = [_RETRIEVABLE_FILTER]
+        media_filter = (
+            f"({_DOCUMENT_FILTER} OR {_AUDIO_FILTER})"
+            if self._audio_enabled else _DOCUMENT_FILTER
+        )
+        filters = [_RETRIEVABLE_FILTER, media_filter]
         if self._acl_enabled:
             filters.append(_ACL_FILTER)
             parameters.append(
@@ -223,13 +254,17 @@ class SecureCosmosRetriever:
         candidates = self._chunks.query_items(**query_kwargs)
         materialized: list[dict[str, Any]] = []
         for candidate in candidates:
-            manifest = self._active_manifest(candidate)
+            manifest = self._active_manifest(candidate, principal_ids)
             if manifest is None:
                 continue
             manifest_source_name = manifest.get("sourceName")
             enriched = dict(candidate)
             if isinstance(manifest_source_name, str) and manifest_source_name:
                 enriched["sourceName"] = manifest_source_name
+            try:
+                _to_chunk(enriched)
+            except ValueError:
+                continue
             materialized.append(enriched)
         if raw:
             return materialized[:effective_top]
@@ -238,7 +273,9 @@ class SecureCosmosRetriever:
     def to_chunks(self, candidates: Iterable[Mapping[str, Any]]) -> list[RetrievedChunk]:
         return [_to_chunk(candidate) for candidate in candidates]
 
-    def _active_manifest(self, candidate: dict[str, Any]) -> dict[str, Any] | None:
+    def _active_manifest(
+        self, candidate: dict[str, Any], principal_ids: list[str],
+    ) -> dict[str, Any] | None:
         document_id = candidate.get("documentId")
         source_run_id = candidate.get("sourceRunId")
         if not isinstance(document_id, str) or not isinstance(source_run_id, str):
@@ -250,16 +287,68 @@ class SecureCosmosRetriever:
             )
         except CosmosResourceNotFoundError:
             return None
+        schema_version = candidate.get("schemaVersion")
         if (
-            manifest.get("schemaVersion") != SOURCE_DOCUMENT_SCHEMA_VERSION
+            type(schema_version) is not int
+            or schema_version != SOURCE_DOCUMENT_SCHEMA_VERSION
+            or type(manifest.get("schemaVersion")) is not int
+            or manifest.get("schemaVersion") != schema_version
             or manifest.get("recordType") != SOURCE_DOCUMENT_RECORD_TYPE
             or manifest.get("status") != "ready"
         ):
             return None
+        if candidate.get("locatorKind") != RetrievalLocatorKind.TIME:
+            if manifest.get("audio") is not None or manifest.get("mimeType") in _AUDIO_MIME_TYPES:
+                return None
+            return manifest
+        if not self._audio_enabled:
+            return None
+        audio = candidate.get("audio")
+        generation = candidate.get("lifecycleGeneration")
+        manifest_groups = manifest.get("allowedGroupIds")
+        if (
+            not isinstance(audio, dict)
+            or manifest.get("mimeType") not in _AUDIO_MIME_TYPES
+            or manifest.get("audio") != audio
+            or manifest.get("eTag") != audio.get("sourceVersion")
+            or manifest.get("contentHash") != audio.get("sourceContentHash")
+            or manifest.get("documentId") != document_id
+            or manifest.get("sourceRunId") != source_run_id
+            or not isinstance(candidate.get("documentKey"), str)
+            or not candidate["documentKey"]
+            or manifest.get("documentKey") != candidate["documentKey"]
+            or type(generation) is not int or generation < 0
+            or type(manifest.get("lifecycleGeneration")) is not int
+            or manifest.get("lifecycleGeneration") != generation
+            or not isinstance(manifest_groups, list)
+            or not all(isinstance(group, str) for group in manifest_groups)
+            or not set(principal_ids).intersection(manifest_groups)
+        ):
+            return None
+        now = datetime.now(timezone.utc)
+        if not _is_fresh(manifest.get("aclEvaluatedAt"), self._audio_max_acl_age_seconds, now):
+            return None
+        if not _is_fresh(manifest.get("sourceVerifiedAt"), self._audio_max_source_age_seconds, now):
+            return None
         return manifest
 
 
+def _is_fresh(value: Any, maximum_age: int | None, now: datetime) -> bool:
+    if not isinstance(value, str) or maximum_age is None:
+        return False
+    try:
+        verified = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if verified.tzinfo is None or verified.utcoffset() != timezone.utc.utcoffset(verified):
+        return False
+    return 0 <= (now - verified).total_seconds() <= maximum_age
+
+
 def _to_chunk(candidate: Mapping[str, Any]) -> RetrievedChunk:
+    schema_version = candidate.get("schemaVersion")
+    if type(schema_version) is not int or schema_version != SOURCE_DOCUMENT_SCHEMA_VERSION:
+        raise ValueError("invalid_retrieval_record")
     source_url = candidate.get("sourceUrl") or ""
     source_modified_at = candidate.get("sourceModifiedAt")
     values = {
@@ -276,14 +365,38 @@ def _to_chunk(candidate: Mapping[str, Any]) -> RetrievedChunk:
         locator_kind = RetrievalLocatorKind(candidate.get("locatorKind"))
     except (TypeError, ValueError) as error:
         raise ValueError("invalid_retrieval_record") from error
+    temporal: dict[str, Any] = {}
+    if locator_kind is RetrievalLocatorKind.TIME:
+        audio = candidate.get("audio")
+        start_ms, end_ms = candidate.get("startMs"), candidate.get("endMs")
+        if (
+            not isinstance(audio, dict)
+            or type(audio.get("durationMs")) is not int
+            or not 0 < audio["durationMs"] <= 1_800_000
+            or (audio.get("channelCount") is not None
+                and (type(audio.get("channelCount")) is not int or audio["channelCount"] not in (1, 2)))
+            or not isinstance(audio.get("locale"), str)
+            or re.fullmatch(r"en-[A-Z]{2}", audio["locale"]) is None
+            or audio.get("mode") not in ("fast", "enhanced")
+            or audio.get("apiVersion") != "2025-10-15"
+            or any(not isinstance(audio.get(name), str) or not audio[name].strip()
+                   for name in ("sourceVersion", "sourceContentHash", "profileVersion"))
+            or re.fullmatch(r"[0-9a-f]{64}", audio["sourceContentHash"]) is None
+            or type(start_ms) is not int or type(end_ms) is not int
+            or not 0 <= start_ms < end_ms <= audio["durationMs"]
+        ):
+            raise ValueError("invalid_retrieval_record")
+        temporal = {"start_ms": start_ms, "end_ms": end_ms, "evidence_version": audio["sourceVersion"]}
+    elif any(candidate.get(name) is not None for name in ("audio", "startMs", "endMs")):
+        raise ValueError("invalid_retrieval_record")
     if (
         not all(
             isinstance(values[name], str) and values[name]
             for name in values
             if name not in ("source_url", "locator_ordinal_start", "locator_ordinal_end")
         )
-        or not isinstance(values["locator_ordinal_start"], int)
-        or not isinstance(values["locator_ordinal_end"], int)
+        or type(values["locator_ordinal_start"]) is not int
+        or type(values["locator_ordinal_end"]) is not int
         or values["locator_ordinal_start"] < 1
         or values["locator_ordinal_end"] < values["locator_ordinal_start"]
     ):
@@ -293,5 +406,6 @@ def _to_chunk(candidate: Mapping[str, Any]) -> RetrievedChunk:
     return RetrievedChunk(
         locator_kind=locator_kind,
         source_modified_at=source_modified_at,
+        **temporal,
         **values,
     )

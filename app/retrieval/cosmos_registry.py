@@ -104,6 +104,9 @@ def build_cosmos_registry(
     credential: ManagedIdentityCredential,
     *,
     acl_enabled: bool = True,
+    audio_retrieval_enabled: bool = False,
+    audio_max_acl_age_seconds: int | None = None,
+    audio_max_source_age_seconds: int | None = None,
 ) -> CosmosRegistry:
     retrievers: dict[str, SecureCosmosRetriever] = {}
     clients: list[CosmosClient] = []
@@ -115,6 +118,9 @@ def build_cosmos_registry(
             db.get_container_client(instance.chunks_container),
             db.get_container_client(instance.manifests_container),
             acl_enabled=acl_enabled,
+            audio_retrieval_enabled=audio_retrieval_enabled,
+            audio_max_acl_age_seconds=audio_max_acl_age_seconds,
+            audio_max_source_age_seconds=audio_max_source_age_seconds,
         )
     return CosmosRegistry(retrievers, clients=tuple(clients))
 

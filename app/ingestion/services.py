@@ -3,17 +3,18 @@
 from __future__ import annotations
 
 import logging
-import re
 import time
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
 
 from config import ExtractionProvider, IngestionConfig
-from ingestion.chunking import chunk_pages, token_count
+from ingestion.audio_transcription import build_transcript
+from ingestion.chunking import chunk_audio_segments, chunk_pages, token_count
 from ingestion.embedding import embed_texts
 from ingestion.enrichment import enrich_chunks
 from ingestion.errors import TerminalDocumentError
+from ingestion.speech_fast import transcribe_audio
 from ingestion.extraction import (
     MIN_TEXT_CHARACTERS,
     VisionExtractionConfig,
@@ -26,9 +27,9 @@ from ingestion.extraction import (
 from ingestion.graph import (
     DeltaResetRequired,
     DiscoveryState,
-    DiscoveryStep,
     ResolvedMarkdownImage,
     VerifiedAcl,
+    canonical_source_mime,
     discovered_pdf_from_item,
     resolve_source_format,
     validate_source_signature,
@@ -42,6 +43,7 @@ from ingestion.lifecycle_repository import (
 from ingestion.models import (
     ActivityOutcome,
     ActivityStatus,
+    AudioMetadata,
     CanonicalExtractionResult,
     Chunk,
     DocumentStage,
@@ -58,9 +60,11 @@ from ingestion.models import (
     ScaleLimits,
     SearchChunkRecord,
     Settings,
+    SUPPORTED_AUDIO_MIME_TYPES,
     SourceControlRecord,
     SourceDocumentRecord,
     content_sha256,
+    content_sha256_bytes,
     create_chunk_id,
     create_document_id,
     create_document_key,
@@ -192,6 +196,7 @@ def process_document(
     audit_container: Any | None = None,
     *,
     cu_client: Any | None = None,
+    speech_token_provider: Callable[[], str] | None = None,
 ) -> ActivityOutcome:
     """Process a single document through the full pipeline."""
     try:
@@ -224,6 +229,96 @@ def process_document(
             config.download_timeout_seconds,
         )
         validate_source_signature(source_format, content)
+
+        if source_snapshot.mime_type in SUPPORTED_AUDIO_MIME_TYPES:
+            if not config.audio_writer_enabled:
+                raise TerminalDocumentError("audio_writer_disabled")
+            if speech_token_provider is None:
+                raise TerminalDocumentError("audio_transcription_token_provider_missing")
+            source_content_hash = content_sha256_bytes(content)
+            response = transcribe_audio(
+                endpoint=config.speech_endpoint,
+                audio=content,
+                filename=current_doc.source_name,
+                content_type=source_snapshot.mime_type,
+                locale=config.audio_locale,
+                token_provider=speech_token_provider,
+                max_response_bytes=config.audio_max_response_bytes,
+                timeout_seconds=config.speech_request_timeout_seconds,
+            )
+            audio, segments = build_transcript(
+                response,
+                locale=config.audio_locale,
+                profile_version=config.audio_transcription_provider,
+                source_version=current_doc.e_tag,
+                source_content_hash=source_content_hash,
+                max_response_bytes=config.audio_max_response_bytes,
+                max_phrases=config.audio_max_phrases,
+                max_words=config.audio_max_words,
+            )
+            chunks = chunk_audio_segments(segments, audio)
+            if config.enrichment_enabled and language_client is not None:
+                enrichments = enrich_chunks(
+                    language_client, [chunk.content for chunk in chunks],
+                    summary_enabled=config.summary_enabled,
+                    key_phrases_enabled=config.key_phrases_enabled,
+                    entities_enabled=config.entities_enabled,
+                )
+            else:
+                enrichments = enrich_chunks(None, [chunk.content for chunk in chunks])
+            searchable_texts = [
+                _build_searchable_text(chunk.content, enrichments[i]["key_phrases"], enrichments[i]["summary"])
+                for i, chunk in enumerate(chunks)
+            ]
+            embeddings = embed_texts(
+                openai_client, searchable_texts,
+                audit_container=audit_container,
+                source_id=config.source_id,
+                run_id=current_doc.source_run_id,
+                batch_size=config.embedding_batch_size,
+            )
+            now = _fmt(_utc_now())
+            chunk_records = _build_chunk_records(
+                current_doc, acl, chunks, searchable_texts, enrichments, embeddings, now, audio=audio,
+            )
+            current_doc = replace(
+                current_doc, stage=DocumentStage.PERSISTING, page_count=None,
+                expected_chunk_count=len(chunk_records), content_hash=source_content_hash,
+                extraction_mode=config.audio_transcription_provider, audio=audio,
+                updated_at=_fmt(_utc_now()),
+            )
+            updated = repository.update_processing_document(current_doc, current_etag)
+            current_doc, current_etag = updated.record, updated.etag
+            written = repository.write_chunks(chunk_records)
+            _read_and_validate_source_snapshot(connector, current_doc, expected_snapshot=source_snapshot)
+            final_acl = connector.read_verified_acl(current_doc.item_id, config.acl_max_pages)
+            if final_acl != acl:
+                raise TerminalDocumentError("source_acl_changed_during_processing")
+            admitting_doc = replace(
+                current_doc, status=DocumentStatus.ADMITTING, stage=DocumentStage.VERIFYING,
+                allowed_group_ids=acl.allowed_group_ids, acl_hash=acl.acl_hash,
+                acl_evaluated_at=_fmt(_utc_now()), expected_chunk_count=len(chunk_records),
+                written_chunk_count=written, source_verified_at=_fmt(_utc_now()),
+                updated_at=_fmt(_utc_now()),
+            )
+            admitting = repository.begin_document_admission(admitting_doc, current_etag)
+            current_doc, current_etag = admitting.record, admitting.etag
+            lifecycle_repository.set_document_chunks_retrievable(
+                document_key=current_doc.document_key,
+                lifecycle_generation=current_doc.lifecycle_generation,
+                is_retrievable=True,
+                allowed_group_ids=acl.allowed_group_ids,
+                expected_count=written,
+            )
+            ready_doc = replace(
+                current_doc, status=DocumentStatus.READY, stage=DocumentStage.TERMINAL,
+                ready_at=_fmt(_utc_now()), updated_at=_fmt(_utc_now()),
+            )
+            repository.verify_and_mark_document_ready(ready_doc, current_etag)
+            return ActivityOutcome(
+                document_id=document.document_id, status=ActivityStatus.SUCCEEDED,
+                chunks_written=written, retry_count=document.attempt_count,
+            )
 
         if config.extraction_enabled:
             extraction_start = time.perf_counter()
@@ -1170,7 +1265,7 @@ def _read_and_validate_source_snapshot(
     if size != document.size_bytes:
         raise TerminalDocumentError("source_size_changed_during_processing")
     source_format = resolve_source_format(name, graph_mime)
-    normalized_mime = graph_mime.split(";", 1)[0].strip().lower()
+    normalized_mime = canonical_source_mime(name, graph_mime)
     snapshot = _SourceSnapshot(source_format, normalized_mime)
     if expected_snapshot is not None and source_format != expected_snapshot.source_format:
         raise TerminalDocumentError("source_format_changed_during_processing")
@@ -1224,8 +1319,9 @@ def _source_to_document(source: Any, config: IngestionConfig, run_id: str, inges
 def _build_chunk_records(
     document: SourceDocumentRecord, acl: Any, chunks: list[Chunk],
     searchable_texts: list[str], enrichments: list[dict], embeddings: list[tuple[float, ...]],
-    now: str,
+    now: str, *, audio: AudioMetadata | None = None,
 ) -> tuple[SearchChunkRecord, ...]:
+    is_audio = audio is not None
     records: list[SearchChunkRecord] = []
     for i, chunk in enumerate(chunks):
         enrichment = enrichments[i]
@@ -1236,7 +1332,8 @@ def _build_chunk_records(
             allowed_group_ids=acl.allowed_group_ids,
             source_name=document.source_name,
             source_url=document.source_url,
-            page_start=chunk.page_number, page_end=chunk.page_number,
+            page_start=None if is_audio else chunk.page_number,
+            page_end=None if is_audio else chunk.page_number,
             section_path=_section_path(chunk.content),
             locator_kind=chunk.locator.kind,
             locator_label=chunk.locator.label,
@@ -1263,6 +1360,9 @@ def _build_chunk_records(
             lifecycle_generation=document.lifecycle_generation,
             id=create_chunk_id(chunk.ordinal),
             source_run_id=create_source_run_id(document.source_id, document.run_id),
+            audio=audio,
+            start_ms=chunk.locator.start_ms if is_audio else None,
+            end_ms=chunk.locator.end_ms if is_audio else None,
         ))
     return tuple(records)
 

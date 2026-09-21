@@ -79,6 +79,10 @@ evaluation/results/raw/
 # Cosmos data exports (runtime output, not source)
 data/*.json
 
+# Local command-output captures (runtime output, not source)
+data/*.err
+data/*.out
+
 # Local configuration
 local.settings.json
 .env.local

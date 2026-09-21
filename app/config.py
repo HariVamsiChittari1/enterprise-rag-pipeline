@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 from enum import Enum
+from urllib.parse import urlsplit
 
 
 def _required(name: str) -> str:
@@ -93,6 +95,75 @@ class IngestionConfig:
     sharepoint_site_url: str
     document_intelligence_enabled: bool = True
     content_understanding_enabled: bool = False
+    audio_writer_enabled: bool = False
+    audio_transcription_provider: str = "speech_fast"
+    speech_endpoint: str = ""
+    speech_region: str = ""
+    audio_deployment_region: str = ""
+    audio_locale: str = ""
+    speech_request_timeout_seconds: float = 120.0
+    audio_max_response_bytes: int = 16 * 1024 * 1024
+    audio_max_phrases: int = 20_000
+    audio_max_words: int = 400_000
+
+    def __post_init__(self) -> None:
+        if type(self.audio_writer_enabled) is not bool:
+            raise ValueError("AUDIO_WRITER_ENABLED must be true or false")
+        if self.audio_transcription_provider != "speech_fast":
+            raise ValueError("AUDIO_TRANSCRIPTION_PROVIDER must be speech_fast")
+        if self.audio_writer_enabled and not self.extraction_enabled:
+            raise ValueError("AUDIO_WRITER_ENABLED requires EXTRACTION_ENABLED")
+        for name, value in (
+            ("SPEECH_ENDPOINT", self.speech_endpoint),
+            ("SPEECH_REGION", self.speech_region),
+            ("AUDIO_DEPLOYMENT_REGION", self.audio_deployment_region),
+            ("AUDIO_LOCALE", self.audio_locale),
+        ):
+            if not isinstance(value, str):
+                raise ValueError(f"{name} must be a string")
+            if self.audio_writer_enabled and not value:
+                raise ValueError(f"AUDIO_WRITER_ENABLED requires {name}")
+        if self.speech_endpoint:
+            try:
+                endpoint = urlsplit(self.speech_endpoint)
+            except ValueError:
+                raise ValueError("SPEECH_ENDPOINT must be an HTTPS custom-domain base URL") from None
+            if (
+                any(character.isspace() or ord(character) < 32 for character in self.speech_endpoint)
+                or endpoint.scheme != "https"
+                or endpoint.netloc != endpoint.hostname
+                or not re.fullmatch(
+                    r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.cognitiveservices\.azure\.com",
+                    endpoint.hostname or "",
+                )
+                or endpoint.path not in ("", "/")
+                or "?" in self.speech_endpoint
+                or "#" in self.speech_endpoint
+            ):
+                raise ValueError("SPEECH_ENDPOINT must be an HTTPS custom-domain base URL")
+        for name, region in (
+            ("SPEECH_REGION", self.speech_region),
+            ("AUDIO_DEPLOYMENT_REGION", self.audio_deployment_region),
+        ):
+            if region and region not in ("eastus2", "centralindia", "southeastasia"):
+                raise ValueError(f"{name} is outside the initial audio region allowlist")
+        if self.speech_region and self.audio_deployment_region and self.speech_region != self.audio_deployment_region:
+            raise ValueError("SPEECH_REGION must match AUDIO_DEPLOYMENT_REGION")
+        if self.audio_locale and self.audio_locale not in ("en-US", "en-GB", "en-IN"):
+            raise ValueError("AUDIO_LOCALE must be en-US, en-GB, or en-IN")
+        if (
+            not isinstance(self.speech_request_timeout_seconds, (int, float))
+            or isinstance(self.speech_request_timeout_seconds, bool)
+            or self.speech_request_timeout_seconds <= 0
+        ):
+            raise ValueError("SPEECH_REQUEST_TIMEOUT_SECONDS must be a positive number")
+        for name, value in (
+            ("AUDIO_MAX_RESPONSE_BYTES", self.audio_max_response_bytes),
+            ("AUDIO_MAX_PHRASES", self.audio_max_phrases),
+            ("AUDIO_MAX_WORDS", self.audio_max_words),
+        ):
+            if type(value) is not int or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
 
     @property
     def extraction_provider(self) -> ExtractionProvider | None:
@@ -104,6 +175,9 @@ class IngestionConfig:
 
 
 def load_config() -> IngestionConfig:
+    audio_enabled_raw = os.getenv("AUDIO_WRITER_ENABLED", "false").strip().lower()
+    if audio_enabled_raw not in ("true", "false"):
+        raise ValueError("AUDIO_WRITER_ENABLED must be true or false")
     extensions_raw = os.getenv("ALLOWED_FILE_EXTENSIONS", ".pdf")
     extensions = tuple(ext.strip().lower() for ext in extensions_raw.split(",") if ext.strip())
 
@@ -171,4 +245,14 @@ def load_config() -> IngestionConfig:
         sharepoint_site_url=_required("SHAREPOINT_SITE_URL"),
         document_intelligence_enabled=document_intelligence_enabled,
         content_understanding_enabled=content_understanding_enabled,
+        audio_writer_enabled=audio_enabled_raw == "true",
+        audio_transcription_provider=os.getenv("AUDIO_TRANSCRIPTION_PROVIDER", "speech_fast").strip().lower(),
+        speech_endpoint=os.getenv("SPEECH_ENDPOINT", "").strip(),
+        speech_region=os.getenv("SPEECH_REGION", "").strip().lower(),
+        audio_deployment_region=os.getenv("AUDIO_DEPLOYMENT_REGION", "").strip().lower(),
+        audio_locale=os.getenv("AUDIO_LOCALE", "").strip(),
+        speech_request_timeout_seconds=float(os.getenv("SPEECH_REQUEST_TIMEOUT_SECONDS", "120.0")),
+        audio_max_response_bytes=_int("AUDIO_MAX_RESPONSE_BYTES", 16 * 1024 * 1024),
+        audio_max_phrases=_int("AUDIO_MAX_PHRASES", 20_000),
+        audio_max_words=_int("AUDIO_MAX_WORDS", 400_000),
     )

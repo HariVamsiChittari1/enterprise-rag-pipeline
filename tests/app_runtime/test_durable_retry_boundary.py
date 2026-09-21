@@ -65,6 +65,7 @@ def test_process_document_activity_retries_inside_activity(
         sharepoint_site_url="",
         drive_id="drive-1",
         source_id="source-1",
+        audio_writer_enabled=False,
     )
 
     monkeypatch.setattr(config, "load_config", lambda: fake_config)

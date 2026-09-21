@@ -14,16 +14,19 @@ param(
     [Parameter(Mandatory)]
     [ValidateSet(
         'Authority', 'Foundation', 'Build', 'Operations', 'Catalog', 'CatalogVerify',
-        'OperationsCleanup', 'Final', 'Function'
+        'OperationsCleanup', 'Final', 'Function', 'FunctionPackage'
     )]
     [string]$Phase,
 
     [string]$PlanId = 'aca-greenfield-retrieval-v1',
     [string]$ExpectedPlanHash,
     [string]$ExpectedSourceTreeHash,
+    [string]$FunctionPackagePath,
+    [string]$ExpectedFunctionPackageHash,
     [string]$SubscriptionId,
     [string]$TenantId,
     [string]$ResourceGroup,
+    [string]$FunctionAppName,
     [string]$Location,
     [string]$AzdEnvironment,
     [string]$DeploymentInstanceId,
@@ -120,6 +123,161 @@ function Assert-Authority {
         throw 'Source tree hash changed after review.'
     }
     return $authority
+}
+
+function Test-FunctionPackage {
+    $packagePath = Get-RequiredValue 'FunctionPackagePath' $FunctionPackagePath
+    $expectedHash = Get-RequiredValue 'ExpectedFunctionPackageHash' $ExpectedFunctionPackageHash
+    if ($expectedHash -cnotmatch '^[a-f0-9]{64}$') {
+        throw 'ExpectedFunctionPackageHash must be a lowercase SHA-256 digest.'
+    }
+    if ([IO.Path]::GetExtension($packagePath) -ine '.zip' -or
+        -not (Test-Path -LiteralPath $packagePath -PathType Leaf)) {
+        throw 'FunctionPackagePath must reference an existing ZIP file.'
+    }
+    $stream = [IO.File]::OpenRead((Resolve-Path -LiteralPath $packagePath).Path)
+    try {
+        if ($stream.Length -gt 256MB) { throw 'Function source ZIP exceeds the 256 MiB preflight limit.' }
+        $actualHash = (Get-FileHash -InputStream $stream -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($actualHash -cne $expectedHash) { throw 'Function package hash does not match review.' }
+        $stream.Position = 0
+        $archive = [IO.Compression.ZipArchive]::new($stream, [IO.Compression.ZipArchiveMode]::Read, $true)
+        try {
+            if ($archive.Entries.Count -gt 4096) { throw 'Function source ZIP exceeds the 4096-entry preflight limit.' }
+            $paths = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+            $files = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+            $filePaths = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+            $buffer = [byte[]]::new(65536)
+            $totalBytes = 0L
+            foreach ($entry in $archive.Entries) {
+                $path = $entry.FullName
+                if ([string]::IsNullOrWhiteSpace($path) -or
+                    $path -match '[\\:\x00-\x1f\x7f]' -or $path.StartsWith('/') -or
+                    $path -match '(^|/)\.{1,2}(/|$)' -or $path.Contains('//') -or
+                    -not $paths.Add($path.TrimEnd('/'))) {
+                    throw 'Function package contains unsafe or duplicate paths.'
+                }
+                if ($path -match '(^|/)(local\.settings\.json|\.env[^/]*|\.azure|\.git|\.venv[^/]*|venv|__pycache__|\.pytest_cache)(/|$)' -or
+                    $path -match '\.(pem|pfx|p12|key|pyc|pyo)$') {
+                    throw 'Function package contains excluded local or credential artifacts.'
+                }
+                if ($path -match '^operations(/|$)') {
+                    throw 'Function package contains standalone operations tooling.'
+                }
+                $unixType = ($entry.ExternalAttributes -shr 16) -band 0xF000
+                if ($unixType -notin @(0, 0x8000, 0x4000) -or
+                    ($unixType -eq 0x4000 -and -not $path.EndsWith('/')) -or
+                    ($unixType -eq 0x8000 -and $path.EndsWith('/'))) {
+                    throw 'Function package contains unsupported filesystem entry types.'
+                }
+                if ($entry.Length -gt 256MB -or $totalBytes + $entry.Length -gt 256MB) {
+                    throw 'Function source ZIP exceeds the 256 MiB expanded preflight limit.'
+                }
+                $entryStream = $null
+                $entryBytes = 0L
+                try {
+                    $entryStream = $entry.Open()
+                    while (($bytesRead = $entryStream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+                        $entryBytes += $bytesRead
+                        $totalBytes += $bytesRead
+                        if ($totalBytes -gt 256MB -or $entryBytes -gt $entry.Length) {
+                            throw 'Expanded entry exceeds its validated bounds.'
+                        }
+                    }
+                    if ($entryBytes -ne $entry.Length -or ($path.EndsWith('/') -and $entryBytes -ne 0)) {
+                        throw 'Expanded entry does not match its declared length.'
+                    }
+                }
+                catch { throw 'Function package contains unreadable or inconsistent entry data.' }
+                finally { if ($null -ne $entryStream) { $entryStream.Dispose() } }
+                if (-not $path.EndsWith('/')) {
+                    $filePaths.Add($path) | Out-Null
+                    if ($entryBytes -gt 0) { $files.Add($path) | Out-Null }
+                }
+            }
+            foreach ($path in $paths) {
+                $ancestor = $path
+                while ($ancestor.Contains('/')) {
+                    $ancestor = $ancestor.Substring(0, $ancestor.LastIndexOf('/'))
+                    if ($filePaths.Contains($ancestor)) {
+                        throw 'Function package contains conflicting file and directory paths.'
+                    }
+                }
+            }
+            foreach ($required in @('host.json', 'function_app.py', 'requirements.txt')) {
+                if (-not $files.Contains($required)) {
+                    throw 'Function package requires nonempty host.json, function_app.py and requirements.txt at its root.'
+                }
+            }
+            return [ordered]@{
+                action      = 'validated-package-only'
+                packageHash = $actualHash
+                entryCount  = $archive.Entries.Count
+            }
+        }
+        finally { $archive.Dispose() }
+    }
+    finally { $stream.Dispose() }
+}
+
+function Assert-FunctionTarget {
+    $appName = Get-RequiredValue 'FunctionAppName' $FunctionAppName
+    if ($appName -cnotmatch '^[a-zA-Z0-9][a-zA-Z0-9-]{0,58}[a-zA-Z0-9]$' -or
+        $FunctionAppName -cne $appName) {
+        throw 'FunctionAppName must be an explicit valid main-site name.'
+    }
+    $version = azd version 2>$null
+    if ($LASTEXITCODE -ne 0 -or ($version -join "`n") -notmatch '^azd version 1\.34\.[01](?: |$)') {
+        throw 'Function target resolution requires reviewed azd version 1.34.0 or 1.34.1.'
+    }
+    $bindings = [ordered]@{
+        AZURE_SUBSCRIPTION_ID          = $SubscriptionId
+        FUNCTION_DEPLOY_RESOURCE_GROUP = $ResourceGroup
+        FUNCTION_DEPLOY_APP_NAME       = $appName
+    }
+    foreach ($key in $bindings.Keys) {
+        $stored = @(azd env get-value $key --environment $AzdEnvironment 2>$null)
+        if ($LASTEXITCODE -ne 0 -or $stored.Count -ne 1 -or
+            [string]::IsNullOrWhiteSpace($stored[0]) -or
+            $stored[0] -cne $stored[0].Trim() -or $stored[0] -ine $bindings[$key]) {
+            throw "Stored azd $key does not match the reviewed Function target."
+        }
+    }
+}
+
+function Invoke-FunctionDeployment {
+    $packageStream = $null
+    Push-Location $ProjectRoot
+    try {
+        Assert-FunctionTarget
+        $package = $null
+        $packagePath = $null
+        if (-not [string]::IsNullOrEmpty($FunctionPackagePath) -or
+            -not [string]::IsNullOrEmpty($ExpectedFunctionPackageHash)) {
+            $package = Test-FunctionPackage
+            $packagePath = (Resolve-Path -LiteralPath $FunctionPackagePath).Path
+            $packageStream = [IO.File]::Open($packagePath, [IO.FileMode]::Open,
+                [IO.FileAccess]::Read, [IO.FileShare]::Read)
+            $lockedHash = (Get-FileHash -InputStream $packageStream -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($lockedHash -cne $package.packageHash) { throw 'Function package changed after validation.' }
+        }
+        if (-not $Execute) {
+            $preview = [ordered]@{ action = 'preview'; service = 'rag-functions'; environment = $AzdEnvironment }
+            if ($null -ne $package) { $preview.packageHash = $package.packageHash }
+            $preview | ConvertTo-Json -Compress
+            return
+        }
+        Assert-Authority -Authority (Get-Authority) | Out-Null
+        Assert-FunctionTarget
+        $arguments = @('deploy', 'rag-functions', '--environment', $AzdEnvironment, '--no-prompt')
+        if ($null -ne $packagePath) { $arguments += @('--from-package', $packagePath) }
+        azd @arguments
+        if ($LASTEXITCODE -ne 0) { throw 'Function deployment failed.' }
+    }
+    finally {
+        if ($null -ne $packageStream) { $packageStream.Dispose() }
+        Pop-Location
+    }
 }
 
 function Assert-Target {
@@ -832,6 +990,14 @@ function Remove-OperationsJob {
     [ordered]@{ action = 'deleted'; jobName = $jobName; deploymentInstanceId = $DeploymentInstanceId } | ConvertTo-Json -Compress
 }
 
+if ($Phase -notin @('FunctionPackage', 'Function') -and
+    ($PSBoundParameters.ContainsKey('FunctionPackagePath') -or
+    $PSBoundParameters.ContainsKey('ExpectedFunctionPackageHash'))) {
+    throw 'Package arguments are supported only by FunctionPackage and Function phases.'
+}
+if ($Phase -eq 'FunctionPackage' -and $Execute) {
+    throw 'FunctionPackage is local validation only; Execute is not supported.'
+}
 $authority = Get-Authority
 if ($Phase -eq 'Authority') {
     $authority | ConvertTo-Json -Compress
@@ -839,6 +1005,10 @@ if ($Phase -eq 'Authority') {
 }
 
 Assert-Authority -Authority $authority | Out-Null
+if ($Phase -eq 'FunctionPackage') {
+    Test-FunctionPackage | ConvertTo-Json -Compress
+    return
+}
 if (
     -not [string]::IsNullOrWhiteSpace($TemporaryContentUnderstandingClientIp) -and
     $Phase -ne 'Final'
@@ -846,6 +1016,10 @@ if (
     throw 'TemporaryContentUnderstandingClientIp is supported only for the Final phase.'
 }
 Assert-Target
+if ($Phase -eq 'Function') {
+    Invoke-FunctionDeployment
+    return
+}
 Import-AzdEnvironment
 Set-ParameterEnvironment
 
@@ -857,12 +1031,4 @@ switch ($Phase) {
     'CatalogVerify' { Test-CatalogJob }
     'OperationsCleanup' { Remove-OperationsJob }
     'Final' { Invoke-InfrastructurePhase -Serving $true -Operations $false }
-    'Function' {
-        if (-not $Execute) {
-            [ordered]@{ action = 'preview'; service = 'rag-functions'; environment = $AzdEnvironment } | ConvertTo-Json -Compress
-            return
-        }
-        azd deploy rag-functions --environment $AzdEnvironment --no-prompt
-        if ($LASTEXITCODE -ne 0) { throw 'Function deployment failed.' }
-    }
 }

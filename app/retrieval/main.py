@@ -33,7 +33,7 @@ from retrieval.auth import (
     principal_from_gateway,
     parse_gateway_request_id,
 )
-from retrieval.catalog import CatalogError, RequestPolicy, RuntimeCatalogLoader
+from retrieval.catalog import RequestPolicy, RuntimeCatalogLoader
 from retrieval.config import RetrievalConfig, load_retrieval_config
 from retrieval.cosmos import RetrievalMode, RetrievedChunk
 from retrieval.cosmos_registry import CosmosRegistry, build_cosmos_registry, load_cosmos_instance_configs
@@ -128,7 +128,12 @@ async def _lifespan(app: FastAPI):
             default_chunks_container=config.cosmos_chunks_container,
             default_manifests_container=config.cosmos_manifests_container,
         )
-        registry = build_cosmos_registry(instance_configs, credential, acl_enabled=config.acl_enabled)
+        registry = build_cosmos_registry(
+            instance_configs, credential, acl_enabled=config.acl_enabled,
+            audio_retrieval_enabled=config.audio_retrieval_enabled,
+            audio_max_acl_age_seconds=config.audio_max_acl_age_seconds,
+            audio_max_source_age_seconds=config.audio_max_source_age_seconds,
+        )
         resources.callback(_close_resource, registry)
 
         cosmos = CosmosClient(url=config.cosmos_endpoint, credential=credential)
@@ -416,6 +421,9 @@ class Citation(BaseModel):
     source_name: str
     location: str
     url: str
+    start_ms: int | None = Field(default=None, ge=0, strict=True)
+    end_ms: int | None = Field(default=None, gt=0, strict=True)
+    evidence_version: str | None = None
 
 
 class QueryResponse(BaseModel):
@@ -430,10 +438,13 @@ def _citation_from_result(index: int, chunk: Mapping[str, Any]) -> Citation:
         source_name=str(chunk["source_name"]),
         location=citation_location(chunk),
         url=citation_url(chunk),
+        start_ms=chunk.get("start_ms"),
+        end_ms=chunk.get("end_ms"),
+        evidence_version=chunk.get("evidence_version"),
     )
 
 
-@app.post("/api/query", response_model=QueryResponse)
+@app.post("/api/query", response_model=QueryResponse, response_model_exclude_none=True)
 async def query(request: Request, body: QueryRequest, background_tasks: BackgroundTasks):
     principal = await asyncio.to_thread(_resolve_principal, request)
     request_id_headers = request.headers.getlist(GATEWAY_REQUEST_ID_HEADER)

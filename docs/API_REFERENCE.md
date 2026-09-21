@@ -22,7 +22,7 @@ For the complete deployment and runtime environment-variable inventory, see [CON
 
 ## Authentication
 
-The Function App uses **App Service Authentication (EasyAuth)** with Microsoft Entra ID. Every non-webhook endpoint requires an authenticated Bearer token with the exact configured audience from an allowed client application. All Function routes use `AuthLevel.ANONYMOUS`; Function keys do not replace EasyAuth authentication. The `/api/query` gateway adds stricter application validation and requires delegated user claims with `user_impersonation`; ingestion and administrative routes do not currently enforce delegated scope or a per-user admin role.
+The Function App uses **App Service Authentication (EasyAuth)** with Microsoft Entra ID. Every non-webhook endpoint requires an authenticated Bearer token with the exact configured audience from an allowed client application. All Function routes use `AuthLevel.ANONYMOUS`; Function keys do not replace EasyAuth authentication. The `/api/query` gateway adds stricter application validation and requires delegated user claims with `user_impersonation`; other ingestion and administrative routes do not currently enforce delegated scope or a per-user admin role.
 
 ### Bearer Token
 
@@ -413,8 +413,15 @@ The deployed example catalog defines:
 | `citations` | `array<object>` | Ordered evidence metadata, including sources not referenced in the answer. Empty for refusal or when `INCLUDE_CITATIONS=false`. |
 | `citations[].ref` | string | Stable source label available to `[S#]` references in `answer` |
 | `citations[].source_name` | string | Original file name |
-| `citations[].url` | string | SharePoint URL with `#page=N` fragment |
+| `citations[].location` | string | Human-readable source locator, such as a page, slide, section, worksheet, or audio time range. |
+| `citations[].url` | string | Source URL; only PDF page locators append `#page=N`. Audio URLs do not promise time seeking or historical-version playback. |
+| `citations[].start_ms` | integer, optional | Audio evidence start offset in milliseconds; absent for document citations. |
+| `citations[].end_ms` | integer, optional | Audio evidence end offset in milliseconds; absent for document citations. |
+| `citations[].evidence_version` | string, optional | Source version bound to audio evidence; absent for document citations. |
 | `request_id` | string | UUID for log correlation |
+
+Temporal citation fields are reader-first contracts. Audio discovery and transcription
+are not yet implemented; see the default-disabled [retrieval settings](CONFIGURATION.md#retrieval-behavior-and-limits).
 
 Both generation paths validate references before applying `INCLUDE_CITATIONS`.
 With evidence, a non-refusal answer must contain at least one canonical reference

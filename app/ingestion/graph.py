@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -12,7 +11,7 @@ from urllib.parse import quote, unquote, unquote_to_bytes, urlparse, urlsplit
 import httpx
 
 from ingestion.errors import TerminalDocumentError
-from ingestion.models import ScaleLimits
+from ingestion.models import ACL_POLICY_VERSION, ScaleLimits, verified_acl_hash
 
 
 GRAPH_ROOT = "https://graph.microsoft.com/v1.0"
@@ -29,7 +28,6 @@ DOWNLOAD_HOST_SUFFIXES = (
 )
 CHILDREN_SELECT = "id,name,eTag,size,file,folder,package,parentReference,webUrl,lastModifiedDateTime"
 SUPPORTED_ACL_ROLES = frozenset({"read", "write", "owner"})
-ACL_POLICY_VERSION = "verified-entra-security-groups-v1"
 SUPPORTED_SOURCE_MIME_TYPES: dict[str, frozenset[str]] = {
     ".md": frozenset({"text/markdown", "text/plain", "application/octet-stream"}),
     ".pdf": frozenset({"application/pdf"}),
@@ -42,8 +40,20 @@ SUPPORTED_SOURCE_MIME_TYPES: dict[str, frozenset[str]] = {
     ".xlsx": frozenset(
         {"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"}
     ),
+    ".wav": frozenset({"audio/wav"}),
+    ".mp3": frozenset({"audio/mpeg"}),
+    ".flac": frozenset({"audio/flac"}),
 }
 SUPPORTED_SOURCE_EXTENSIONS = tuple(SUPPORTED_SOURCE_MIME_TYPES)
+# Microsoft Graph file.mimeType is server-determined and not documented per extension
+# (https://learn.microsoft.com/en-us/graph/api/resources/file), so audio is gated on the
+# documented file name/extension and the stored MIME is canonicalized here. Values must
+# match models.SUPPORTED_AUDIO_MIME_TYPES.
+AUDIO_SOURCE_MIME_TYPES: dict[str, str] = {
+    ".wav": "audio/wav",
+    ".mp3": "audio/mpeg",
+    ".flac": "audio/flac",
+}
 PDF_SIGNATURE = b"%PDF-"
 ZIP_SIGNATURES = (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")
 MARKDOWN_IMAGE_MIME_TYPE = "image/png"
@@ -319,8 +329,7 @@ def discovered_pdf_from_item(item: dict[str, Any], ordinal: int) -> DiscoveredPd
         file_metadata.get("mimeType") if isinstance(file_metadata, dict) else None
     )
     resolve_source_format(name, graph_mime)
-    assert isinstance(graph_mime, str)
-    normalized_mime = graph_mime.split(";", 1)[0].strip().lower()
+    normalized_mime = canonical_source_mime(name, graph_mime)
     size_bytes = item.get("size")
     if isinstance(size_bytes, bool) or not isinstance(size_bytes, int) or size_bytes < 0:
         raise ValueError("Graph PDF has an invalid size")
@@ -342,14 +351,21 @@ def discovered_pdf_from_item(item: dict[str, Any], ordinal: int) -> DiscoveredPd
     )
 
 
-def resolve_source_format(name: str, graph_mime: str | None) -> str:
-    """Validate one supported source extension against Graph's MIME metadata."""
+def _source_extension(name: str) -> str:
     if not isinstance(name, str) or "." not in name:
         raise TerminalDocumentError("source_extension_missing")
-    extension = f".{name.rsplit('.', 1)[-1].strip().lower()}"
+    return f".{name.rsplit('.', 1)[-1].strip().lower()}"
+
+
+def resolve_source_format(name: str, graph_mime: str | None) -> str:
+    """Validate one supported source extension. Documents also cross-check Graph's MIME;
+    audio is gated on the extension because Graph's mimeType is server-determined."""
+    extension = _source_extension(name)
     allowed_mimes = SUPPORTED_SOURCE_MIME_TYPES.get(extension)
     if allowed_mimes is None:
         raise TerminalDocumentError(f"source_extension_not_allowed:{extension}")
+    if extension in AUDIO_SOURCE_MIME_TYPES:
+        return extension
     if not isinstance(graph_mime, str) or not graph_mime.strip():
         raise TerminalDocumentError("source_mime_missing")
     normalized_mime = graph_mime.split(";", 1)[0].strip().lower()
@@ -358,6 +374,16 @@ def resolve_source_format(name: str, graph_mime: str | None) -> str:
             f"source_mime_mismatch:{extension}:{normalized_mime}"
         )
     return extension
+
+
+def canonical_source_mime(name: str, graph_mime: str | None) -> str:
+    """Return the stored MIME: canonical-by-extension for audio, normalized Graph MIME for
+    documents. Call only after resolve_source_format has validated the source."""
+    extension = _source_extension(name)
+    if extension in AUDIO_SOURCE_MIME_TYPES:
+        return AUDIO_SOURCE_MIME_TYPES[extension]
+    assert isinstance(graph_mime, str)
+    return graph_mime.split(";", 1)[0].strip().lower()
 
 
 def validate_source_signature(source_format: str, content: bytes) -> None:
@@ -377,6 +403,9 @@ def validate_source_signature(source_format: str, content: bytes) -> None:
             content.decode("utf-8")
         except UnicodeDecodeError as error:
             raise TerminalDocumentError("source_signature_invalid:.md") from error
+        return
+    if source_format in (".wav", ".mp3", ".flac"):
+        # Speech fast transcription validates the actual audio format server-side.
         return
     raise TerminalDocumentError(f"source_signature_unknown:{source_format}")
 
@@ -858,9 +887,10 @@ def read_verified_acl(
     if not verified_group_ids:
         raise TerminalDocumentError("unsafe_acl:no_verified_security_groups")
     canonical = tuple(sorted(verified_group_ids))
-    digest = hashlib.sha256(
-        "\x1f".join((*canonical, ACL_POLICY_VERSION)).encode("utf-8")
-    ).hexdigest()
+    try:
+        digest = verified_acl_hash(canonical, ACL_POLICY_VERSION)
+    except ValueError:
+        raise TerminalDocumentError("unsafe_acl:invalid_verified_group_ids") from None
     return VerifiedAcl(canonical, digest)
 
 

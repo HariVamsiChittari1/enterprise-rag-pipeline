@@ -6,7 +6,9 @@ import os
 from pathlib import Path
 import re
 import shutil
+import struct
 import subprocess
+import zipfile
 
 import pytest
 
@@ -247,6 +249,7 @@ def test_function_package_excludes_local_python_environments_and_settings() -> N
     assert ".venv/" in patterns
     assert ".venv-*/" in patterns
     assert "local.settings.json" in patterns
+    assert "operations/" in patterns
 
 
 @pytest.fixture
@@ -291,6 +294,110 @@ def _run_authority(project: Path) -> subprocess.CompletedProcess[str]:
          "& './scripts/deploy.ps1' -Phase Authority"],
         cwd=project, capture_output=True, text=True, check=False,
     )
+
+
+@pytest.mark.parametrize(
+    ("case", "error"),
+    [
+        ("valid", None),
+        ("digest", "hash does not match"),
+        ("missing_hash", "ExpectedFunctionPackageHash is required"),
+        ("missing_root", "at its root"),
+        ("traversal", "unsafe or duplicate paths"),
+        ("duplicate", "unsafe or duplicate paths"),
+        ("local_settings", "excluded local or credential artifacts"),
+        ("environment", "excluded local or credential artifacts"),
+        ("certificate", "excluded local or credential artifacts"),
+        ("operations", "standalone operations tooling"),
+        ("operations_case", "standalone operations tooling"),
+        ("execute", "Execute is not supported"),
+        ("wrong_phase", "supported only by FunctionPackage and Function"),
+        ("source_hash", "Source tree hash changed"),
+        ("plan_hash", "Deployment plan hash changed"),
+        ("ancestor_first", "conflicting file and directory paths"),
+        ("ancestor_last", "conflicting file and directory paths"),
+        ("unreadable", "unreadable or inconsistent entry data"),
+        ("empty_root", "at its root"),
+        ("symlink", "unsupported filesystem entry types"),
+        ("expanded_size", "expanded preflight limit"),
+        ("entry_count", "4096-entry preflight limit"),
+    ],
+)
+def test_function_package_preflight_is_local_and_fail_closed(
+    authority_project: Path, case: str, error: str | None,
+) -> None:
+    powershell = shutil.which("pwsh") or shutil.which("powershell")
+    if powershell is None:
+        pytest.skip("PowerShell is required for deployment controller tests")
+    package = authority_project / ".azure" / "candidate.zip"
+    entries = {"host.json": b"{}", "function_app.py": b"pass", "requirements.txt": b"soundfile==0.14.0"}
+    if case == "missing_root":
+        entries = {f"app/{name}": value for name, value in entries.items()}
+    additions = {
+        "traversal": "../escape.py", "duplicate": "HOST.JSON",
+        "local_settings": "local.settings.json", "environment": "nested/.env.test",
+        "certificate": "nested/private.pfx",
+        "operations": "operations/storage_probe.py",
+        "operations_case": "OPERATIONS/Dockerfile",
+    }
+    if case in additions:
+        entries[additions[case]] = b"synthetic"
+    if case == "ancestor_first":
+        entries["host.json/child.py"] = b"pass"
+    if case == "ancestor_last":
+        entries = {"host.json/child.py": b"pass", **entries}
+    if case == "empty_root":
+        entries["host.json"] = b""
+    if case == "entry_count":
+        entries.update({f"extra/{index}.py": b"pass" for index in range(4094)})
+    with zipfile.ZipFile(package, "w") as archive:
+        for name, content in entries.items():
+            archive.writestr(name, content)
+        if case == "symlink":
+            symlink = zipfile.ZipInfo("linked.py")
+            symlink.create_system = 3
+            symlink.external_attr = 0o120777 << 16
+            archive.writestr(symlink, "function_app.py")
+    if case == "unreadable":
+        payload = bytearray(package.read_bytes())
+        payload[:4] = b"BAD!"
+        package.write_bytes(payload)
+    if case == "expanded_size":
+        payload = bytearray(package.read_bytes())
+        directory_offset = payload.index(b"PK\x01\x02")
+        struct.pack_into("<I", payload, directory_offset + 24, 256 * 1024 * 1024 + 1)
+        package.write_bytes(payload)
+    authority_result = _run_authority(authority_project)
+    assert authority_result.returncode == 0, authority_result.stderr
+    authority = json.loads(authority_result.stdout)
+    digest = hashlib.sha256(package.read_bytes()).hexdigest()
+    command = (
+        "function az { throw 'Unexpected Azure call' }; "
+        "function azd { throw 'Unexpected azd call' }; "
+        "& './scripts/deploy.ps1' "
+        f"-Phase {'Build' if case == 'wrong_phase' else 'FunctionPackage'} "
+        f"-ExpectedPlanHash {'0' * 64 if case == 'plan_hash' else authority['planHash']} "
+        f"-ExpectedSourceTreeHash {'0' * 64 if case == 'source_hash' else authority['sourceTreeHash']} "
+        "-FunctionPackagePath './.azure/candidate.zip' "
+    )
+    if case != "missing_hash":
+        command += f"-ExpectedFunctionPackageHash {'0' * 64 if case == 'digest' else digest} "
+    if case == "execute":
+        command += "-Execute"
+    result = subprocess.run(
+        [powershell, "-NoProfile", "-NonInteractive", "-Command", command],
+        cwd=authority_project, capture_output=True, text=True, check=False,
+    )
+    if error is None:
+        assert result.returncode == 0, result.stderr
+        assert json.loads(result.stdout) == {
+            "action": "validated-package-only", "packageHash": digest, "entryCount": 3,
+        }
+    else:
+        assert result.returncode != 0
+        assert error in result.stderr
+    assert "Unexpected Azure call" not in result.stderr
+    assert "Unexpected azd call" not in result.stderr
 
 
 def test_authority_mode_is_local_and_machine_readable(authority_project: Path) -> None:
@@ -402,6 +509,156 @@ $env:OPERATIONS_MANAGED_IDENTITY_CLIENT_ID = 'synthetic-client'
     )
 
 
+def test_function_target_uses_explicit_yaml_binding() -> None:
+    import yaml
+
+    configuration = yaml.safe_load((PROJECT_ROOT / "azure.yaml").read_text(encoding="utf-8"))
+    service = configuration["services"]["rag-functions"]
+    assert service["resourceGroup"] == "${FUNCTION_DEPLOY_RESOURCE_GROUP}"
+    assert service["resourceName"] == "${FUNCTION_DEPLOY_APP_NAME}"
+    assert service["host"] == "function"
+    assert service["project"] == "./app"
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["valid", "valid_1340", "missing_app", "invalid_app", "version", "missing", "blank", "whitespace",
+     "multiple", "subscription", "group", "app"],
+)
+def test_function_target_fails_closed_without_cloud_calls(case: str) -> None:
+    body = r"""
+$FunctionAppName = 'synthetic-app'
+$SubscriptionId = '11111111-1111-4111-8111-111111111111'
+$ResourceGroup = 'synthetic-group'
+$AzdEnvironment = 'synthetic-env'
+$case = 'CASE'
+if ($case -eq 'missing_app') { $FunctionAppName = '' }
+if ($case -eq 'invalid_app') { $FunctionAppName = 'app/slots/staging' }
+$script:reads = 0
+function azd {
+    $global:LASTEXITCODE = 0
+    if ($args[0] -eq 'version') {
+        if ($case -eq 'version') { return 'azd version 0.0.0' }
+        if ($case -eq 'valid_1340') { return 'azd version 1.34.0 (commit synthetic) (stable)' }
+        return 'azd version 1.34.1 (commit synthetic)'
+    }
+    if (($args[0..1] -join ' ') -ne 'env get-value' -or
+        ($args[3..4] -join ' ') -ne '--environment synthetic-env') { throw 'Unexpected azd call' }
+    $script:reads++
+    if ($case -eq 'missing') { $global:LASTEXITCODE = 1; return '' }
+    if ($case -eq 'blank') { return '' }
+    if ($case -eq 'multiple') { return @('first', 'second') }
+    switch ($args[2]) {
+        'AZURE_SUBSCRIPTION_ID' {
+            if ($case -eq 'subscription') { return 'other' }
+            return $SubscriptionId
+        }
+        'FUNCTION_DEPLOY_RESOURCE_GROUP' {
+            if ($case -eq 'group') { return 'other' }
+            return $ResourceGroup
+        }
+        'FUNCTION_DEPLOY_APP_NAME' {
+            if ($case -eq 'app') { return 'other' }
+            if ($case -eq 'whitespace') { return ' synthetic-app ' }
+            return 'synthetic-app'
+        }
+        default { throw 'Unexpected setting' }
+    }
+}
+Assert-FunctionTarget
+if ($script:reads -ne 3) { throw 'Bindings were not all checked' }
+Write-Output 'verified'
+""".replace("CASE", case)
+    result = _run_controller_functions(body)
+    if case in {"valid", "valid_1340"}:
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "verified"
+    else:
+        assert result.returncode != 0
+        assert any(message in result.stderr for message in (
+            "FunctionAppName", "reviewed azd version", "does not match the reviewed Function target",
+        ))
+    assert "Unexpected Azure call" not in result.stderr
+    assert "Unexpected azd call" not in result.stderr
+
+
+@pytest.mark.parametrize(
+    "case", ["preview", "execute", "mismatch", "target", "target_recheck", "replaced",
+             "authority", "deploy_failure"],
+)
+def test_function_candidate_deployment_is_guarded(tmp_path: Path, case: str) -> None:
+    package = tmp_path / "candidate.zip"
+    with zipfile.ZipFile(package, "w") as archive:
+        for name in ("host.json", "function_app.py", "requirements.txt"):
+            archive.writestr(name, "synthetic")
+    digest = hashlib.sha256(package.read_bytes()).hexdigest()
+    body = r"""
+$ProjectRoot = (Get-Location).Path
+$FunctionPackagePath = 'PACKAGE'
+$ExpectedFunctionPackageHash = 'HASH'
+$AzdEnvironment = 'synthetic-env'
+$case = 'CASE'
+$Execute = $case -ne 'preview'
+$script:checks = 0
+function Assert-FunctionTarget {
+    $script:checks++
+    if ($case -eq 'target' -or ($case -eq 'target_recheck' -and $script:checks -eq 2)) {
+        throw 'target rejected'
+    }
+}
+if ($case -eq 'replaced') {
+    $script:originalValidator = ${function:Test-FunctionPackage}
+    function Test-FunctionPackage {
+        $validated = & $script:originalValidator
+        [IO.File]::AppendAllText($FunctionPackagePath, 'synthetic replacement')
+        return $validated
+    }
+}
+function Get-Authority { return @{} }
+function Assert-Authority {
+    param($Authority)
+    if ($case -eq 'authority') { throw 'authority rejected' }
+}
+function azd {
+    if ($script:checks -ne 2) { throw 'Missing target recheck' }
+    if (($args[0..4] -join '|') -cne 'deploy|rag-functions|--environment|synthetic-env|--no-prompt' -or
+        $args.Count -ne 7 -or $args[5] -ne '--from-package' -or $args[6] -ne $FunctionPackagePath) {
+        throw 'Unexpected deployment arguments'
+    }
+    if ((Get-Location).Path -ne $ProjectRoot) { throw 'Wrong project root' }
+    if ($null -eq $packageStream -or -not $packageStream.CanRead) { throw 'Missing package read handle' }
+    $global:LASTEXITCODE = 0
+    if ($case -eq 'deploy_failure') { $global:LASTEXITCODE = 1 }
+    Write-Output 'mock-deployed'
+}
+try { Invoke-FunctionDeployment }
+finally {
+    $releaseCheck = [IO.File]::Open($FunctionPackagePath, 'Open', 'ReadWrite', 'None')
+    $releaseCheck.Dispose()
+}
+""".replace("PACKAGE", str(package).replace("'", "''")).replace(
+        "HASH", "0" * 64 if case == "mismatch" else digest,
+    ).replace("CASE", case)
+    result = _run_controller_functions(body)
+    if case == "preview":
+        assert result.returncode == 0, result.stderr
+        assert json.loads(result.stdout)["packageHash"] == digest
+        assert "mock-deployed" not in result.stdout
+    elif case == "execute":
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "mock-deployed"
+    else:
+        assert result.returncode != 0
+        expected = {
+            "mismatch": "hash does not match", "target": "target rejected",
+            "target_recheck": "target rejected", "replaced": "changed after validation",
+            "authority": "authority rejected", "deploy_failure": "Function deployment failed",
+        }[case]
+        assert expected in result.stderr
+        if case != "deploy_failure":
+            assert "mock-deployed" not in result.stdout
+
+
 @pytest.mark.parametrize("poll", ["60", "7200", "86400"])
 def test_catalog_poll_accepts_inclusive_integer_bounds(poll: str) -> None:
     result = _run_controller_functions(
@@ -419,6 +676,21 @@ def test_catalog_poll_rejects_invalid_explicit_values(poll: str) -> None:
     )
     assert result.returncode != 0
     assert "must be an integer" in result.stderr
+
+
+@pytest.mark.parametrize("phase", ["Function"])
+def test_function_dispatch_does_not_import_unrelated_infrastructure(phase: str) -> None:
+    source = SCRIPT.read_text(encoding="utf-8")
+    dispatch = source[source.index("Assert-Target\nif ($Phase") :]
+    result = _run_controller_functions(r"""
+$Phase = 'Function'
+function Assert-Target { Write-Output 'target-checked' }
+function Invoke-FunctionDeployment { Write-Output 'function-dispatched' }
+function Import-AzdEnvironment { throw 'Unrelated environment import' }
+function Set-ParameterEnvironment { throw 'Unrelated infrastructure setup' }
+""".replace("$Phase = 'Function'", f"$Phase = '{phase}'") + dispatch)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == ["target-checked", "function-dispatched"]
 
 
 def test_catalog_poll_defaults_only_when_absent() -> None:

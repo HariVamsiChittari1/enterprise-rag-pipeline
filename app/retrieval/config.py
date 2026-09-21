@@ -24,6 +24,15 @@ def parse_catalog_poll_seconds(raw: str | None) -> int:
     return seconds
 
 
+def _optional_positive_seconds(name: str) -> int | None:
+    value = os.getenv(name)
+    if value is None:
+        return None
+    if not value.isascii() or not value.isdecimal() or int(value) <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return int(value)
+
+
 @dataclass(frozen=True)
 class RetrievalConfig:
     cosmos_endpoint: str
@@ -55,9 +64,26 @@ class RetrievalConfig:
     catalog_poll_seconds: int = 7200
     catalog_container: str = "retrieval-config"
     operation_timeout_seconds: float = 27.0
+    audio_retrieval_enabled: bool = False
+    audio_max_acl_age_seconds: int | None = None
+    audio_max_source_age_seconds: int | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.audio_retrieval_enabled) is not bool:
+            raise ValueError("AUDIO_RETRIEVAL_ENABLED must be true or false")
+        if self.audio_retrieval_enabled and (
+            not self.acl_enabled
+            or any(type(value) is not int or value <= 0 for value in (
+                self.audio_max_acl_age_seconds, self.audio_max_source_age_seconds,
+            ))
+        ):
+            raise ValueError("audio_requires_acl_and_freshness_limits")
 
 
 def load_retrieval_config() -> RetrievalConfig:
+    audio_enabled = os.getenv("AUDIO_RETRIEVAL_ENABLED", "false").strip().lower()
+    if audio_enabled not in ("true", "false"):
+        raise ValueError("AUDIO_RETRIEVAL_ENABLED must be true or false")
     return RetrievalConfig(
         cosmos_endpoint=_required("COSMOS_ENDPOINT"),
         cosmos_database=_required("COSMOS_DATABASE"),
@@ -90,4 +116,7 @@ def load_retrieval_config() -> RetrievalConfig:
         catalog_poll_seconds=parse_catalog_poll_seconds(os.getenv("RETRIEVAL_CATALOG_POLL_SECONDS")),
         catalog_container=os.getenv("RETRIEVAL_CONFIG_CONTAINER", "retrieval-config").strip() or "retrieval-config",
         operation_timeout_seconds=float(os.getenv("RETRIEVAL_OPERATION_TIMEOUT_SECONDS", "27.0")),
+        audio_retrieval_enabled=audio_enabled == "true",
+        audio_max_acl_age_seconds=_optional_positive_seconds("AUDIO_MAX_ACL_AGE_SECONDS"),
+        audio_max_source_age_seconds=_optional_positive_seconds("AUDIO_MAX_SOURCE_AGE_SECONDS"),
     )

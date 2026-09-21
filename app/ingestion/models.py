@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass, field, fields, is_dataclass
+import re
+from dataclasses import dataclass, field, fields, is_dataclass, replace
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Mapping
 
 
 SCHEMA_VERSION = 1
+SUPPORTED_AUDIO_MIME_TYPES = frozenset({"audio/wav", "audio/mpeg", "audio/flac"})
 SOURCE_CONTROL_ID = "source-control"
 SOURCE_DOCUMENT_RECORD_TYPE = "source_document"
 VISUAL_MANIFEST_PAGE_RECORD_TYPE = "visual_manifest_page"
@@ -94,16 +96,19 @@ class LocatorKind(str, Enum):
     SECTION = "section"
     SLIDE = "slide"
     WORKSHEET = "worksheet"
+    TIME = "time"
 
 
 class ContentModality(str, Enum):
     TEXT = "text"
     VISUAL_DESCRIPTION = "visual_description"
+    AUDIO_TRANSCRIPT = "audio_transcript"
 
 
 class ExtractionProvenance(str, Enum):
     DIRECT = "direct"
     RENDERED = "rendered"
+    TRANSCRIBED = "transcribed"
 
 
 class VisualCoverageStatus(str, Enum):
@@ -132,6 +137,8 @@ class SourceLocator:
     label: str
     ordinal_start: int
     ordinal_end: int
+    start_ms: int | None = field(default=None, metadata={"omit_none": True})
+    end_ms: int | None = field(default=None, metadata={"omit_none": True})
 
     def __post_init__(self) -> None:
         if not isinstance(self.kind, LocatorKind):
@@ -139,6 +146,10 @@ class SourceLocator:
         _require_text("locator label", self.label, 200)
         if self.ordinal_start < 1 or self.ordinal_end < self.ordinal_start:
             raise ValueError("locator ordinal range is invalid")
+        if self.kind is LocatorKind.TIME:
+            _validate_time_range(self.start_ms, self.end_ms, 1_800_000)
+        elif self.start_ms is not None or self.end_ms is not None:
+            raise ValueError("only time locators accept timestamps")
 
 
 @dataclass(frozen=True)
@@ -514,6 +525,217 @@ class IngestionRunRecord:
 
 
 @dataclass(frozen=True)
+class AudioMetadata:
+    """Validated media and transcription identity shared by audio manifests and chunks."""
+
+    duration_ms: int
+    channel_count: int | None = field(metadata={"omit_none": True})
+    locale: str
+    mode: str
+    api_version: str
+    profile_version: str
+    source_version: str
+    source_content_hash: str
+
+    def __post_init__(self) -> None:
+        if type(self.duration_ms) is not int or not 0 < self.duration_ms <= 1_800_000:
+            raise ValueError("audio duration is out of range")
+        if self.channel_count is not None and (
+            type(self.channel_count) is not int or self.channel_count not in (1, 2)
+        ):
+            raise ValueError("audio channel count is invalid")
+        if not isinstance(self.locale, str) or re.fullmatch(r"en-[A-Z]{2}", self.locale) is None:
+            raise ValueError("audio requires an English locale")
+        if self.mode not in ("fast", "enhanced") or self.api_version != "2025-10-15":
+            raise ValueError("audio transcription profile is unsupported")
+        _require_text("audio profile version", self.profile_version, 200)
+        _require_text("audio source version", self.source_version, 500)
+        _require_text("audio source content hash", self.source_content_hash, 64)
+        _require_sha256("audio source content hash", self.source_content_hash)
+
+
+class AudioOperationState(str, Enum):
+    VALIDATED = "validated"
+    SUBMITTING = "submitting"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class AudioOperationRecord:
+    """Run-independent ownership metadata; no transcript or source content."""
+
+    source_id: str
+    drive_id: str
+    item_id: str
+    audio: AudioMetadata
+    owner_id: str
+    ownership_epoch: int = 1
+    state: AudioOperationState = AudioOperationState.VALIDATED
+
+    def __post_init__(self) -> None:
+        create_audio_operation_id(self.source_id, self.drive_id, self.item_id, self.audio)
+        _require_text("audio owner id", self.owner_id, 200)
+        if type(self.ownership_epoch) is not int or self.ownership_epoch < 1:
+            raise ValueError("audio ownership epoch must be positive")
+        if not isinstance(self.state, AudioOperationState):
+            raise ValueError("audio operation state is invalid")
+
+    @property
+    def id(self) -> str:
+        return create_audio_operation_id(self.source_id, self.drive_id, self.item_id, self.audio)
+
+    @property
+    def source_run_id(self) -> str:
+        return create_audio_control_partition_id(self.source_id)
+
+    def to_cosmos_item(self) -> dict[str, Any]:
+        """Serialize an internal schema-1 operation in its reserved partition."""
+        return _serialize_dataclass(self) | {
+            "id": self.id, "sourceRunId": self.source_run_id,
+            "recordType": "audio_operation", "schemaVersion": 1,
+        }
+
+    def to_permit_item(self) -> dict[str, Any]:
+        """Bind the one-source admission permit to this exact owner and state."""
+        return {
+            "id": "audio-permit", "sourceRunId": self.source_run_id,
+            "sourceId": self.source_id, "recordType": "audio_permit", "schemaVersion": 1,
+            "operationId": self.id, "ownerId": self.owner_id,
+            "ownershipEpoch": self.ownership_epoch, "state": self.state.value,
+        }
+
+
+@dataclass(frozen=True)
+class AudioTranscriptSegment:
+    """One ordered phrase with provider timings, without inferred precision."""
+
+    ordinal: int
+    text: str
+    start_ms: int
+    end_ms: int
+
+    def __post_init__(self) -> None:
+        if type(self.ordinal) is not int or self.ordinal < 0:
+            raise ValueError("audio segment ordinal must be a nonnegative integer")
+        _require_text("audio segment text", self.text, MAX_DOCUMENT_ITEM_BYTES)
+        _validate_time_range(self.start_ms, self.end_ms, 1_800_000)
+
+
+@dataclass(frozen=True)
+class AudioTranscriptPage:
+    """Bounded internal page; validity does not imply a committed checkpoint."""
+
+    operation: AudioOperationRecord
+    source_run_id: str
+    page_index: int
+    page_count: int
+    segments: tuple[AudioTranscriptSegment, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.operation, AudioOperationRecord):
+            raise ValueError("audio page requires validated operation metadata")
+        _require_text("audio page partition", self.source_run_id, 301)
+        if (
+            type(self.page_index) is not int or type(self.page_count) is not int
+            or not 0 <= self.page_index < self.page_count
+        ):
+            raise ValueError("audio page position is invalid")
+        if not isinstance(self.segments, tuple) or not self.segments:
+            raise ValueError("audio page requires an immutable nonempty segment tuple")
+        if any(not isinstance(segment, AudioTranscriptSegment) for segment in self.segments):
+            raise ValueError("audio page contains an invalid segment")
+        first_ordinal = self.segments[0].ordinal
+        if self.page_index == 0 and first_ordinal != 0:
+            raise ValueError("first audio page must start at ordinal zero")
+        for offset, segment in enumerate(self.segments):
+            if segment.ordinal != first_ordinal + offset:
+                raise ValueError("audio page segment ordinals must be contiguous")
+            _validate_time_range(segment.start_ms, segment.end_ms, self.operation.audio.duration_ms)
+        if serialized_size_bytes(self.to_cosmos_item()) > MAX_DOCUMENT_ITEM_BYTES:
+            raise ValueError("audio transcript page exceeds 128 KiB")
+
+    @property
+    def id(self) -> str:
+        binding = json.dumps(
+            [self.operation.id, self.operation.owner_id, self.operation.ownership_epoch, self.page_index],
+            ensure_ascii=False, separators=(",", ":"),
+        )
+        return f"audio-transcript:{content_sha256(binding)}"
+
+    @property
+    def page_hash(self) -> str:
+        return content_sha256(json.dumps(self._payload(), ensure_ascii=False, separators=(",", ":")))
+
+    def _payload(self) -> dict[str, Any]:
+        return {
+            "id": self.id, "sourceRunId": self.source_run_id,
+            "recordType": "audio_transcript_page", "schemaVersion": SCHEMA_VERSION,
+            "operationId": self.operation.id, "ownerId": self.operation.owner_id,
+            "ownershipEpoch": self.operation.ownership_epoch,
+            "audio": _serialize_dataclass(self.operation.audio),
+            "pageIndex": self.page_index, "pageCount": self.page_count,
+            "segments": _serialize_dataclass(self.segments),
+        }
+
+    def to_cosmos_item(self) -> dict[str, Any]:
+        """Serialize the full binding and content with its deterministic digest."""
+        return self._payload() | {"pageHash": self.page_hash}
+
+
+@dataclass(frozen=True)
+class AudioTranscriptDescriptor:
+    """Verified checkpoint metadata, not a persisted commit or authorization grant."""
+
+    operation: AudioOperationRecord
+    pages_source_run_id: str
+    page_count: int
+    segment_count: int
+    total_bytes: int
+    transcript_hash: str
+    allowed_group_ids: tuple[str, ...]
+    acl_hash: str
+    acl_policy_version: str
+    acl_evaluated_at: str
+    source_verified_at: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.operation, AudioOperationRecord):
+            raise ValueError("audio descriptor requires validated operation metadata")
+        _require_text("audio page partition", self.pages_source_run_id, 301)
+        for name in ("page_count", "segment_count", "total_bytes"):
+            value = getattr(self, name)
+            if type(value) is not int or value < 1:
+                raise ValueError(f"audio descriptor {name} must be positive")
+        _require_text("transcript hash", self.transcript_hash, 64)
+        _require_sha256("transcript hash", self.transcript_hash)
+        if self.acl_hash != verified_acl_hash(self.allowed_group_ids, self.acl_policy_version):
+            raise ValueError("audio descriptor ACL hash does not match provenance")
+        for name in ("acl_evaluated_at", "source_verified_at"):
+            value = getattr(self, name)
+            _require_text(name, value, 100)
+            _require_utc(name, value)
+        if serialized_size_bytes(self.to_dict()) > MAX_DOCUMENT_ITEM_BYTES:
+            raise ValueError("audio transcript descriptor exceeds 128 KiB")
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize checkpoint metadata without text, mutable state, or Cosmos ETags."""
+        operation = self.operation
+        return {
+            "schemaVersion": SCHEMA_VERSION, "recordType": "audio_transcript_descriptor",
+            "sourceId": operation.source_id, "driveId": operation.drive_id,
+            "itemId": operation.item_id, "operationId": operation.id,
+            "audio": _serialize_dataclass(operation.audio),
+            "ownerId": operation.owner_id, "ownershipEpoch": operation.ownership_epoch,
+            "pagesSourceRunId": self.pages_source_run_id,
+            "pageCount": self.page_count, "segmentCount": self.segment_count,
+            "totalBytes": self.total_bytes, "transcriptHash": self.transcript_hash,
+            "allowedGroupIds": list(self.allowed_group_ids), "aclHash": self.acl_hash,
+            "aclPolicyVersion": self.acl_policy_version, "aclEvaluatedAt": self.acl_evaluated_at,
+            "sourceVerifiedAt": self.source_verified_at,
+        }
+
+
+@dataclass(frozen=True)
 class SourceDocumentRecord:
     source_id: str
     run_id: str
@@ -558,6 +780,8 @@ class SourceDocumentRecord:
     document_key: str = ""
     record_type: str = SOURCE_DOCUMENT_RECORD_TYPE
     schema_version: int = SCHEMA_VERSION
+    audio: AudioMetadata | None = field(default=None, metadata={"omit_none": True})
+    source_verified_at: str | None = field(default=None, metadata={"omit_none": True})
 
     def __post_init__(self) -> None:
         expected_document_id = create_document_id(self.source_id, self.drive_id, self.item_id)
@@ -569,7 +793,25 @@ class SourceDocumentRecord:
             raise ValueError("document run keys do not match their deterministic value")
         if self.record_type != SOURCE_DOCUMENT_RECORD_TYPE:
             raise ValueError("invalid source-document record type")
-        _require_schema_version(self.schema_version)
+        is_audio = self.mime_type in SUPPORTED_AUDIO_MIME_TYPES
+        if type(self.schema_version) is not int or self.schema_version != SCHEMA_VERSION:
+            raise ValueError("unsupported source-document schema version")
+        if is_audio:
+            if type(self.size_bytes) is not int or not 0 < self.size_bytes <= 100 * 1024 * 1024:
+                raise ValueError("audio size is out of range")
+            if self.audio is not None:
+                if not isinstance(self.audio, AudioMetadata):
+                    raise ValueError("audio metadata is invalid")
+                if self.audio.source_version != self.e_tag or self.audio.source_content_hash != self.content_hash:
+                    raise ValueError("audio metadata does not match source version")
+            if self.status in (DocumentStatus.ADMITTING, DocumentStatus.READY) and (
+                self.audio is None or self.source_verified_at is None
+            ):
+                raise ValueError("ready audio requires metadata and source verification")
+            if self.source_verified_at is not None:
+                _require_utc("source_verified_at", self.source_verified_at)
+        elif self.audio is not None or self.source_verified_at is not None:
+            raise ValueError("document schema does not accept audio fields")
         _validate_document_fields(self)
         _validate_sorted_unique("allowed_group_ids", self.allowed_group_ids, require_nonempty=True)
         _require_sha256("acl_hash", self.acl_hash)
@@ -668,8 +910,8 @@ class SearchChunkRecord:
     allowed_group_ids: tuple[str, ...]
     source_name: str
     source_url: str
-    page_start: int
-    page_end: int
+    page_start: int | None
+    page_end: int | None
     section_path: tuple[str, ...]
     locator_kind: LocatorKind
     locator_label: str
@@ -698,6 +940,9 @@ class SearchChunkRecord:
     id: str = ""
     source_run_id: str = ""
     schema_version: int = SCHEMA_VERSION
+    audio: AudioMetadata | None = field(default=None, metadata={"omit_none": True})
+    start_ms: int | None = field(default=None, metadata={"omit_none": True})
+    end_ms: int | None = field(default=None, metadata={"omit_none": True})
 
     def __post_init__(self) -> None:
         expected_id = create_chunk_id(self.chunk_index)
@@ -707,7 +952,30 @@ class SearchChunkRecord:
             raise ValueError("chunk identifiers do not match their deterministic value")
         if self.document_key != expected_document_key:
             raise ValueError("chunk document key does not match its deterministic value")
-        _require_schema_version(self.schema_version)
+        is_audio = self.locator_kind is LocatorKind.TIME
+        if type(self.schema_version) is not int or self.schema_version != SCHEMA_VERSION:
+            raise ValueError("unsupported chunk schema version")
+        if is_audio:
+            if not isinstance(self.audio, AudioMetadata):
+                raise ValueError("audio chunk requires metadata")
+            _validate_time_range(self.start_ms, self.end_ms, self.audio.duration_ms)
+            if (
+                self.page_start is not None or self.page_end is not None
+                or self.modalities != (ContentModality.TEXT, ContentModality.AUDIO_TRANSCRIPT)
+                or self.provenance != (ExtractionProvenance.TRANSCRIBED,)
+                or self.visual_coverage is not VisualCoverageStatus.NOT_REQUIRED
+            ):
+                raise ValueError("audio chunk cannot contain document-only fields")
+            if type(self.token_count) is not int or not 0 < self.token_count <= 800:
+                raise ValueError("audio chunk token count is out of range")
+            if type(self.chunk_index) is not int or not 0 <= self.chunk_index < 2000:
+                raise ValueError("audio chunk index is out of range")
+        elif (
+            self.audio is not None or self.start_ms is not None or self.end_ms is not None
+            or ContentModality.AUDIO_TRANSCRIPT in self.modalities
+            or ExtractionProvenance.TRANSCRIBED in self.provenance
+        ):
+            raise ValueError("document chunk does not accept audio fields")
         _validate_chunk_fields(self)
         if serialized_size_bytes(self.to_cosmos_item()) > MAX_CHUNK_ITEM_BYTES:
             raise ValueError("chunk item exceeds 256 KiB")
@@ -773,6 +1041,31 @@ def create_document_key(source_id: str, run_id: str, document_id: str) -> str:
     return f"{create_source_run_id(source_id, run_id)}:{document_id}"
 
 
+def create_audio_control_partition_id(source_id: str) -> str:
+    """Return a source-scoped control partition outside the source:run namespace."""
+    _require_text("source_id", source_id, 200)
+    return f"audio-control-{content_sha256(source_id)}"
+
+
+def create_audio_operation_id(
+    source_id: str,
+    drive_id: str,
+    item_id: str,
+    audio: AudioMetadata,
+) -> str:
+    """Identify a source/profile transcription operation independently of ingestion runs."""
+    document_id = create_document_id(source_id, drive_id, item_id)
+    if not isinstance(audio, AudioMetadata):
+        raise ValueError("audio operation requires validated audio metadata")
+    identity = json.dumps(
+        [document_id, audio.source_version, audio.source_content_hash,
+         audio.mode, audio.locale, audio.api_version, audio.profile_version],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return f"audio-operation:{content_sha256(identity)}"
+
+
 def create_chunk_id(chunk_index: int) -> str:
     if chunk_index < 0 or chunk_index > 999_999:
         raise ValueError("chunk_index must be between 0 and 999999")
@@ -833,6 +1126,142 @@ def create_visual_manifest_pages(
         )
         for page_index, page_entries in enumerate(grouped_entries)
     )
+
+
+ACL_POLICY_VERSION = "verified-entra-security-groups-v1"
+
+
+def verified_acl_hash(group_ids: tuple[str, ...], policy_version: str) -> str:
+    """Hash canonical ACL provenance without asserting current authorization."""
+    if policy_version != ACL_POLICY_VERSION:
+        raise ValueError("unsupported ACL policy version")
+    if not isinstance(group_ids, tuple):
+        raise ValueError("ACL groups must be an immutable tuple")
+    if any(not isinstance(group_id, str) for group_id in group_ids):
+        raise ValueError("ACL groups must contain strings")
+    _validate_sorted_unique("ACL groups", group_ids, require_nonempty=True)
+    if any("\x1f" in group_id for group_id in group_ids):
+        raise ValueError("ACL groups cannot contain the hash delimiter")
+    return content_sha256("\x1f".join((*group_ids, policy_version)))
+
+
+def audio_transcript_hash(
+    pages: tuple[AudioTranscriptPage, ...],
+    *,
+    max_pages: int,
+    max_segments: int,
+    max_total_bytes: int,
+) -> str:
+    """Validate declared completeness within caller budgets, not commitment or authorization."""
+    for name, limit in (
+        ("max_pages", max_pages), ("max_segments", max_segments),
+        ("max_total_bytes", max_total_bytes),
+    ):
+        if type(limit) is not int or limit < 1:
+            raise ValueError(f"{name} must be a positive integer")
+    if not isinstance(pages, tuple) or not pages:
+        raise ValueError("audio transcript requires an immutable nonempty page tuple")
+    if len(pages) > max_pages:
+        raise ValueError("audio transcript exceeds page limit")
+    expected_binding = None
+    segment_count = 0
+    total_bytes = 0
+    page_bindings: list[dict[str, str]] = []
+    for page_index, page in enumerate(pages):
+        if not isinstance(page, AudioTranscriptPage):
+            raise ValueError("audio transcript contains an invalid page")
+        if page.page_index != page_index or page.page_count != len(pages):
+            raise ValueError("audio transcript page positions or counts are inconsistent")
+        operation = page.operation
+        binding = (
+            operation.source_id, operation.drive_id, operation.item_id, operation.id,
+            operation.audio, operation.owner_id, operation.ownership_epoch, page.source_run_id,
+        )
+        if expected_binding is None:
+            expected_binding = binding
+        elif binding != expected_binding:
+            raise ValueError("audio transcript pages have inconsistent identity or ownership")
+        if segment_count + len(page.segments) > max_segments:
+            raise ValueError("audio transcript exceeds segment limit")
+        for segment in page.segments:
+            if segment.ordinal != segment_count:
+                raise ValueError("audio transcript segment ordinals must be contiguous from zero")
+            segment_count += 1
+        item = page.to_cosmos_item()
+        total_bytes += serialized_size_bytes(item)
+        if total_bytes > max_total_bytes:
+            raise ValueError("audio transcript exceeds total byte limit")
+        page_bindings.append({"id": item["id"], "pageHash": item["pageHash"]})
+    return content_sha256(json.dumps(page_bindings, ensure_ascii=False, separators=(",", ":")))
+
+
+def create_audio_transcript_descriptor(
+    expected_operation: AudioOperationRecord,
+    source: SourceDocumentRecord,
+    pages: tuple[AudioTranscriptPage, ...],
+    *,
+    acl_policy_version: str,
+    max_pages: int,
+    max_segments: int,
+    max_total_bytes: int,
+) -> AudioTranscriptDescriptor:
+    """Bind complete pages and recorded provenance to an independently expected operation."""
+    if not isinstance(expected_operation, AudioOperationRecord) or not isinstance(source, SourceDocumentRecord):
+        raise ValueError("audio descriptor requires validated operation and source records")
+    if (
+        (source.source_id, source.drive_id, source.item_id)
+        != (expected_operation.source_id, expected_operation.drive_id, expected_operation.item_id)
+        or source.audio != expected_operation.audio
+        or source.e_tag != expected_operation.audio.source_version
+        or source.content_hash != expected_operation.audio.source_content_hash
+    ):
+        raise ValueError("audio descriptor source does not match expected operation")
+    digest = audio_transcript_hash(
+        pages, max_pages=max_pages, max_segments=max_segments, max_total_bytes=max_total_bytes,
+    )
+    descriptor = AudioTranscriptDescriptor(
+        operation=expected_operation, pages_source_run_id=source.source_run_id,
+        page_count=len(pages), segment_count=sum(len(page.segments) for page in pages),
+        total_bytes=sum(serialized_size_bytes(page.to_cosmos_item()) for page in pages),
+        transcript_hash=digest, allowed_group_ids=source.allowed_group_ids,
+        acl_hash=source.acl_hash, acl_policy_version=acl_policy_version,
+        acl_evaluated_at=source.acl_evaluated_at, source_verified_at=source.source_verified_at,
+    )
+    verify_audio_transcript_descriptor(
+        descriptor, expected_operation, pages,
+        max_pages=max_pages, max_segments=max_segments, max_total_bytes=max_total_bytes,
+    )
+    return descriptor
+
+
+def verify_audio_transcript_descriptor(
+    descriptor: AudioTranscriptDescriptor,
+    expected_operation: AudioOperationRecord,
+    pages: tuple[AudioTranscriptPage, ...],
+    *,
+    max_pages: int,
+    max_segments: int,
+    max_total_bytes: int,
+) -> None:
+    """Check integrity against independent ownership, without proving commitment or freshness."""
+    if not isinstance(descriptor, AudioTranscriptDescriptor) or not isinstance(expected_operation, AudioOperationRecord):
+        raise ValueError("audio checkpoint requires validated descriptor and expected operation")
+    digest = audio_transcript_hash(
+        pages, max_pages=max_pages, max_segments=max_segments, max_total_bytes=max_total_bytes,
+    )
+    for operation in (descriptor.operation, pages[0].operation):
+        if replace(operation, state=AudioOperationState.VALIDATED) != replace(
+            expected_operation, state=AudioOperationState.VALIDATED,
+        ):
+            raise ValueError("audio checkpoint does not match expected operation")
+    if (
+        descriptor.pages_source_run_id != pages[0].source_run_id
+        or descriptor.page_count != len(pages)
+        or descriptor.segment_count != sum(len(page.segments) for page in pages)
+        or descriptor.total_bytes != sum(serialized_size_bytes(page.to_cosmos_item()) for page in pages)
+        or descriptor.transcript_hash != digest
+    ):
+        raise ValueError("audio checkpoint does not match its complete page set")
 
 
 def visual_manifest_hash(pages: tuple[VisualManifestPage, ...]) -> str:
@@ -899,6 +1328,12 @@ def content_sha256(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
+def content_sha256_bytes(content: bytes) -> str:
+    if not isinstance(content, bytes):
+        raise TypeError("content must be bytes")
+    return hashlib.sha256(content).hexdigest()
+
+
 def safe_error_from_exception(error: BaseException, stage: str) -> SafeError:
     if isinstance(error, TimeoutError):
         return SafeError("dependency_timeout", stage, True)
@@ -920,6 +1355,7 @@ def _serialize_dataclass(value: Any) -> Any:
         return {
             _snake_to_camel(field.name): _serialize_dataclass(getattr(value, field.name))
             for field in fields(value)
+            if not (field.metadata.get("omit_none") and getattr(value, field.name) is None)
         }
     if isinstance(value, Mapping):
         return {str(key): _serialize_dataclass(item) for key, item in value.items()}
@@ -958,6 +1394,14 @@ def _require_utc(name: str, value: str) -> None:
 def _require_schema_version(value: int) -> None:
     if value != SCHEMA_VERSION:
         raise ValueError(f"schema_version must be {SCHEMA_VERSION}")
+
+
+def _validate_time_range(start_ms: int | None, end_ms: int | None, duration_ms: int) -> None:
+    if (
+        type(start_ms) is not int or type(end_ms) is not int
+        or not 0 <= start_ms < end_ms <= duration_ms
+    ):
+        raise ValueError("audio time range is invalid")
 
 
 def _validate_profile_texts(profile: Any) -> None:
@@ -1003,7 +1447,7 @@ def _validate_document_fields(record: SourceDocumentRecord) -> None:
         ("mime_type", record.mime_type, 200),
     ):
         _require_text(name, value, maximum)
-    if record.mime_type not in SUPPORTED_SOURCE_MIME_TYPES:
+    if record.mime_type not in SUPPORTED_SOURCE_MIME_TYPES | SUPPORTED_AUDIO_MIME_TYPES:
         raise ValueError("document MIME type is not supported")
     if record.size_bytes < 0 or record.discovery_ordinal < 0 or record.attempt_count < 0:
         raise ValueError("document counters cannot be negative")
@@ -1049,7 +1493,10 @@ def _validate_chunk_fields(record: SearchChunkRecord) -> None:
         record.lifecycle_generation, int
     ) or record.lifecycle_generation < 0:
         raise ValueError("lifecycle_generation must be a non-negative integer")
-    if record.page_start < 1 or record.page_end < record.page_start:
+    if record.locator_kind is not LocatorKind.TIME and (
+        type(record.page_start) is not int or type(record.page_end) is not int
+        or record.page_start < 1 or record.page_end < record.page_start
+    ):
         raise ValueError("chunk page range is invalid")
     if not isinstance(record.locator_kind, LocatorKind):
         raise ValueError("chunk locator kind is invalid")

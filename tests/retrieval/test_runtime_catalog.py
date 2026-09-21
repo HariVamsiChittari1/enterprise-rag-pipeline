@@ -470,6 +470,45 @@ def test_given_environment_when_loaded_then_no_digest_or_relevance_override_requ
     assert load_retrieval_config().catalog_poll_seconds == 86400
 
 
+@pytest.mark.parametrize("settings,valid", [
+    ({}, True),
+    ({"AUDIO_RETRIEVAL_ENABLED": "false"}, True),
+    ({"AUDIO_RETRIEVAL_ENABLED": "yes"}, False),
+    ({"AUDIO_RETRIEVAL_ENABLED": "true"}, False),
+    ({"AUDIO_RETRIEVAL_ENABLED": "true", "AUDIO_MAX_ACL_AGE_SECONDS": "60",
+      "AUDIO_MAX_SOURCE_AGE_SECONDS": "120"}, True),
+    ({"AUDIO_RETRIEVAL_ENABLED": "true", "AUDIO_MAX_ACL_AGE_SECONDS": "60",
+      "AUDIO_MAX_SOURCE_AGE_SECONDS": "120", "ACL_ENABLED": "false"}, False),
+    ({"AUDIO_MAX_ACL_AGE_SECONDS": "0"}, False),
+    ({"AUDIO_MAX_ACL_AGE_SECONDS": "1.5"}, False),
+    ({"AUDIO_MAX_SOURCE_AGE_SECONDS": "-1"}, False),
+    ({"AUDIO_MAX_SOURCE_AGE_SECONDS": "nan"}, False),
+])
+def test_audio_configuration_requires_explicit_freshness_policy(
+    monkeypatch: pytest.MonkeyPatch, settings: dict[str, str], valid: bool,
+) -> None:
+    for name in (
+        "COSMOS_ENDPOINT", "COSMOS_DATABASE", "AZURE_OPENAI_ENDPOINT", "CHAT_DEPLOYMENT", "TENANT_ID",
+        "MANAGED_IDENTITY_CLIENT_ID", "RETRIEVAL_API_AUDIENCE", "RETRIEVAL_GATEWAY_CLIENT_ID",
+        "RETRIEVAL_GATEWAY_PRINCIPAL_ID", "DEPLOYMENT_INSTANCE_ID",
+    ):
+        monkeypatch.setenv(name, "test")
+    for name in ("AUDIO_RETRIEVAL_ENABLED", "AUDIO_MAX_ACL_AGE_SECONDS", "AUDIO_MAX_SOURCE_AGE_SECONDS", "ACL_ENABLED"):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in settings.items():
+        monkeypatch.setenv(name, value)
+    if not valid:
+        with pytest.raises(ValueError):
+            load_retrieval_config()
+        return
+    config = load_retrieval_config()
+    assert config.audio_retrieval_enabled == (settings.get("AUDIO_RETRIEVAL_ENABLED") == "true")
+    if config.audio_retrieval_enabled:
+        assert (config.audio_max_acl_age_seconds, config.audio_max_source_age_seconds) == (60, 120)
+    else:
+        assert config.audio_max_acl_age_seconds is None
+
+
 def test_given_read_duration_when_polling_then_start_to_start_interval(monkeypatch: pytest.MonkeyPatch) -> None:
     async def exercise() -> None:
         clock = 0.0

@@ -14,8 +14,10 @@ from ingestion.graph import (
     FolderCursor,
     GraphDiscoveryLimitExceeded,
     advance_discovery,
+    canonical_source_mime,
     discover_next_page,
     read_verified_acl,
+    resolve_source_format,
     validate_sharepoint_drive_site,
 )
 from ingestion.models import ScaleLimits
@@ -69,6 +71,42 @@ def test_discovery_preserves_validated_source_mime(
 
     assert step.pdfs[0].mime_type == mime_type
     assert step.pdfs[0].to_dict()["mimeType"] == mime_type
+
+
+@pytest.mark.parametrize(("name", "server_mime", "canonical"), [
+    ("meeting.wav", "audio/x-wav", "audio/wav"),
+    ("meeting.wav", "application/octet-stream", "audio/wav"),
+    ("call.mp3", "audio/mp3", "audio/mpeg"),
+    ("call.mp3", "audio/mpeg", "audio/mpeg"),
+    ("song.flac", "audio/x-flac", "audio/flac"),
+    ("song.flac", "audio/flac", "audio/flac"),
+])
+def test_discovery_admits_audio_by_extension_and_canonicalizes_mime(
+    name: str, server_mime: str, canonical: str,
+) -> None:
+    item = pdf_item("audio", name=name)
+    item["file"]["mimeType"] = server_mime
+
+    step = advance_discovery(
+        DiscoveryState.initial(),
+        ChildrenPage((item,), None),
+        ScaleLimits(),
+        allowed_extensions=(".wav", ".mp3", ".flac"),
+    )
+
+    assert step.pdfs[0].mime_type == canonical
+    assert step.pdfs[0].to_dict()["mimeType"] == canonical
+
+
+@pytest.mark.parametrize("graph_mime", ["audio/x-wav", "application/octet-stream", None, ""])
+def test_audio_is_resolved_and_canonicalized_regardless_of_server_mime(graph_mime: str | None) -> None:
+    assert resolve_source_format("meeting.wav", graph_mime) == ".wav"
+    assert canonical_source_mime("meeting.wav", graph_mime) == "audio/wav"
+
+
+def test_document_mime_cross_check_is_unchanged() -> None:
+    with pytest.raises(TerminalDocumentError, match="source_mime_mismatch"):
+        resolve_source_format("report.pdf", "text/plain")
 
 
 def test_discovery_skips_source_mime_mismatch_and_keeps_valid_items() -> None:
@@ -201,9 +239,25 @@ def test_read_verified_acl_returns_sorted_verified_security_groups() -> None:
     with httpx.Client(transport=httpx.MockTransport(handler)) as client:
         acl = read_verified_acl(client, "drive", "item", 2)
     assert acl.allowed_group_ids == ("group-a", "group-b")
-    assert len(acl.acl_hash) == 64
+    assert acl.acl_hash == "686e6912b96e03ca356929119443b69a2fafe8815791d169dd09cf7f82fd0835"
     assert requests[0].endswith("/permissions")
     assert all("/content" not in path for path in requests)
+
+
+@pytest.mark.parametrize("group_id", [" ", "x" * 501, "group\x1finvalid"])
+def test_read_verified_acl_rejects_malformed_verified_ids_safely(group_id: str) -> None:
+    from ingestion.errors import TerminalDocumentError
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/permissions"):
+            return httpx.Response(200, json={"value": [{
+                "roles": ["read"], "grantedToV2": {"group": {"id": group_id}},
+            }]})
+        return httpx.Response(200, json={"id": group_id, "securityEnabled": True})
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(TerminalDocumentError, match="^unsafe_acl:invalid_verified_group_ids$"):
+            read_verified_acl(client, "drive", "item", 2)
 
 
 def test_read_verified_acl_combines_direct_and_site_group_security_groups() -> None:

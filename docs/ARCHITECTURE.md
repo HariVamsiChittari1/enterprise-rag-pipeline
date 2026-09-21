@@ -389,6 +389,24 @@ indexed vectors fall back to full scan. Shared-throughput database accounts are
 not supported for this vector path. Treat vector policy or index changes as a
 container migration until the exact deployed API behavior is tested.
 
+### Audio reader compatibility
+
+Documents and audio use the same source-document manifest and chunk contracts with
+`schemaVersion: 1`. There is no separate audio schema version. Manifest MIME type
+and chunk `locatorKind: time` select audio-specific validation; audio metadata and
+temporal fields extend the shared records without changing document serialization,
+containers, partition keys, or run/control schemas. No audio discovery, transcription,
+checkpoint persistence, or lifecycle writer is implemented yet.
+
+Retrieval filters the supported schema version and locator kinds before ranking. Audio is
+default-disabled; when enabled under the [explicit freshness policy](CONFIGURATION.md#retrieval-behavior-and-limits),
+raw and typed results require a ready manifest with matching source version/hash,
+document identity, generation, authorized groups, and fresh ACL/source verification.
+Malformed or stale candidates are omitted. [Temporal citations](API_REFERENCE.md#response-schema)
+identify the evidence version but do not provide historical playback.
+Shared schema numbering does not make older readers audio-aware: deploy compatible
+readers before audio writers, and hide or retire audio before rolling readers back.
+
 ### service-audit (partition: /id)
 
 Best-effort audit records for explicitly instrumented service calls and document lifecycle events. Retrieval audit failures are logged and do not fail the query. Items expire after the container's 90-day default TTL.

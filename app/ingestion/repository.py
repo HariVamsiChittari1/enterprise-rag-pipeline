@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
@@ -13,6 +14,11 @@ from azure.core import MatchConditions
 logger = logging.getLogger(__name__)
 
 from ingestion.models import (
+    AudioMetadata,
+    AudioOperationRecord,
+    AudioOperationState,
+    AudioTranscriptPage,
+    AudioTranscriptSegment,
     ChunkingProfile,
     ContentModality,
     DocumentStage,
@@ -43,6 +49,7 @@ from ingestion.models import (
     VisualManifestPage,
     VisualRelevance,
     VISUAL_MANIFEST_PAGE_RECORD_TYPE,
+    create_audio_control_partition_id,
     create_chunk_id,
     create_source_run_id,
     run_record_id,
@@ -109,10 +116,104 @@ class CleanupPage:
 class IngestionRepository:
     """Own schema-v1 ingestion reads and writes across three Cosmos containers."""
 
-    def __init__(self, ingestion_runs: Any, source_documents: Any, search_chunks: Any) -> None:
+    def __init__(
+        self, ingestion_runs: Any, source_documents: Any, search_chunks: Any,
+        *, audio_pilot_source_id: str | None = None,
+    ) -> None:
+        if audio_pilot_source_id is not None:
+            create_audio_control_partition_id(audio_pilot_source_id)
         self._ingestion_runs = ingestion_runs
         self._source_documents = source_documents
         self._search_chunks = search_chunks
+        self._audio_pilot_source_id = audio_pilot_source_id
+
+    def get_audio_operation(
+        self, source_id: str, operation_id: str,
+    ) -> VersionedRecord[AudioOperationRecord] | None:
+        """Read internal ownership metadata, independently of an ingestion run."""
+        item = self._read_item(
+            self._source_documents, operation_id, create_audio_control_partition_id(source_id),
+        )
+        stored = self._versioned(item, _audio_operation_from_item, "audio operation")
+        if stored is not None and (
+            stored.record.source_id != source_id or stored.record.id != operation_id
+        ):
+            raise RepositoryDataError("audio operation identity does not match point read")
+        return stored
+
+    def claim_audio_operation(self, operation: AudioOperationRecord) -> VersionedRecord[AudioOperationRecord]:
+        """Create operation and source permit atomically; replay never grants ownership."""
+        self._require_audio_pilot(operation)
+        if operation.state is not AudioOperationState.VALIDATED or operation.ownership_epoch != 1:
+            raise ValueError("new audio operation requires initial validated ownership")
+        self._write_audio_transaction(operation, [
+            ("create", (operation.to_cosmos_item(),)),
+            ("create", (operation.to_permit_item(),)),
+        ])
+        return self._read_audio_write(operation)
+
+    def mark_audio_submission_intent(
+        self, current: VersionedRecord[AudioOperationRecord],
+    ) -> VersionedRecord[AudioOperationRecord]:
+        """Persist intent once under both ownership tokens, before any provider call."""
+        if current.record.state is not AudioOperationState.VALIDATED:
+            raise RepositoryConflictError("audio submission intent is already recorded")
+        return self._transition_audio_operation(current, AudioOperationState.SUBMITTING)
+
+    def mark_audio_operation_unknown(
+        self, current: VersionedRecord[AudioOperationRecord],
+    ) -> VersionedRecord[AudioOperationRecord]:
+        """Quarantine an ambiguous submission without releasing its source permit."""
+        if current.record.state is not AudioOperationState.SUBMITTING:
+            raise RepositoryConflictError("only submitted audio intent can become unknown")
+        return self._transition_audio_operation(current, AudioOperationState.UNKNOWN)
+
+    def _require_audio_pilot(self, operation: AudioOperationRecord) -> None:
+        if self._audio_pilot_source_id is None or operation.source_id != self._audio_pilot_source_id:
+            raise RepositoryConflictError("audio operation source is not the configured pilot")
+
+    def _transition_audio_operation(
+        self, current: VersionedRecord[AudioOperationRecord], state: AudioOperationState,
+    ) -> VersionedRecord[AudioOperationRecord]:
+        operation = current.record
+        self._require_audio_pilot(operation)
+        if not isinstance(current.etag, str) or not current.etag.strip():
+            raise ValueError("audio operation requires an ETag")
+        permit = self._versioned(
+            self._read_item(self._source_documents, "audio-permit", operation.source_run_id),
+            _domain_item, "audio permit",
+        )
+        if permit is None or permit.record != operation.to_permit_item():
+            raise RepositoryConflictError("audio operation no longer owns the source permit")
+        updated = replace(operation, state=state)
+        self._write_audio_transaction(updated, [
+            ("replace", (operation.id, updated.to_cosmos_item()), {"if_match_etag": current.etag}),
+            ("replace", ("audio-permit", updated.to_permit_item()), {"if_match_etag": permit.etag}),
+        ])
+        return self._read_audio_write(updated)
+
+    def _write_audio_transaction(
+        self, operation: AudioOperationRecord, operations: list[tuple[Any, ...]],
+    ) -> None:
+        try:
+            results = self._source_documents.execute_item_batch(
+                batch_operations=operations, partition_key=operation.source_run_id,
+            )
+        except Exception as error:
+            if _error_status(error) in (409, 412):
+                raise RepositoryConflictError("audio operation ownership conflicts") from None
+            raise RepositoryError("Cosmos audio operation transaction failed") from None
+        failure = _batch_failure_status(results)
+        if failure in (409, 412):
+            raise RepositoryConflictError("audio operation ownership conflicts")
+        if failure is not None or not isinstance(results, Sequence) or len(results) != 2:
+            raise RepositoryError("Cosmos audio operation transaction failed")
+
+    def _read_audio_write(self, operation: AudioOperationRecord) -> VersionedRecord[AudioOperationRecord]:
+        stored = self.get_audio_operation(operation.source_id, operation.id)
+        if stored is None or stored.record != operation:
+            raise RepositoryConflictError("audio operation changed after transaction")
+        return stored
 
     def get_source_control(self, source_id: str) -> VersionedRecord[SourceControlRecord] | None:
         item = self._read_item(self._ingestion_runs, "source-control", source_id)
@@ -133,6 +234,27 @@ class IngestionRepository:
         if item is None:
             return None
         return _hydrate(item, _chunk_from_item, "search chunk")
+
+    def get_audio_transcript_page(
+        self, source_run_id: str, page_id: str, *, expected_operation: AudioOperationRecord,
+    ) -> AudioTranscriptPage | None:
+        """Read page integrity against independent ownership, not commitment or authorization."""
+        if not isinstance(expected_operation, AudioOperationRecord):
+            raise ValueError("audio page requires expected operation metadata")
+        if not isinstance(source_run_id, str) or not source_run_id.strip() or len(source_run_id) > 301:
+            raise ValueError("audio page partition is invalid")
+        if not isinstance(page_id, str) or re.fullmatch(r"audio-transcript:[0-9a-f]{64}", page_id) is None:
+            raise ValueError("audio page ID is invalid")
+        item = self._read_item(self._source_documents, page_id, source_run_id)
+        if item is None:
+            return None
+        page = _hydrate(
+            item, lambda stored: _audio_transcript_page_from_item(stored, expected_operation),
+            "audio transcript page",
+        )
+        if page.id != page_id or page.source_run_id != source_run_id:
+            raise RepositoryDataError("audio transcript page address does not match point read")
+        return page
 
     def get_visual_manifest_page(
         self,
@@ -379,7 +501,6 @@ class IngestionRepository:
         """Reset a failed document back to discovered so it can be reprocessed."""
         doc_id = doc["id"]
         etag = doc.get("_etag")
-        source_run_id = doc.get("sourceRunId")
         now = datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         doc["status"] = DocumentStatus.DISCOVERED.value
         doc["stage"] = DocumentStage.DISCOVERED.value
@@ -1229,6 +1350,47 @@ def _hydrate(item: Mapping[str, Any], factory: Any, record_name: str) -> Any:
         return factory(item)
     except (KeyError, TypeError, ValueError):
         raise RepositoryDataError(f"{record_name} does not match schema version 1") from None
+
+
+def _audio_operation_from_item(item: Mapping[str, Any]) -> AudioOperationRecord:
+    if not isinstance(item["audio"], Mapping):
+        raise ValueError("audio operation metadata must be an object")
+    record = AudioOperationRecord(
+        source_id=item["sourceId"], drive_id=item["driveId"], item_id=item["itemId"],
+        audio=AudioMetadata(**_snake_keys(item["audio"])), owner_id=item["ownerId"],
+        ownership_epoch=item["ownershipEpoch"], state=AudioOperationState(item["state"]),
+    )
+    if record.to_cosmos_item() != _domain_item(item):
+        raise ValueError("audio operation fields do not match validated identity")
+    return record
+
+
+def _audio_transcript_page_from_item(
+    item: Mapping[str, Any], expected_operation: AudioOperationRecord,
+) -> AudioTranscriptPage:
+    if not isinstance(item, Mapping) or any(not isinstance(key, str) for key in item):
+        raise ValueError("audio transcript page must be an object")
+    if type(item["schemaVersion"]) is not int or type(item["ownershipEpoch"]) is not int:
+        raise ValueError("audio transcript page versions must be integers")
+    audio = item["audio"]
+    if not isinstance(audio, Mapping) or any(not isinstance(key, str) for key in audio):
+        raise ValueError("audio transcript metadata must be an object")
+    if AudioMetadata(**_snake_keys(audio)) != expected_operation.audio:
+        raise ValueError("audio transcript metadata does not match expected operation")
+    segments = item["segments"]
+    if not isinstance(segments, list) or any(not isinstance(segment, Mapping) for segment in segments):
+        raise ValueError("audio transcript segments must be an object array")
+    page = AudioTranscriptPage(
+        operation=expected_operation, source_run_id=item["sourceRunId"],
+        page_index=item["pageIndex"], page_count=item["pageCount"],
+        segments=tuple(AudioTranscriptSegment(
+            ordinal=segment["ordinal"], text=segment["text"],
+            start_ms=segment["startMs"], end_ms=segment["endMs"],
+        ) for segment in segments),
+    )
+    if page.to_cosmos_item() != _domain_item(item):
+        raise ValueError("audio transcript fields do not match validated page")
+    return page
 
 
 def _source_control_from_item(item: Mapping[str, Any]) -> SourceControlRecord:

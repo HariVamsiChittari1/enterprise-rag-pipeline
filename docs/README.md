@@ -5,6 +5,7 @@ Use this index to locate the owner of each maintained documentation concern.
 | Document | Audience and responsibility |
 | --- | --- |
 | [Architecture](ARCHITECTURE.md) | System boundaries, flows, data model, security model, quality attributes, and known limitations |
+| [Audio RAG proposal](AUDIO_RAG_PROPOSAL.md) | Proposed audio requirements, design, phased implementation, and unresolved approval gates; not production readiness |
 | [API reference](API_REFERENCE.md) | HTTP authentication, routes, request and response contracts, errors, and retrieval catalog properties |
 | [Configuration reference](CONFIGURATION.md) | Deployment inputs and runtime environment variables, ownership, defaults, and accepted values |
 | [Azure setup](AZURE_SETUP.md) | Prerequisites and the guarded deployment procedure |

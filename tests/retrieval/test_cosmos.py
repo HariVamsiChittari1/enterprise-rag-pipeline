@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from unittest.mock import Mock
+from datetime import datetime, timedelta, timezone
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -16,6 +17,7 @@ from retrieval.pipeline import citation_location, citation_url
 def candidate() -> dict[str, object]:
     return {
         "id": "chunk",
+        "schemaVersion": 1,
         "documentId": "document",
         "sourceRunId": "sharepoint-drive:run1",
         "content": "authorized content",
@@ -36,6 +38,169 @@ def active_manifest(**overrides: object) -> dict[str, object]:
     }
     manifest.update(overrides)
     return manifest
+
+
+NOW = datetime(2026, 9, 18, 12, tzinfo=timezone.utc)
+
+
+def audio_candidate() -> dict[str, object]:
+    return candidate() | {
+        "locatorKind": "time", "locatorLabel": "00:00-00:02",
+        "startMs": 0, "endMs": 2000, "lifecycleGeneration": 1,
+        "documentKey": "source:run:document", "sourceName": "recording.wav",
+        "sourceUrl": "https://example.invalid/recording.wav",
+        "audio": {
+            "durationMs": 3000, "channelCount": 1, "locale": "en-US", "mode": "fast",
+            "apiVersion": "2025-10-15", "profileVersion": "1", "sourceVersion": "etag-1",
+            "sourceContentHash": "a" * 64,
+        },
+    }
+
+
+def audio_manifest() -> dict[str, object]:
+    row = audio_candidate()
+    return active_manifest(
+        mimeType="audio/wav", audio=row["audio"], lifecycleGeneration=1,
+        documentId=row["documentId"], sourceRunId=row["sourceRunId"],
+        documentKey=row["documentKey"], eTag="etag-1", contentHash="a" * 64,
+        allowedGroupIds=["group"], aclEvaluatedAt=NOW.isoformat(), sourceVerifiedAt=NOW.isoformat(),
+    )
+
+
+@pytest.mark.parametrize("raw", [False, True])
+@pytest.mark.parametrize("mode", list(RetrievalMode))
+def test_audio_is_opt_in_and_bound_to_fresh_manifest(raw: bool, mode: RetrievalMode) -> None:
+    chunks, manifests = Mock(), Mock()
+    chunks.query_items.return_value = [audio_candidate()]
+    manifests.read_item.return_value = audio_manifest()
+    assert SecureCosmosRetriever(chunks, manifests).retrieve(
+        "policy", [0.1], ["group"], mode=mode, raw=raw,
+    ) == []
+    retriever = SecureCosmosRetriever(
+        chunks, manifests, audio_retrieval_enabled=True,
+        audio_max_acl_age_seconds=60, audio_max_source_age_seconds=60,
+    )
+    with patch("retrieval.cosmos.datetime") as clock:
+        clock.now.return_value = NOW
+        clock.fromisoformat = datetime.fromisoformat
+        results = retriever.retrieve("policy", [0.1], ["group"], mode=mode, raw=raw)
+    assert len(results) == 1
+    if not raw:
+        assert (results[0].start_ms, results[0].end_ms, results[0].evidence_version) == (0, 2000, "etag-1")
+    query = chunks.query_items.call_args.kwargs["query"]
+    assert "OR (c.schemaVersion = 1 AND c.locatorKind = 'time')" in query.split("ORDER BY")[0]
+
+
+@pytest.mark.parametrize("raw", [False, True])
+@pytest.mark.parametrize("overrides", [
+    {"aclEvaluatedAt": (NOW - timedelta(seconds=61)).isoformat()},
+    {"sourceVerifiedAt": (NOW - timedelta(seconds=61)).isoformat()},
+    {"sourceVerifiedAt": (NOW + timedelta(seconds=1)).isoformat()},
+    {"aclEvaluatedAt": None}, {"sourceVerifiedAt": "bad"},
+    {"aclEvaluatedAt": "2026-09-18T12:00:00"},
+    {"lifecycleGeneration": 2}, {"lifecycleGeneration": True},
+    {"eTag": "updated"}, {"contentHash": "b" * 64},
+    {"allowedGroupIds": ["other-group"]}, {"allowedGroupIds": []},
+    {"status": "retired"}, {"documentKey": "wrong"}, {"audio": {}},
+    {"schemaVersion": 2}, {"mimeType": "application/pdf"},
+])
+def test_audio_manifest_validation_fails_closed(raw: bool, overrides: dict[str, object]) -> None:
+    chunks, manifests = Mock(), Mock()
+    chunks.query_items.return_value = [audio_candidate()]
+    manifests.read_item.return_value = audio_manifest() | overrides
+    retriever = SecureCosmosRetriever(
+        chunks, manifests, audio_retrieval_enabled=True,
+        audio_max_acl_age_seconds=60, audio_max_source_age_seconds=60,
+    )
+    with patch("retrieval.cosmos.datetime") as clock:
+        clock.now.return_value = NOW
+        clock.fromisoformat = datetime.fromisoformat
+        assert retriever.retrieve("policy", [0.1], ["group"], raw=raw) == []
+
+
+@pytest.mark.parametrize("overrides", [
+    {"startMs": True}, {"startMs": -1}, {"endMs": 3001}, {"endMs": 0},
+    {"endMs": 1.5}, {"locatorKind": "page"}, {"schemaVersion": 2}, {"schemaVersion": 3},
+])
+def test_audio_rejects_invalid_temporal_contract(overrides: dict[str, object]) -> None:
+    retriever = SecureCosmosRetriever(Mock(), Mock())
+    with pytest.raises(ValueError, match="invalid_retrieval_record"):
+        retriever.to_chunks([audio_candidate() | overrides])
+
+
+@pytest.mark.parametrize("raw", [False, True])
+@pytest.mark.parametrize("mode", list(RetrievalMode))
+@pytest.mark.parametrize("enabled", [False, True])
+def test_shared_schema_retrieves_mixed_media_only_when_enabled(
+    raw: bool, mode: RetrievalMode, enabled: bool,
+) -> None:
+    chunks, manifests = Mock(), Mock()
+    chunks.query_items.return_value = [candidate(), audio_candidate()]
+    manifests.read_item.side_effect = [active_manifest(), audio_manifest()]
+    retriever = SecureCosmosRetriever(
+        chunks, manifests, audio_retrieval_enabled=enabled,
+        audio_max_acl_age_seconds=60, audio_max_source_age_seconds=60,
+    )
+    with patch("retrieval.cosmos.datetime") as clock:
+        clock.now.return_value = NOW
+        clock.fromisoformat = datetime.fromisoformat
+        results = retriever.retrieve("policy", [0.1], ["group"], mode=mode, raw=raw)
+    expected = ["page", "time"] if enabled else ["page"]
+    assert [row["locatorKind"] if raw else row.locator_kind.value for row in results] == expected
+
+
+@pytest.mark.parametrize("raw", [False, True])
+@pytest.mark.parametrize("schema_version", [2, 99, True, None])
+@pytest.mark.parametrize("is_audio", [False, True])
+def test_matching_unsupported_manifest_and_chunk_schemas_are_rejected(
+    raw: bool, schema_version: object, is_audio: bool,
+) -> None:
+    chunks, manifests = Mock(), Mock()
+    row = audio_candidate() if is_audio else candidate()
+    manifest = audio_manifest() if is_audio else active_manifest()
+    chunks.query_items.return_value = [row | {"schemaVersion": schema_version}]
+    manifests.read_item.return_value = manifest | {"schemaVersion": schema_version}
+    retriever = SecureCosmosRetriever(
+        chunks, manifests, audio_retrieval_enabled=True,
+        audio_max_acl_age_seconds=60, audio_max_source_age_seconds=60,
+    )
+    with patch("retrieval.cosmos.datetime") as clock:
+        clock.now.return_value = NOW
+        clock.fromisoformat = datetime.fromisoformat
+        assert retriever.retrieve("policy", [0.1], ["group"], raw=raw) == []
+
+
+@pytest.mark.parametrize("raw", [False, True])
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("mime_type", ["audio/wav", "audio/mpeg", "audio/flac"])
+@pytest.mark.parametrize("metadata_state", ["present", "null", "missing"])
+def test_document_locator_cannot_bypass_audio_manifest_guards(
+    raw: bool, enabled: bool, mime_type: str, metadata_state: str,
+) -> None:
+    chunks, manifests = Mock(), Mock()
+    chunks.query_items.return_value = [candidate()]
+    manifest = audio_manifest() | {"mimeType": mime_type}
+    if metadata_state == "missing":
+        manifest.pop("audio")
+    elif metadata_state == "null":
+        manifest["audio"] = None
+    manifests.read_item.return_value = manifest
+    retriever = SecureCosmosRetriever(
+        chunks, manifests, audio_retrieval_enabled=enabled,
+        audio_max_acl_age_seconds=60, audio_max_source_age_seconds=60,
+    )
+    assert retriever.retrieve("policy", [0.1], ["group"], raw=raw) == []
+
+
+@pytest.mark.parametrize("options", [
+    {}, {"audio_max_acl_age_seconds": 60},
+    {"audio_max_acl_age_seconds": 0, "audio_max_source_age_seconds": 60},
+    {"audio_max_acl_age_seconds": True, "audio_max_source_age_seconds": 60},
+    {"acl_enabled": False, "audio_max_acl_age_seconds": 60, "audio_max_source_age_seconds": 60},
+])
+def test_enabling_audio_requires_authorization_policy(options: dict[str, object]) -> None:
+    with pytest.raises(ValueError, match="audio_requires_acl_and_freshness_limits"):
+        SecureCosmosRetriever(Mock(), Mock(), audio_retrieval_enabled=True, **options)
 
 
 @pytest.mark.parametrize("mode", list(RetrievalMode))
@@ -76,6 +241,47 @@ def test_non_ready_document_is_not_returned() -> None:
 
     assert SecureCosmosRetriever(chunks, manifests).retrieve(
         "policy", [0.1], ["group"]
+    ) == []
+
+
+@pytest.mark.parametrize("mode", list(RetrievalMode))
+@pytest.mark.parametrize("raw", [False, True])
+def test_documents_only_filter_precedes_ranking(mode: RetrievalMode, raw: bool) -> None:
+    chunks = Mock()
+    chunks.query_items.return_value = [candidate()]
+    manifests = Mock()
+    manifests.read_item.return_value = active_manifest()
+
+    assert len(SecureCosmosRetriever(chunks, manifests).retrieve(
+        "policy", [0.1], ["group"], mode=mode, raw=raw,
+    )) == 1
+    query = chunks.query_items.call_args.kwargs["query"]
+    assert "c.schemaVersion = 1" in query.split("ORDER BY")[0]
+    assert "c.locatorKind IN ('page', 'section', 'slide', 'worksheet')" in query
+    assert "c.locatorKind = 'time'" not in query
+
+
+@pytest.mark.parametrize("raw", [False, True])
+@pytest.mark.parametrize("overrides", [
+    {"locatorKind": "time"},
+    {"schemaVersion": 2},
+    {"schemaVersion": 99},
+    {"schemaVersion": True},
+    {"locatorOrdinalStart": True},
+    {"locatorKind": "unknown"},
+    {"content": ""},
+    {"startMs": 0}, {"endMs": 1000},
+])
+def test_invalid_candidates_cannot_bypass_raw_validation(
+    raw: bool, overrides: dict[str, object],
+) -> None:
+    chunks = Mock()
+    chunks.query_items.return_value = [candidate() | overrides]
+    manifests = Mock()
+    manifests.read_item.return_value = active_manifest()
+
+    assert SecureCosmosRetriever(chunks, manifests).retrieve(
+        "policy", [0.1], ["group"], raw=raw,
     ) == []
 
 

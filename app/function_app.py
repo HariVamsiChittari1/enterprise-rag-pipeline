@@ -45,7 +45,6 @@ SUBSCRIPTION_RENEW_SCHEDULE = os.getenv("SUBSCRIPTION_RENEW_SCHEDULE", "0 0 2 * 
 WEBHOOK_CLIENT_STATE = os.getenv("WEBHOOK_CLIENT_STATE", "")
 
 
-
 @app.route(route="ingestion/full-sync", methods=["POST"], auth_level=func.AuthLevel.ANONYMOUS)
 @app.durable_client_input(client_name="client")
 async def start_full_sync(req: func.HttpRequest, client) -> func.HttpResponse:
@@ -1007,6 +1006,7 @@ def process_document_activity(payload: dict) -> dict:
         language_client = _build_language_client(config) if config.enrichment_enabled else None
         openai_client = _build_openai_client(config)
         audit_container = _build_audit_container(config)
+        speech_token_provider = _build_speech_token_provider(config) if config.audio_writer_enabled else None
 
         sp_client = _build_sharepoint_client(config)
         connector = SharePointConnector(graph_client, config.drive_id, sp_client=sp_client, site_url=config.sharepoint_site_url)
@@ -1020,6 +1020,7 @@ def process_document_activity(payload: dict) -> dict:
                 connector, di_client, language_client, openai_client,
                 audit_container=audit_container,
                 cu_client=cu_client,
+                speech_token_provider=speech_token_provider,
             )
             if outcome.status.value == "succeeded":
                 _retire_prior_version(config, document_ref["documentId"], document_ref["sourceRunId"], audit_container)
@@ -1510,6 +1511,16 @@ def _build_openai_client(config):
             api_version="2024-10-21",
         )
     return _client_cache["openai_client"]
+
+
+def _build_speech_token_provider(config):
+    if "speech_token_provider" not in _client_cache:
+        from azure.identity import DefaultAzureCredential, get_bearer_token_provider
+        credential = DefaultAzureCredential(managed_identity_client_id=config.managed_identity_client_id)
+        _client_cache["speech_token_provider"] = get_bearer_token_provider(
+            credential, "https://cognitiveservices.azure.com/.default",
+        )
+    return _client_cache["speech_token_provider"]
 
 
 def _build_audit_container(config):

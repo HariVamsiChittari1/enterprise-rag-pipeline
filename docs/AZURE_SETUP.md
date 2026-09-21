@@ -290,12 +290,21 @@ Cognitive Services Content Understanding Contributor on the Content
 Understanding account. An Azure control-plane role alone does not provide the
 required data-plane access.
 
+Before the `Function` phase, store `FUNCTION_DEPLOY_RESOURCE_GROUP` and
+`FUNCTION_DEPLOY_APP_NAME` in the selected azd environment with the reviewed group
+and main-site name. The stored `AZURE_SUBSCRIPTION_ID` must also match `@target`.
+These explicit bindings in `azure.yaml` replace tag-based Function discovery;
+existing environments must supply them before their next Function deployment.
+Process-only values, blank values, mismatches, and surrounding whitespace are
+rejected. The controller accepts the source-reviewed azd versions 1.34.0 and
+1.34.1; review resolver behavior before admitting other versions.
+
 ```powershell
 .\scripts\deploy.ps1 -Phase Final @target -JobExecutionName $verification.executionName
 .\scripts\deploy.ps1 -Phase Final @target -JobExecutionName $verification.executionName -Execute
 
-.\scripts\deploy.ps1 -Phase Function @target
-.\scripts\deploy.ps1 -Phase Function @target -Execute
+.\scripts\deploy.ps1 -Phase Function @target -FunctionAppName '<reviewed-function-app>'
+.\scripts\deploy.ps1 -Phase Function @target -FunctionAppName '<reviewed-function-app>' -Execute
 ```
 
 For a development environment without a private-connected workstation, VM, or
@@ -325,6 +334,72 @@ Content Understanding model defaults before it creates the Function and ACA
 resources with the immutable image and a verified mutable catalog. A private-network or
 data-plane authorization failure stops the phase before the serving deployment.
 `Function` delegates only the Function package deployment to `azd`.
+
+### Local Function Package Preflight
+
+`FunctionPackage` is an offline artifact check, not a deployment phase. It requires
+the reviewed plan/source hashes and the independently reviewed ZIP SHA-256, but
+does not contact Azure or require deployment target arguments. It rejects `-Execute`;
+package arguments are accepted only by `FunctionPackage` and `Function`.
+
+```powershell
+.\scripts\deploy.ps1 -Phase FunctionPackage `
+  -ExpectedPlanHash '<reviewed-plan-sha256>' `
+  -ExpectedSourceTreeHash '<reviewed-source-sha256>' `
+  -FunctionPackagePath 'C:\DevEnvs\enterprise-rag-pipeline\staging\candidate.zip' `
+  -ExpectedFunctionPackageHash '<reviewed-zip-sha256>'
+```
+
+Success returns `action: validated-package-only`, `packageHash`, and `entryCount`.
+The source-package preflight limits both ZIP size and expanded data to 256 MiB,
+and the archive to 4096 entries. These are local preflight limits, not audio or
+Functions capacity guarantees. It reads entry streams and checks declared lengths,
+rejects unsafe/duplicate/conflicting paths and unsupported filesystem entry types,
+and excludes common local settings, environment files, caches, key artifacts,
+and root-level `operations/` tooling. Normal Function packaging also excludes
+`operations/` through [the package ignore file](../app/.funcignore).
+Nonempty `host.json`, `function_app.py`, and `requirements.txt` must be at the root.
+
+Passing does not establish complete application contents, source-to-artifact
+equivalence, absence of secrets or malicious code, dependency integrity, or a
+deployment target. Perform those reviews separately.
+
+### Reviewed Function Package Deployment
+
+Without package arguments, `Function` deploys from the configured application
+project. To preview an external source ZIP, use the same reviewed target and
+plan/source authority with the package path and digest:
+
+```powershell
+.\scripts\deploy.ps1 -Phase Function @target `
+  -FunctionAppName '<reviewed-function-app>' `
+  -FunctionPackagePath 'C:\DevEnvs\enterprise-rag-pipeline\staging\candidate.zip' `
+  -ExpectedFunctionPackageHash '<reviewed-zip-sha256>'
+```
+
+Preview checks the archive and stored target bindings and returns the ZIP hash;
+it does not deploy. After separate authorization, add `-Execute` to that reviewed
+command. Execution rechecks plan/source authority and target bindings, then invokes
+`azd deploy rag-functions --from-package` from the repository root. A read handle
+is retained through deployment and its hash rechecked after archive validation.
+On Windows, the handle denies writes/deletion through ordinary file-sharing APIs;
+this is not a cross-platform filesystem immutability guarantee. Deployment errors
+propagate and the handle is released even on failure.
+
+The bindings select the reviewed main site, not a slot. They are not live
+attestation of its hosting plan, Python runtime, identity, network, or health.
+Verify those separately, prevent concurrent edits to the local azd environment,
+and review the complete package, quiet window, active work, and compatible recovery path
+before authorizing an existing-app deployment. A Flex update is app-wide and can
+interrupt executing invocations. Python Flex defaults to remote build even with
+`--from-package`, so the input ZIP hash does not attest the deployed build output.
+See [azd deployment](https://learn.microsoft.com/en-us/azure/developer/azure-developer-cli/reference#azd-deploy)
+and [Python build options](https://learn.microsoft.com/en-us/azure/azure-functions/python-build-options#remote-build).
+
+Recovery can use a retained verified artifact or a rebuild of known-good source
+compatible with the live configuration and data contracts. A locally tested but
+undeployed candidate is not a known-good recovery baseline; a source rebuild also
+has dependency/build drift risk. See [Functions rollback](https://learn.microsoft.com/en-us/azure/azure-functions/functions-rollback-deployments#what-re-running-rebuilds).
 
 ### 6. Validate End to End
 

@@ -88,7 +88,7 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
             continue
         try:
             value = json.loads(line)
-        except json.JSONDecodeError as error:
+        except json.JSONDecodeError:
             raise GenerateRankingsError(
                 f"{path}: line {line_number} is not valid JSON"
             ) from None

@@ -5,7 +5,7 @@ description: Verified evidence, release gates, unresolved risks, and readiness v
 
 This document separates verified release evidence from production-scale work that remains unproven. It does not convert development estimates into production guarantees.
 
-## Current Verified Baseline
+## Historical Verified Baseline
 
 The historical 2026-09-05 release completed local validation, guarded deployment,
 and non-production smoke testing. It predates the mutable runtime catalog and
@@ -127,9 +127,14 @@ The evaluator verifies ranking/ground-truth hashes bound by the manifest. Source
 
 ## Readiness Verdict
 
-- **Current-release deployment smoke:** passed.
+The results below describe the 2026-09-05 release, not the current worktree.
+The mutable-catalog candidate and [audio implementation](AUDIO_RAG_PROPOSAL.md#current-status)
+have not established same-source deployment and end-to-end acceptance here.
+
+- **Historical-release deployment smoke:** passed on 2026-09-05.
 - **Five-format local implementation:** complete local gate passed for the current Document Intelligence candidate on 2026-09-05.
 - **Five-format Azure deployment and smoke:** Document Intelligence production-default and Content Understanding rollback scenarios passed in the approved non-production environment.
 - **Same-release functional E2E:** full sync, delta create/update/delete, lifecycle reconciliation, authorized retrieval, unauthenticated rejection, and six retrieval scenarios passed. A live non-member denial and direct private Container App probe remain open.
-- **General production readiness:** conditional.
+- **Current-worktree release readiness:** not established; local checks alone do not satisfy deployment and E2E gates.
+- **General production readiness:** conditional on the gates in this document.
 - **Blocking evidence for production scale:** workload requirements, capacity/load evidence, recovery objectives/tests, the two open E2E checks, and acceptance of or fixes for the listed security gaps.

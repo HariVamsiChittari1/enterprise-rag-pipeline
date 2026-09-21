@@ -133,6 +133,29 @@ def test_query_missing_auth_returns_401(client):
     assert response.json()["error"]["code"] == "invalid_gateway_headers"
 
 
+def test_audio_citation_preserves_times_without_inventing_a_playback_url() -> None:
+    citation = retrieval_main._citation_from_result(1, {
+        "source_name": "recording.wav", "source_url": "https://example.invalid/recording.wav",
+        "locator_kind": "time", "locator_label": "00:01-00:03",
+        "start_ms": 1000, "end_ms": 3000, "evidence_version": "etag-1",
+    })
+    assert citation.model_dump(exclude_none=True) == {
+        "ref": "[S1]", "source_name": "recording.wav", "location": "00:01-00:03",
+        "url": "https://example.invalid/recording.wav",
+        "start_ms": 1000, "end_ms": 3000, "evidence_version": "etag-1",
+    }
+
+
+def test_document_citation_wire_shape_stays_unchanged() -> None:
+    citation = retrieval_main._citation_from_result(1, {
+        "source_name": "document.pdf", "source_url": "https://example.invalid/document.pdf",
+        "locator_kind": "page", "locator_label": "Page 1", "locator_ordinal_start": 1,
+    })
+    assert set(citation.model_dump(exclude_none=True)) == {"ref", "source_name", "location", "url"}
+    route = next(route for route in app.routes if getattr(route, "path", None) == "/api/query")
+    assert route.response_model_exclude_none is True
+
+
 def test_resolve_principal_accepts_only_function_app_boundary(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -757,6 +780,7 @@ async def test_given_safety_clients_when_lifespan_exits_then_preserves_settings_
         managed_identity_client_id="synthetic", cosmos_endpoint="https://cosmos.invalid",
         cosmos_database="synthetic", cosmos_chunks_container="chunks", cosmos_manifests_container="manifests",
         cosmos_audit_container="audit", acl_enabled=True, openai_endpoint="https://sdk-test.invalid",
+        audio_retrieval_enabled=False, audio_max_acl_age_seconds=None, audio_max_source_age_seconds=None,
         openai_api_version="2024-10-21", agent_api_version="synthetic-api-version", chat_deployment="synthetic",
         catalog_container="catalog", deployment_instance_id="synthetic", catalog_poll_seconds=60,
         embedding_deployment="synthetic-embedding", retrieval_timeout_seconds=2, generation_timeout_seconds=2,

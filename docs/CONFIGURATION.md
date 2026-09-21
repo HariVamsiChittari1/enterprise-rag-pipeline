@@ -245,6 +245,12 @@ The deployed Durable Task Scheduler retains terminal orchestration history for 3
 | Variable | Value/default | Accepted values and effect |
 | --- | --- | --- |
 | `EXTRACTION_ENABLED` | Runtime fallback `true` | Boolean parser treats `true`, `1`, and `yes` as true; other nonempty values are false. Disabling causes documents to fail because no extraction alternative exists. Current Bicep does not emit an override. |
+| `AUDIO_WRITER_ENABLED` | `false` | Ingestion (writer) audio gate: strict boolean, trimmed and case-normalized. Enabling requires `EXTRACTION_ENABLED=true` and the Speech settings below; DI/CU selection is unchanged. Independent of the retrieval gate. When enabled, discovered `.wav`, `.mp3`, and `.flac` items (add the extensions to `ALLOWED_FILE_EXTENSIONS`) are sent to Speech fast transcription, which validates and decodes the format server-side, and are published as time-located chunks. Audio is admitted by file extension; the Graph `file.mimeType` is [server-determined](https://learn.microsoft.com/en-us/graph/api/resources/file) and not used to gate audio. No client-side audio decoder is used; source channel count is not recorded (the default transcribe response does not report it). Requires a live Speech resource, private endpoint, and the `Cognitive Services Speech User` role before real use. |
+| `AUDIO_TRANSCRIPTION_PROVIDER` | `speech_fast` | Fixed v1 value; only `speech_fast` after trimming and case normalization. Any other value fails configuration loading even when audio is disabled. |
+| `SPEECH_ENDPOINT` | Empty; required when the writer is enabled | HTTPS custom-domain base URL with one lowercase DNS label before `.cognitiveservices.azure.com`. Optional root slash; no credentials, port, other path, query, fragment, or embedded whitespace. Independent of DI/CU endpoints. |
+| `SPEECH_REGION` | Empty; required when the writer is enabled | Initial project allowlist: `eastus2`, `centralindia`, `southeastasia`; trimmed and lowercased. |
+| `AUDIO_DEPLOYMENT_REGION` | Empty; required when the writer is enabled | Declared ingestion deployment region; same initial allowlist and normalization. Must equal `SPEECH_REGION` when both are supplied. No inferred region or cross-region fallback. |
+| `AUDIO_LOCALE` | Empty; required when the writer is enabled | Initial project allowlist: `en-US`, `en-GB`, `en-IN`; trimmed, case-sensitive. No automatic locale selection. This does not detect or reject non-English speech. |
 | `KEY_PHRASES_ENABLED` | Runtime fallback `true` | Enables key-phrase enrichment. Same boolean parsing. |
 | `ENTITIES_ENABLED` | Runtime fallback `true` | Enables entity enrichment. Same boolean parsing. |
 | `SUMMARY_ENABLED` | Runtime fallback `false` | Enables summary enrichment. Same boolean parsing. |
@@ -261,6 +267,21 @@ The deployed Durable Task Scheduler retains terminal orchestration history for 3
 | `VISION_MAX_FIGURES` | `60` | Maximum figures described for one source document. |
 
 Shared application limits also reject source files over 100 MB and rendered Office-to-PDF derivatives over 200 MB. These limits are stricter than some provider-tier limits and apply before or around provider analysis. Document Intelligence S0 supports up to 500 MB and 2,000 PDF/TIFF pages; F0 supports 4 MB and processes only the first two pages. The effective limit is always the lowest applicable application, provider-tier, and format-specific limit.
+
+Keep audio disabled. The ingestion configuration validator is a preparation step,
+not an audio execution path. Supplied Speech settings are validated even when
+audio is disabled; missing Speech settings are permitted only while disabled.
+These are initial project allowlists, not the complete Azure region or English
+locale lists. Their service eligibility is grounded in [Speech regions](https://learn.microsoft.com/en-us/azure/ai-services/speech-service/regions),
+[language support](https://learn.microsoft.com/en-us/azure/ai-services/speech-service/language-support?tabs=stt),
+and the [fast transcription endpoint guide](https://learn.microsoft.com/en-us/azure/ai-services/speech-service/fast-transcription-create).
+
+URL validation and matching declared regions do not verify account ownership,
+actual region/residency, worker identity, private routing, or permission to process
+recordings. Decoder integrity/containment, policy approvals, and live verification
+remain open; see the [audio implementation plan](AUDIO_RAG_PROPOSAL.md#implementation-plan).
+No Speech client is created by configuration loading. These ingestion audio/Speech
+settings are not emitted by Bicep or the deployment controller.
 
 ### Timers, webhooks, and query gateway
 
@@ -318,6 +339,9 @@ remove reference markers from generated answer text.
 | --- | --- | --- | --- |
 | `ACL_ENABLED` | No | `true` | `false`, `0`, or `no` disable ACL filtering; any other value enables it. Never disable in a shared secure environment merely to make a test pass. |
 | `INCLUDE_CITATIONS` | No | `true` | Only literal `false` disables citations. |
+| `AUDIO_RETRIEVAL_ENABLED` | No | `false` | Retrieval (reader) audio gate: only `true` or `false` after trimming and case normalization. Independent of the ingestion writer gate. Keep disabled until reader and enablement gates pass. |
+| `AUDIO_MAX_ACL_AGE_SECONDS` | When retrieval audio is enabled | No default | Positive integer maximum age of the audio manifest's verified ACL. Audio requires `ACL_ENABLED=true`; missing, expired, or future verification timestamps hide the evidence. |
+| `AUDIO_MAX_SOURCE_AGE_SECONDS` | When retrieval audio is enabled | No default | Positive integer maximum age of source-version verification for audio. Obtain security/product approval for both freshness limits; no production freshness policy is supplied by the code. |
 | `MAX_EVIDENCE_CHUNKS` | No | `5` | Default top-K when omitted by request; public request allows 1–20. |
 | `MAX_PLANNED_QUERIES` | No | `3` | Maximum planner queries used by retrieval. |
 | `RETRIEVAL_TIMEOUT_SECONDS` | No | `5.0` | Retrieval fan-out wait bound and query embedding timeout; not a Cosmos SDK query timeout. |
@@ -329,6 +353,9 @@ remove reference markers from generated answer text.
 | `OPENAI_API_VERSION` | No | `2024-10-21` | Azure OpenAI API version for standard embeddings/chat. |
 | `RETRIEVAL_OPERATION_TIMEOUT_SECONDS` | No | `27.0` | Wall-clock middleware deadline for `/api/query`. |
 | `RATE_LIMIT_RPM` | No | Runtime fallback `30` | Per-user requests per minute per ACA replica. Current Bicep does not emit an override. |
+
+The audio settings above are not yet emitted by the deployment controller or Bicep.
+They do not enable a Speech client or grant permission to process recordings.
 
 ### Catalog-owned relevance settings
 
