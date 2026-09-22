@@ -389,6 +389,78 @@ def test_aca_requires_immutable_inputs_and_exact_gateway_auth() -> None:
     assert "output retrievalContainerAppName string" in main_source
 
 
+def test_audio_staging_account_is_deny_gated_to_speech_resource_instance() -> None:
+    template = _compile_bicep("infra/modules/audio-staging.bicep")
+    account = _resources(template, "Microsoft.Storage/storageAccounts")[0]
+    properties = account["properties"]
+
+    # Public endpoint on (required for Speech resource-instance access) but locked down.
+    assert properties["publicNetworkAccess"] == "Enabled"
+    assert properties["allowSharedKeyAccess"] is False
+    assert properties["allowBlobPublicAccess"] is False
+    assert properties["minimumTlsVersion"] == "TLS1_2"
+    network_acls = properties["networkAcls"]
+    assert network_acls["defaultAction"] == "Deny"
+    assert network_acls["virtualNetworkRules"] == []
+    assert network_acls["ipRules"] == []
+    assert network_acls["resourceAccessRules"] == [
+        {
+            "tenantId": "[subscription().tenantId]",
+            "resourceId": "[parameters('speechAccountId')]",
+        }
+    ]
+    containers = _resources(
+        template, "Microsoft.Storage/storageAccounts/blobServices/containers"
+    )
+    assert len(containers) == 1
+    assert template["parameters"]["containerName"]["defaultValue"] == "audio-staging"
+    assert containers[0]["properties"]["publicAccess"] == "None"
+
+
+def test_audio_staging_rbac_is_least_privilege_split() -> None:
+    template = _compile_bicep("infra/modules/audio-staging-rbac.bicep")
+    roles = _resources(template, "Microsoft.Authorization/roleAssignments")
+    roles_by_principal = {
+        role["properties"]["principalId"]: role["properties"]["roleDefinitionId"]
+        for role in roles
+    }
+    assert len(roles) == 2
+    assert template["variables"]["roles"]["StorageBlobDataContributor"] == (
+        "ba92f5b4-2d11-453d-a403-e96b0029c9fe"
+    )
+    assert template["variables"]["roles"]["StorageBlobDataReader"] == (
+        "2a2b9908-6ea1-4ae2-8e65-a410df84e7d1"
+    )
+    # Function MI writes/deletes source audio; Speech MI only reads it.
+    assert roles_by_principal["[parameters('functionPrincipalId')]"].endswith(
+        "variables('roles').StorageBlobDataContributor)]"
+    )
+    assert roles_by_principal["[parameters('speechPrincipalId')]"].endswith(
+        "variables('roles').StorageBlobDataReader)]"
+    )
+    assert all(
+        role["properties"]["principalType"] == "ServicePrincipal" for role in roles
+    )
+
+
+def test_audio_staging_composition_is_gated_and_privately_reachable() -> None:
+    main_source = (PROJECT_ROOT / "infra/main.bicep").read_text(encoding="utf-8")
+
+    assert (
+        "module audioStaging './modules/audio-staging.bicep' = if (audioWriterEnabled)"
+    ) in main_source
+    assert (
+        "module audioStagingRbac './modules/audio-staging-rbac.bicep' = if (audioWriterEnabled)"
+    ) in main_source
+    assert "speechAccountId: speech.?outputs.?accountId ?? ''" in main_source
+    assert "speechPrincipalId: speech.?outputs.?principalId ?? ''" in main_source
+    # Function reaches the Deny-gated account only via a blob private endpoint.
+    assert "name: 'storage-blob-staging'" in main_source
+    assert "resourceId: audioStaging.?outputs.?storageAccountId ?? ''" in main_source
+    assert "audioStaging.?outputs.?blobEndpoint ?? ''" in main_source
+    assert "audioStaging.?outputs.?containerName ?? ''" in main_source
+
+
 def test_key_vault_uri_uses_the_complete_environment_suffix() -> None:
     main_source = (PROJECT_ROOT / "infra/main.bicep").read_text(encoding="utf-8")
 

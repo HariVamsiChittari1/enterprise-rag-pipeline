@@ -76,6 +76,78 @@ def build_transcript(
     return audio, segments
 
 
+_BATCH_TRANSCRIPTION_MODE = "batch"
+_BATCH_API_VERSION = "2024-11-15"
+_TICKS_PER_MS = 10_000  # one tick is 100 nanoseconds
+
+
+def build_transcript_from_batch(
+    body: bytes,
+    *,
+    locale: str,
+    profile_version: str,
+    source_version: str,
+    source_content_hash: str,
+    max_response_bytes: int,
+    max_phrases: int,
+    max_words: int,
+) -> tuple[AudioMetadata, tuple[AudioTranscriptSegment, ...]]:
+    """Build validated metadata and segments from a batch transcription result file.
+
+    The batch result schema (``recognizedPhrases`` + ``nBest``) is projected onto the fast
+    phrase shape and validated by the shared projector, so both providers share one strictness
+    path. Duration comes from the response; channel count is omitted.
+    """
+    _validate_limits(max_response_bytes, max_phrases, max_words)
+    response = _decode_response(body, max_response_bytes)
+    duration = response.get("durationMilliseconds")
+    if type(duration) is not int or not 0 < duration <= _MAX_DURATION_MS:
+        raise TerminalDocumentError("audio_response_duration_invalid")
+    audio = AudioMetadata(
+        duration, None, locale, _BATCH_TRANSCRIPTION_MODE, _BATCH_API_VERSION,
+        profile_version, source_version, source_content_hash,
+    )
+    projected = _batch_result_to_fast_shape(response, locale, duration)
+    segments = _project_phrases(projected, audio, max_phrases, max_words)
+    return audio, segments
+
+
+def _batch_result_to_fast_shape(response: dict[str, Any], locale: str, duration_ms: int) -> dict[str, Any]:
+    """Map a batch result's recognizedPhrases onto the fast phrase shape (Success phrases only)."""
+    recognized = response.get("recognizedPhrases")
+    if not isinstance(recognized, list):
+        raise TerminalDocumentError("audio_response_invalid_shape")
+    phrases: list[dict[str, Any]] = []
+    for phrase in recognized:
+        if not isinstance(phrase, dict):
+            raise TerminalDocumentError("audio_response_invalid_phrase")
+        if phrase.get("recognitionStatus") != "Success":
+            continue
+        offset_ticks = phrase.get("offsetInTicks")
+        duration_ticks = phrase.get("durationInTicks")
+        n_best = phrase.get("nBest")
+        if (
+            not _is_number(offset_ticks) or not _is_number(duration_ticks)
+            or not isinstance(n_best, list) or not n_best or not isinstance(n_best[0], dict)
+        ):
+            raise TerminalDocumentError("audio_response_invalid_phrase")
+        best = n_best[0]
+        text = best.get("display") or best.get("lexical")
+        words = best.get("displayWords") or best.get("words") or []
+        phrases.append({
+            "locale": locale,
+            "offsetMilliseconds": int(round(offset_ticks / _TICKS_PER_MS)),
+            "durationMilliseconds": int(round(duration_ticks / _TICKS_PER_MS)),
+            "text": text if isinstance(text, str) else "",
+            "words": words if isinstance(words, list) else [],
+        })
+    return {"durationMilliseconds": duration_ms, "phrases": phrases}
+
+
+def _is_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
 def _validate_limits(max_response_bytes: int, max_phrases: int, max_words: int) -> None:
     if any(type(limit) is not int or limit <= 0 for limit in (
         max_response_bytes, max_phrases, max_words,

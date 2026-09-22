@@ -377,8 +377,10 @@ def _to_chunk(candidate: Mapping[str, Any]) -> RetrievedChunk:
                 and (type(audio.get("channelCount")) is not int or audio["channelCount"] not in (1, 2)))
             or not isinstance(audio.get("locale"), str)
             or re.fullmatch(r"en-[A-Z]{2}", audio["locale"]) is None
-            or audio.get("mode") not in ("fast", "enhanced")
-            or audio.get("apiVersion") != "2025-10-15"
+            or not (
+                (audio.get("mode") in ("fast", "enhanced") and audio.get("apiVersion") == "2025-10-15")
+                or (audio.get("mode") == "batch" and audio.get("apiVersion") == "2024-11-15")
+            )
             or any(not isinstance(audio.get(name), str) or not audio[name].strip()
                    for name in ("sourceVersion", "sourceContentHash", "profileVersion"))
             or re.fullmatch(r"[0-9a-f]{64}", audio["sourceContentHash"]) is None

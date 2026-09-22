@@ -71,6 +71,7 @@ class DocumentStage(str, Enum):
     ACL = "acl"
     DOWNLOAD = "download"
     EXTRACTION = "extraction"
+    TRANSCRIBING = "transcribing"
     CHUNKING = "chunking"
     ENRICHMENT = "enrichment"
     EMBEDDING = "embedding"
@@ -546,7 +547,10 @@ class AudioMetadata:
             raise ValueError("audio channel count is invalid")
         if not isinstance(self.locale, str) or re.fullmatch(r"en-[A-Z]{2}", self.locale) is None:
             raise ValueError("audio requires an English locale")
-        if self.mode not in ("fast", "enhanced") or self.api_version != "2025-10-15":
+        if not (
+            (self.mode in ("fast", "enhanced") and self.api_version == "2025-10-15")
+            or (self.mode == "batch" and self.api_version == "2024-11-15")
+        ):
             raise ValueError("audio transcription profile is unsupported")
         _require_text("audio profile version", self.profile_version, 200)
         _require_text("audio source version", self.source_version, 500)
@@ -782,6 +786,9 @@ class SourceDocumentRecord:
     schema_version: int = SCHEMA_VERSION
     audio: AudioMetadata | None = field(default=None, metadata={"omit_none": True})
     source_verified_at: str | None = field(default=None, metadata={"omit_none": True})
+    # Transient batch-transcription tracking, set together while stage == TRANSCRIBING.
+    transcription_job_url: str | None = field(default=None, metadata={"omit_none": True})
+    staging_blob_name: str | None = field(default=None, metadata={"omit_none": True})
 
     def __post_init__(self) -> None:
         expected_document_id = create_document_id(self.source_id, self.drive_id, self.item_id)
@@ -810,7 +817,20 @@ class SourceDocumentRecord:
                 raise ValueError("ready audio requires metadata and source verification")
             if self.source_verified_at is not None:
                 _require_utc("source_verified_at", self.source_verified_at)
-        elif self.audio is not None or self.source_verified_at is not None:
+            if (self.transcription_job_url is None) != (self.staging_blob_name is None):
+                raise ValueError("transcription job url and staging blob name must be set together")
+            for _name, _value in (
+                ("transcription_job_url", self.transcription_job_url),
+                ("staging_blob_name", self.staging_blob_name),
+            ):
+                if _value is not None and (not isinstance(_value, str) or not _value.strip()):
+                    raise ValueError(f"{_name} must be a non-empty string when set")
+        elif (
+            self.audio is not None
+            or self.source_verified_at is not None
+            or self.transcription_job_url is not None
+            or self.staging_blob_name is not None
+        ):
             raise ValueError("document schema does not accept audio fields")
         _validate_document_fields(self)
         _validate_sorted_unique("allowed_group_ids", self.allowed_group_ids, require_nonempty=True)

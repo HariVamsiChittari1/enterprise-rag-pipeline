@@ -41,6 +41,8 @@ LIFECYCLE_RECONCILE_SCHEDULE = os.getenv(
 LIFECYCLE_RECONCILE_PAGE_SIZE = int(
     os.getenv("LIFECYCLE_RECONCILE_PAGE_SIZE", "50")
 )
+AUDIO_POLL_SCHEDULE = os.getenv("AUDIO_POLL_SCHEDULE", "0 */5 * * * *")  # every 5 minutes
+AUDIO_POLL_PAGE_SIZE = int(os.getenv("AUDIO_POLL_PAGE_SIZE", "20"))
 SUBSCRIPTION_RENEW_SCHEDULE = os.getenv("SUBSCRIPTION_RENEW_SCHEDULE", "0 0 2 * * *")
 WEBHOOK_CLIENT_STATE = os.getenv("WEBHOOK_CLIENT_STATE", "")
 
@@ -903,6 +905,88 @@ def lifecycle_reconcile_orchestrator(context: df.DurableOrchestrationContext):
     }
 
 
+@app.timer_trigger(schedule=AUDIO_POLL_SCHEDULE, arg_name="timer", run_on_startup=False, use_monitor=True)
+@app.durable_client_input(client_name="client")
+async def audio_transcription_poll_timer(timer: func.TimerRequest, client) -> None:
+    """Advance audio documents awaiting batch transcription (poll the batch jobs, finalize)."""
+    from config import load_config
+    from ingestion.lifecycle_repository import AUDIO_POLL_TRIGGER_ID
+
+    config = load_config()
+    if not (config.audio_writer_enabled and config.audio_transcription_provider == "speech_batch"):
+        return
+    source_id = os.getenv("INGESTION_SOURCE_ID", "").strip()
+    if not source_id:
+        logger.warning("audio_transcription_poll_timer skipped: missing INGESTION_SOURCE_ID")
+        return
+    lifecycle_repository = _build_lifecycle_repository(config)
+    started = await _start_if_not_running(
+        client, lifecycle_repository, source_id, AUDIO_POLL_TRIGGER_ID,
+        "audio_transcription_poll_orchestrator",
+    )
+    if not started:
+        logger.info("audio_transcription_poll_timer skipped: previous pass still running")
+
+
+@app.orchestration_trigger(context_name="context")
+def audio_transcription_poll_orchestrator(context: df.DurableOrchestrationContext):
+    """Page through documents awaiting transcription and finalize the completed ones."""
+    continuation_token: str | None = None
+    checked = succeeded = failed = pending = 0
+    while True:
+        result = yield context.call_activity(
+            "audio_transcription_poll_page_activity",
+            {"continuationToken": continuation_token},
+        )
+        if result.get("error"):
+            return {"status": "failed", "error": result["error"]}
+        checked += result["checked"]
+        succeeded += result["succeeded"]
+        failed += result["failed"]
+        pending += result["pending"]
+        continuation_token = result.get("continuationToken")
+        if continuation_token is None:
+            break
+    return {"status": "completed", "checked": checked, "succeeded": succeeded, "failed": failed, "pending": pending}
+
+
+@app.activity_trigger(input_name="payload")
+def audio_transcription_poll_page_activity(payload: dict) -> dict:
+    from config import load_config
+    from ingestion.services import run_audio_transcription_poll_page
+    from ingestion.source_connector import SharePointConnector
+
+    try:
+        config = load_config()
+        repository = _build_repository(config)
+        lifecycle_repository = _build_lifecycle_repository(config)
+        graph_client = _build_graph_client(config)
+        sp_client = _build_sharepoint_client(config)
+        language_client = _build_language_client(config) if config.enrichment_enabled else None
+        openai_client = _build_openai_client(config)
+        audit_container = _build_audit_container(config)
+        connector = SharePointConnector(graph_client, config.drive_id, sp_client=sp_client, site_url=config.sharepoint_site_url)
+        speech_token_provider = _build_speech_token_provider(config)
+        blob_service_client = _build_audio_staging_client(config)
+        outcome, token = run_audio_transcription_poll_page(
+            config, repository, lifecycle_repository, connector, language_client, openai_client,
+            speech_token_provider=speech_token_provider, blob_service_client=blob_service_client,
+            page_size=AUDIO_POLL_PAGE_SIZE, continuation_token=payload.get("continuationToken"),
+            audit_container=audit_container,
+        )
+        logger.info(
+            "audio_poll_page_completed checked=%d succeeded=%d failed=%d pending=%d has_more=%s",
+            outcome.checked, outcome.succeeded, outcome.failed, outcome.pending, token is not None,
+        )
+        return {
+            "checked": outcome.checked, "succeeded": outcome.succeeded,
+            "failed": outcome.failed, "pending": outcome.pending, "continuationToken": token,
+        }
+    except Exception:
+        logger.exception("audio_transcription_poll_page_activity failed")
+        return {"error": "audio_transcription_poll_failed"}
+
+
 @app.orchestration_trigger(context_name="context")
 def retry_failed_orchestrator(context: df.DurableOrchestrationContext):
     """Reprocess only the failed documents that were reset to discovered."""
@@ -1007,6 +1091,11 @@ def process_document_activity(payload: dict) -> dict:
         openai_client = _build_openai_client(config)
         audit_container = _build_audit_container(config)
         speech_token_provider = _build_speech_token_provider(config) if config.audio_writer_enabled else None
+        blob_service_client = (
+            _build_audio_staging_client(config)
+            if config.audio_writer_enabled and config.audio_transcription_provider == "speech_batch"
+            else None
+        )
 
         sp_client = _build_sharepoint_client(config)
         connector = SharePointConnector(graph_client, config.drive_id, sp_client=sp_client, site_url=config.sharepoint_site_url)
@@ -1021,6 +1110,7 @@ def process_document_activity(payload: dict) -> dict:
                 audit_container=audit_container,
                 cu_client=cu_client,
                 speech_token_provider=speech_token_provider,
+                blob_service_client=blob_service_client,
             )
             if outcome.status.value == "succeeded":
                 _retire_prior_version(config, document_ref["documentId"], document_ref["sourceRunId"], audit_container)
@@ -1162,11 +1252,19 @@ def delta_sync_activity(payload: Any) -> dict:
         audit_container = _build_audit_container(config)
         sp_client = _build_sharepoint_client(config)
         connector = SharePointConnector(graph_client, config.drive_id, sp_client=sp_client, site_url=config.sharepoint_site_url)
+        speech_token_provider = _build_speech_token_provider(config) if config.audio_writer_enabled else None
+        blob_service_client = (
+            _build_audio_staging_client(config)
+            if config.audio_writer_enabled and config.audio_transcription_provider == "speech_batch"
+            else None
+        )
         outcome = run_delta_sync(
             config, repository, lifecycle_repository, connector,
             di_client, language_client, openai_client,
             audit_container=audit_container,
             cu_client=cu_client,
+            speech_token_provider=speech_token_provider,
+            blob_service_client=blob_service_client,
         )
         logger.info(
             "delta_sync_completed bootstrapped=%s created_or_updated=%d deleted=%d acl_resynced=%d failed=%d items_seen=%d",
@@ -1521,6 +1619,17 @@ def _build_speech_token_provider(config):
             credential, "https://cognitiveservices.azure.com/.default",
         )
     return _client_cache["speech_token_provider"]
+
+
+def _build_audio_staging_client(config):
+    if "audio_staging_client" not in _client_cache:
+        from azure.identity import DefaultAzureCredential
+        from azure.storage.blob import BlobServiceClient
+        credential = DefaultAzureCredential(managed_identity_client_id=config.managed_identity_client_id)
+        _client_cache["audio_staging_client"] = BlobServiceClient(
+            account_url=config.audio_staging_blob_endpoint, credential=credential,
+        )
+    return _client_cache["audio_staging_client"]
 
 
 def _build_audit_container(config):

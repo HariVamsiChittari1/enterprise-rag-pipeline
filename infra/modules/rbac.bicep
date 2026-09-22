@@ -13,6 +13,9 @@ param documentIntelligenceId string
 @description('Content Understanding resource ID')
 param contentUnderstandingId string
 
+@description('Speech resource ID')
+param speechId string = ''
+
 @description('Azure AI Language resource ID')
 param languageServiceId string
 
@@ -35,6 +38,10 @@ resource contentUnderstanding 'Microsoft.CognitiveServices/accounts@2025-06-01' 
   name: split(contentUnderstandingId, '/')[8]
 }
 
+resource speech 'Microsoft.CognitiveServices/accounts@2025-06-01' existing = if (!empty(speechId)) {
+  name: split(speechId, '/')[8]
+}
+
 resource languageService 'Microsoft.CognitiveServices/accounts@2024-10-01' existing = {
   name: split(languageServiceId, '/')[8]
 }
@@ -50,6 +57,7 @@ var roles = {
   StorageTableDataContributor: '0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3'
   CognitiveServicesUser: 'a97b65f3-24c7-4388-baec-2e87135dc908'
   ContentUnderstandingContributor: '59a2dba3-6303-4fd8-9a2e-8cbb4bdda972'
+  CognitiveServicesSpeechUser: 'f2dc8367-1007-4938-bd23-fe263f013447'
   MonitoringMetricsPublisher: '3913510d-42f4-4e42-8a64-420c390055eb'
 }
 
@@ -132,6 +140,19 @@ resource languageServiceUser 'Microsoft.Authorization/roleAssignments@2022-04-01
   }
 }
 
+resource speechUser 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (!empty(speechId)) {
+  name: guid(speech.id, principalId, roles.CognitiveServicesSpeechUser)
+  scope: speech
+  properties: {
+    roleDefinitionId: subscriptionResourceId(
+      'Microsoft.Authorization/roleDefinitions',
+      roles.CognitiveServicesSpeechUser
+    )
+    principalId: principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
 resource monitoringPublisher 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   name: guid(applicationInsights.id, principalId, roles.MonitoringMetricsPublisher)
   scope: applicationInsights
@@ -145,4 +166,4 @@ resource monitoringPublisher 'Microsoft.Authorization/roleAssignments@2022-04-01
   }
 }
 
-output roleAssignmentsCreated int = empty(contentUnderstandingId) ? 7 : 8
+output roleAssignmentsCreated int = 7 + (empty(contentUnderstandingId) ? 0 : 1) + (empty(speechId) ? 0 : 1)

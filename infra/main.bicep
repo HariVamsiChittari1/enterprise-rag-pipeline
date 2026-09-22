@@ -35,6 +35,19 @@ param contentUnderstandingAnalyzerId string = 'prebuilt-documentSearch'
 @description('Temporary public IPv4 address allowed during guarded Content Understanding setup; empty keeps private-only access')
 param contentUnderstandingAllowedIpAddress string = ''
 
+@description('Enable the audio ingestion writer and provision a dedicated Speech resource')
+param audioWriterEnabled bool = false
+
+@description('Enable audio chunks in the retrieval reader')
+param audioRetrievalEnabled bool = false
+
+@description('Audio transcription locale')
+@allowed(['en-US', 'en-GB', 'en-IN'])
+param audioLocale string = 'en-US'
+
+@description('Temporary public IPv4 address allowed during a guarded Speech transcription spike; empty keeps the Speech resource private-only')
+param speechAllowedIpAddress string = ''
+
 @description('SharePoint tenant ID')
 param sharePointTenantId string
 
@@ -174,6 +187,7 @@ param tags object = {
 var suffix = take(uniqueString(resourceGroup().id, deploymentInstanceId), 8)
 var prefix = 'rag-${deploymentInstanceId}'
 var storageName = take('st${replace(prefix, '-', '')}${suffix}', 24)
+var audioStagingName = take('astg${suffix}', 24)
 var openAiEndpoint = 'https://${openAiAccountName}.openai.azure.com/'
 var sharePointKeyVaultId = resourceId(
   subscription().subscriptionId,
@@ -263,6 +277,29 @@ module contentUnderstanding './modules/content-understanding.bicep' = if (conten
   }
 }
 
+module speech './modules/speech.bicep' = if (audioWriterEnabled) {
+  name: 'speech'
+  params: {
+    accountName: take('${prefix}-speech-${suffix}', 64)
+    location: location
+    allowedIpAddress: speechAllowedIpAddress
+    tags: tags
+  }
+}
+
+// Dedicated, Deny-gated staging account so Speech batch transcription can read the source audio
+// via its system-assigned MI without exposing the shared Functions/Durable account.
+module audioStaging './modules/audio-staging.bicep' = if (audioWriterEnabled) {
+  name: 'audio-staging'
+  params: {
+    storageAccountName: audioStagingName
+    location: location
+    redundancy: storageRedundancy
+    speechAccountId: speech.?outputs.?accountId ?? ''
+    tags: tags
+  }
+}
+
 module networking './modules/networking.bicep' = {
   name: 'networking'
   params: {
@@ -316,16 +353,34 @@ module networking './modules/networking.bicep' = {
           dnsZoneName: 'privatelink.cognitiveservices.azure.com'
         }
       ],
-      contentUnderstandingEnabled
-        ? [
-            {
-              name: 'content-understanding'
-              resourceId: contentUnderstanding.?outputs.?accountId ?? ''
-              groupId: 'account'
-              dnsZoneName: 'privatelink.services.ai.azure.com'
-            }
-          ]
-        : []
+      concat(
+        contentUnderstandingEnabled
+          ? [
+              {
+                name: 'content-understanding'
+                resourceId: contentUnderstanding.?outputs.?accountId ?? ''
+                groupId: 'account'
+                dnsZoneName: 'privatelink.services.ai.azure.com'
+              }
+            ]
+          : [],
+        audioWriterEnabled
+          ? [
+              {
+                name: 'speech'
+                resourceId: speech.?outputs.?accountId ?? ''
+                groupId: 'account'
+                dnsZoneName: 'privatelink.cognitiveservices.azure.com'
+              }
+              {
+                name: 'storage-blob-staging'
+                resourceId: audioStaging.?outputs.?storageAccountId ?? ''
+                groupId: 'blob'
+                dnsZoneName: 'privatelink.blob.${environment().suffixes.storage}'
+              }
+            ]
+          : []
+      )
     )
     tags: tags
   }
@@ -371,6 +426,15 @@ module functions './modules/functions.bicep' = if (deployServing) {
     contentUnderstandingAnalyzerId: contentUnderstandingEnabled ? contentUnderstandingAnalyzerId : ''
     contentUnderstandingEnabled: contentUnderstandingEnabled
     languageEndpoint: documentIntelligence.outputs.languageServiceEndpoint
+    speechEndpoint: speech.?outputs.?endpoint ?? ''
+    speechRegion: audioWriterEnabled ? location : ''
+    audioWriterEnabled: audioWriterEnabled
+    audioLocale: audioLocale
+    audioStagingBlobEndpoint: audioWriterEnabled ? (audioStaging.?outputs.?blobEndpoint ?? '') : ''
+    audioStagingContainer: audioWriterEnabled ? (audioStaging.?outputs.?containerName ?? '') : ''
+    allowedFileExtensions: audioWriterEnabled
+      ? '.md,.pdf,.docx,.pptx,.xlsx,.wav,.mp3,.flac'
+      : '.md,.pdf,.docx,.pptx,.xlsx'
     keyVaultUri: sharePointKeyVaultUri
     entraTenantId: sharePointTenantId
     sharePointAppClientId: sharePointAppClientId
@@ -396,8 +460,18 @@ module rbac './modules/rbac.bicep' = {
     storageAccountId: storage.outputs.storageAccountId
     documentIntelligenceId: documentIntelligence.outputs.documentIntelligenceId
     contentUnderstandingId: contentUnderstanding.?outputs.?accountId ?? ''
+    speechId: speech.?outputs.?accountId ?? ''
     languageServiceId: documentIntelligence.outputs.languageServiceId
     applicationInsightsId: monitoring.outputs.applicationInsightsId
+  }
+}
+
+module audioStagingRbac './modules/audio-staging-rbac.bicep' = if (audioWriterEnabled) {
+  name: 'audio-staging-rbac'
+  params: {
+    functionPrincipalId: identity.outputs.identityPrincipalId
+    speechPrincipalId: speech.?outputs.?principalId ?? ''
+    storageAccountId: audioStaging.?outputs.?storageAccountId ?? ''
   }
 }
 
@@ -518,6 +592,7 @@ module retrievalConfig './modules/retrieval-config.bicep' = if (deployServing) {
     deploymentInstanceId: deploymentInstanceId
     catalogPollSeconds: retrievalCatalogPollSeconds
     aclEnabled: aclEnabled
+    audioRetrievalEnabled: audioRetrievalEnabled
     includeCitations: includeCitations
     appInsightsConnectionString: monitoring.outputs.connectionString
     retrievalConfigContainer: cosmos.outputs.retrievalConfigContainerName
@@ -572,6 +647,7 @@ output cosmosDbDatabaseName string = cosmos.outputs.databaseName
 output documentIntelligenceEndpoint string = documentIntelligence.outputs.documentIntelligenceEndpoint
 output contentUnderstandingAccountId string = contentUnderstanding.?outputs.?accountId ?? ''
 output contentUnderstandingEndpoint string = contentUnderstanding.?outputs.?endpoint ?? ''
+output speechEndpoint string = speech.?outputs.?endpoint ?? ''
 output contentUnderstandingCompletionDeploymentName string = contentUnderstanding.?outputs.?completionDeploymentName ?? ''
 output contentUnderstandingEmbeddingDeploymentName string = contentUnderstanding.?outputs.?embeddingDeploymentName ?? ''
 output openAiEndpoint string = openAiEndpoint

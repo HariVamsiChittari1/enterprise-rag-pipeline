@@ -552,7 +552,51 @@ def test_audio_manifest_and_chunk_round_trip_to_compatible_reader() -> None:
 def test_v1_serialization_does_not_gain_audio_fields() -> None:
     assert "audio" not in build_document_record().to_cosmos_item()
     assert "sourceVerifiedAt" not in build_document_record().to_cosmos_item()
+    assert "transcriptionJobUrl" not in build_document_record().to_cosmos_item()
+    assert "stagingBlobName" not in build_document_record().to_cosmos_item()
     assert not {"audio", "startMs", "endMs"}.intersection(build_chunk_record().to_cosmos_item())
+
+
+def _transcribing_values() -> dict[str, object]:
+    return document_values() | {
+        "mime_type": "audio/wav",
+        "status": DocumentStatus.PROCESSING,
+        "stage": DocumentStage.TRANSCRIBING,
+        "transcription_job_url": (
+            "https://speech.cognitiveservices.azure.com/speechtotext/transcriptions/abc"
+            "?api-version=2024-11-15"
+        ),
+        "staging_blob_name": "source/abc.wav",
+    }
+
+
+def test_transcribing_document_round_trips_batch_tracking_fields() -> None:
+    from ingestion import repository as repository_module
+
+    record = SourceDocumentRecord(**_transcribing_values())
+    item = record.to_cosmos_item()
+    assert item["stage"] == "transcribing"
+    assert item["transcriptionJobUrl"] == record.transcription_job_url
+    assert item["stagingBlobName"] == "source/abc.wav"
+
+    restored = repository_module._document_from_item(item)
+    assert restored.stage is DocumentStage.TRANSCRIBING
+    assert restored.transcription_job_url == record.transcription_job_url
+    assert restored.staging_blob_name == "source/abc.wav"
+
+
+@pytest.mark.parametrize("drop", ["transcription_job_url", "staging_blob_name"])
+def test_batch_tracking_fields_must_be_set_together(drop: str) -> None:
+    values = _transcribing_values() | {drop: None}
+    with pytest.raises(ValueError, match="must be set together"):
+        SourceDocumentRecord(**values)
+
+
+@pytest.mark.parametrize("field", ["transcription_job_url", "staging_blob_name"])
+def test_non_audio_document_rejects_batch_tracking_fields(field: str) -> None:
+    values = document_values() | {field: "x"}
+    with pytest.raises(ValueError, match="does not accept audio fields"):
+        SourceDocumentRecord(**values)
 
 
 def test_ready_audio_requires_verified_source_and_metadata() -> None:

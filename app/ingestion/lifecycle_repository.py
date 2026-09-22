@@ -19,6 +19,7 @@ from typing import Any, Mapping
 from azure.core import MatchConditions
 
 from ingestion.models import (
+    DocumentStage,
     DocumentStatus,
     RETIRED_REASONS,
     SOURCE_DOCUMENT_RECORD_TYPE,
@@ -32,6 +33,7 @@ WEBHOOK_CONTROL_ID = "webhook-subscription"
 DELTA_SYNC_TRIGGER_ID = "delta-sync-trigger"
 ACL_RESYNC_TRIGGER_ID = "acl-resync-trigger"
 LIFECYCLE_RECONCILE_TRIGGER_ID = "lifecycle-reconcile-trigger"
+AUDIO_POLL_TRIGGER_ID = "audio-poll-trigger"
 MAX_PATCH_BATCH_OPERATIONS = 100
 MAX_PATCH_BATCH_ATTEMPTS = 3
 MAX_MANIFEST_CONFLICT_ATTEMPTS = 3
@@ -96,6 +98,20 @@ class LifecycleDocumentPage:
 @dataclass(frozen=True)
 class DuplicateDocumentPage:
     document_ids: tuple[str, ...]
+    continuation_token: str | None
+
+
+@dataclass(frozen=True)
+class AudioTranscribingRef:
+    """Minimal projection of an audio document awaiting batch transcription."""
+
+    document_id: str
+    source_run_id: str
+
+
+@dataclass(frozen=True)
+class AudioTranscribingPage:
+    items: tuple[AudioTranscribingRef, ...]
     continuation_token: str | None
 
 
@@ -303,6 +319,41 @@ class DocumentLifecycleRepository:
             ) from None
         return LifecycleDocumentPage(
             tuple(_lifecycle_ref_from_row(row) for row in page),
+            token,
+        )
+
+    def list_transcribing_documents_page(
+        self,
+        *,
+        page_size: int,
+        continuation_token: str | None = None,
+    ) -> AudioTranscribingPage:
+        """Page audio documents parked at PROCESSING/TRANSCRIBING for the batch poller."""
+        _validate_page_size(page_size)
+        query = (
+            "SELECT c.documentId, c.sourceRunId FROM c "
+            "WHERE c.recordType = @recordType AND c.status = @status AND c.stage = @stage"
+        )
+        parameters = [
+            {"name": "@recordType", "value": SOURCE_DOCUMENT_RECORD_TYPE},
+            {"name": "@status", "value": DocumentStatus.PROCESSING.value},
+            {"name": "@stage", "value": DocumentStage.TRANSCRIBING.value},
+        ]
+        try:
+            iterator = self._source_documents.query_items(
+                query=query,
+                parameters=parameters,
+                enable_cross_partition_query=True,
+                max_item_count=page_size,
+            )
+            page, token = _read_resumable_query_page(iterator, continuation_token)
+        except Exception:
+            raise LifecycleRepositoryError("Cosmos transcribing scan failed") from None
+        return AudioTranscribingPage(
+            tuple(
+                AudioTranscribingRef(row["documentId"], row["sourceRunId"])
+                for row in page
+            ),
             token,
         )
 

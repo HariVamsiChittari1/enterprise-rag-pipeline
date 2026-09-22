@@ -105,12 +105,15 @@ class IngestionConfig:
     audio_max_response_bytes: int = 16 * 1024 * 1024
     audio_max_phrases: int = 20_000
     audio_max_words: int = 400_000
+    audio_staging_blob_endpoint: str = ""
+    audio_staging_container: str = ""
+    audio_batch_ttl_hours: int = 48
 
     def __post_init__(self) -> None:
         if type(self.audio_writer_enabled) is not bool:
             raise ValueError("AUDIO_WRITER_ENABLED must be true or false")
-        if self.audio_transcription_provider != "speech_fast":
-            raise ValueError("AUDIO_TRANSCRIPTION_PROVIDER must be speech_fast")
+        if self.audio_transcription_provider not in ("speech_fast", "speech_batch"):
+            raise ValueError("AUDIO_TRANSCRIPTION_PROVIDER must be speech_fast or speech_batch")
         if self.audio_writer_enabled and not self.extraction_enabled:
             raise ValueError("AUDIO_WRITER_ENABLED requires EXTRACTION_ENABLED")
         for name, value in (
@@ -164,6 +167,24 @@ class IngestionConfig:
         ):
             if type(value) is not int or value <= 0:
                 raise ValueError(f"{name} must be a positive integer")
+        if type(self.audio_batch_ttl_hours) is not int or not (6 <= self.audio_batch_ttl_hours <= 744):
+            raise ValueError("AUDIO_BATCH_TTL_HOURS must be an integer between 6 and 744")
+        # Batch transcription stages source audio in a dedicated blob container Speech can read.
+        if self.audio_writer_enabled and self.audio_transcription_provider == "speech_batch":
+            for name, value in (
+                ("AUDIO_STAGING_BLOB_ENDPOINT", self.audio_staging_blob_endpoint),
+                ("AUDIO_STAGING_CONTAINER", self.audio_staging_container),
+            ):
+                if not value:
+                    raise ValueError(f"AUDIO_TRANSCRIPTION_PROVIDER=speech_batch requires {name}")
+            staging = urlsplit(self.audio_staging_blob_endpoint)
+            if (
+                any(character.isspace() or ord(character) < 32 for character in self.audio_staging_blob_endpoint)
+                or staging.scheme != "https"
+                or staging.netloc != staging.hostname
+                or not (staging.hostname or "").endswith(".blob.core.windows.net")
+            ):
+                raise ValueError("AUDIO_STAGING_BLOB_ENDPOINT must be an HTTPS blob endpoint URL")
 
     @property
     def extraction_provider(self) -> ExtractionProvider | None:
@@ -255,4 +276,7 @@ def load_config() -> IngestionConfig:
         audio_max_response_bytes=_int("AUDIO_MAX_RESPONSE_BYTES", 16 * 1024 * 1024),
         audio_max_phrases=_int("AUDIO_MAX_PHRASES", 20_000),
         audio_max_words=_int("AUDIO_MAX_WORDS", 400_000),
+        audio_staging_blob_endpoint=os.getenv("AUDIO_STAGING_BLOB_ENDPOINT", "").strip(),
+        audio_staging_container=os.getenv("AUDIO_STAGING_CONTAINER", "").strip(),
+        audio_batch_ttl_hours=_int("AUDIO_BATCH_TTL_HOURS", 48),
     )

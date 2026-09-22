@@ -128,6 +128,28 @@ def test_audio_rejects_invalid_temporal_contract(overrides: dict[str, object]) -
         retriever.to_chunks([audio_candidate() | overrides])
 
 
+def test_audio_accepts_batch_transcription_profile() -> None:
+    retriever = SecureCosmosRetriever(Mock(), Mock())
+    candidate = audio_candidate()
+    candidate["audio"] = dict(candidate["audio"]) | {"mode": "batch", "apiVersion": "2024-11-15"}
+    result = retriever.to_chunks([candidate])
+    assert len(result) == 1
+    assert (result[0].start_ms, result[0].end_ms) == (0, 2000)
+
+
+@pytest.mark.parametrize("overrides", [
+    {"mode": "batch", "apiVersion": "2025-10-15"},  # mismatched pair
+    {"mode": "fast", "apiVersion": "2024-11-15"},
+    {"mode": "unknown", "apiVersion": "2024-11-15"},
+])
+def test_audio_rejects_mismatched_transcription_profile(overrides: dict[str, object]) -> None:
+    retriever = SecureCosmosRetriever(Mock(), Mock())
+    candidate = audio_candidate()
+    candidate["audio"] = dict(candidate["audio"]) | overrides
+    with pytest.raises(ValueError, match="invalid_retrieval_record"):
+        retriever.to_chunks([candidate])
+
+
 @pytest.mark.parametrize("raw", [False, True])
 @pytest.mark.parametrize("mode", list(RetrievalMode))
 @pytest.mark.parametrize("enabled", [False, True])

@@ -654,6 +654,92 @@ def test_admission_rejects_missing_manifest_page() -> None:
         begin_admission(repository, bound, 0)
 
 
+def _audio_processing_document(repository: IngestionRepository) -> Any:
+    base = build_document(item_id="audio-1")
+    audio_doc = replace(
+        base, source_name="clip.wav", source_path="/clip.wav",
+        source_url="https://example.invalid/clip.wav", mime_type="audio/wav",
+    )
+    return create_processing_document(repository, document=audio_doc)
+
+
+def test_audio_document_admits_and_readies_without_visual_manifest() -> None:
+    from ingestion.models import AudioMetadata
+
+    documents = StatefulContainer("sourceRunId")
+    chunks = StatefulContainer("documentKey")
+    repository = IngestionRepository(StatefulContainer("sourceId"), documents, chunks)
+    processing = _audio_processing_document(repository)
+
+    content_hash = "a" * 64
+    audio = AudioMetadata(
+        3000, None, "en-US", "batch", "2024-11-15", "speech_batch",
+        processing.record.e_tag, content_hash,
+    )
+    # The PERSISTING update sets the audio metadata (no visual manifest is created).
+    bound = repository.update_processing_document(
+        replace(
+            processing.record, content_hash=content_hash, extraction_mode="speech_batch",
+            expected_chunk_count=1, audio=audio,
+        ),
+        processing.etag,
+    )
+    repository.write_chunks(build_chunks(1, document=bound.record, is_retrievable=True))
+
+    admitting = repository.begin_document_admission(
+        replace(
+            bound.record, status=DocumentStatus.ADMITTING, stage=DocumentStage.VERIFYING,
+            written_chunk_count=1, source_verified_at=UTC,
+        ),
+        bound.etag,
+    )
+    assert admitting.record.visual_manifest_page_count is None  # audio carries no manifest
+
+    ready = repository.verify_and_mark_document_ready(
+        build_ready_document(admitting.record, 1), admitting.etag,
+    )
+    assert ready.record.status is DocumentStatus.READY
+    assert ready.record.audio is not None
+
+
+def test_non_audio_document_still_requires_manifest_for_admission() -> None:
+    repository = IngestionRepository(
+        StatefulContainer("sourceId"), StatefulContainer("sourceRunId"), StatefulContainer("documentKey"),
+    )
+    processing = create_processing_document(repository)  # PDF, audio=None, no manifest bound
+    with pytest.raises(ValueError, match="admitting document integrity fields are incomplete"):
+        repository.begin_document_admission(
+            replace(
+                processing.record, status=DocumentStatus.ADMITTING, stage=DocumentStage.VERIFYING,
+                expected_chunk_count=1, written_chunk_count=1,
+            ),
+            processing.etag,
+        )
+
+
+def test_chunk_from_item_rehydrates_audio_metadata() -> None:
+    from ingestion.models import (
+        AudioMetadata, ContentModality, ExtractionProvenance, VisualCoverageStatus,
+    )
+
+    content_hash = "a" * 64
+    audio = AudioMetadata(
+        3000, None, "en-US", "batch", "2024-11-15", "speech_batch", "source-etag", content_hash,
+    )
+    audio_chunk = replace(
+        build_chunks(1, is_retrievable=True)[0],
+        audio=audio, start_ms=0, end_ms=3000, page_start=None, page_end=None,
+        locator_kind=LocatorKind.TIME, locator_label="00:00-00:03",
+        modalities=(ContentModality.TEXT, ContentModality.AUDIO_TRANSCRIPT),
+        provenance=(ExtractionProvenance.TRANSCRIBED,),
+        visual_coverage=VisualCoverageStatus.NOT_REQUIRED,
+    )
+    restored = repository_module._chunk_from_item(audio_chunk.to_cosmos_item())
+    assert isinstance(restored.audio, AudioMetadata)
+    assert (restored.start_ms, restored.end_ms) == (0, 3000)
+    assert restored.audio.source_content_hash == content_hash
+
+
 def test_ready_verification_consumes_every_projected_page_without_point_reads(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

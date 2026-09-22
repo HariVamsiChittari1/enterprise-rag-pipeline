@@ -32,6 +32,10 @@ param(
     [string]$DeploymentInstanceId,
     [bool]$DocumentIntelligenceEnabled = $true,
     [bool]$ContentUnderstandingEnabled = $false,
+    [bool]$AudioWriterEnabled = $false,
+    [bool]$AudioRetrievalEnabled = $false,
+    [ValidateSet('en-US', 'en-GB', 'en-IN')]
+    [string]$AudioLocale = 'en-US',
     [bool]$AclEnabled = $true,
     [bool]$IncludeCitations = $true,
     [string]$ContentUnderstandingAnalyzerId = 'prebuilt-documentSearch',
@@ -390,6 +394,9 @@ function Set-ParameterEnvironment {
     $env:DEPLOYMENT_INSTANCE_ID = $DeploymentInstanceId
     $env:DOCUMENT_INTELLIGENCE_ENABLED = $DocumentIntelligenceEnabled.ToString().ToLowerInvariant()
     $env:CONTENT_UNDERSTANDING_ENABLED = $ContentUnderstandingEnabled.ToString().ToLowerInvariant()
+    $env:AUDIO_WRITER_ENABLED = $AudioWriterEnabled.ToString().ToLowerInvariant()
+    $env:AUDIO_RETRIEVAL_ENABLED = $AudioRetrievalEnabled.ToString().ToLowerInvariant()
+    $env:AUDIO_LOCALE = $AudioLocale
     $env:ACL_ENABLED = $AclEnabled.ToString().ToLowerInvariant()
     $env:INCLUDE_CITATIONS = $IncludeCitations.ToString().ToLowerInvariant()
     $env:CONTENT_UNDERSTANDING_ANALYZER_ID = Get-RequiredValue `

@@ -126,6 +126,63 @@ def test_enabled_audio_requires_explicit_speech_settings(monkeypatch: pytest.Mon
         replace(load_config(), **settings)
 
 
+_BATCH_SETTINGS = dict(
+    extraction_enabled=True,
+    audio_writer_enabled=True,
+    audio_transcription_provider="speech_batch",
+    speech_endpoint="https://speech-fixture.cognitiveservices.azure.com",
+    speech_region="eastus2",
+    audio_deployment_region="eastus2",
+    audio_locale="en-US",
+    audio_staging_blob_endpoint="https://astg.blob.core.windows.net/",
+    audio_staging_container="audio-staging",
+)
+
+
+def test_speech_batch_provider_accepted_with_staging(monkeypatch: pytest.MonkeyPatch) -> None:
+    _set_required_environment(monkeypatch)
+    monkeypatch.setenv("SHAREPOINT_SITE_URL", "https://tenant.sharepoint.com/sites/site")
+    config = replace(load_config(), **_BATCH_SETTINGS)
+    assert config.audio_transcription_provider == "speech_batch"
+    assert config.audio_staging_container == "audio-staging"
+    assert config.audio_batch_ttl_hours == 48
+
+
+@pytest.mark.parametrize("field", ["audio_staging_blob_endpoint", "audio_staging_container"])
+def test_speech_batch_requires_staging_settings(monkeypatch: pytest.MonkeyPatch, field: str) -> None:
+    _set_required_environment(monkeypatch)
+    monkeypatch.setenv("SHAREPOINT_SITE_URL", "https://tenant.sharepoint.com/sites/site")
+    settings = dict(_BATCH_SETTINGS)
+    settings[field] = ""
+    with pytest.raises(ValueError, match=field.upper()):
+        replace(load_config(), **settings)
+
+
+@pytest.mark.parametrize("endpoint", [
+    "http://astg.blob.core.windows.net",
+    "https://astg.blob.core.windows.net.evil.example",
+    "https://user:secret@astg.blob.core.windows.net",
+    "https://astg.file.core.windows.net",
+])
+def test_speech_batch_rejects_non_blob_staging_endpoint(
+    monkeypatch: pytest.MonkeyPatch, endpoint: str,
+) -> None:
+    _set_required_environment(monkeypatch)
+    monkeypatch.setenv("SHAREPOINT_SITE_URL", "https://tenant.sharepoint.com/sites/site")
+    settings = dict(_BATCH_SETTINGS)
+    settings["audio_staging_blob_endpoint"] = endpoint
+    with pytest.raises(ValueError, match="AUDIO_STAGING_BLOB_ENDPOINT"):
+        replace(load_config(), **settings)
+
+
+@pytest.mark.parametrize("ttl", [5, 745, 0, -1])
+def test_audio_batch_ttl_out_of_range_is_rejected(monkeypatch: pytest.MonkeyPatch, ttl: int) -> None:
+    _set_required_environment(monkeypatch)
+    monkeypatch.setenv("SHAREPOINT_SITE_URL", "https://tenant.sharepoint.com/sites/site")
+    with pytest.raises(ValueError, match="AUDIO_BATCH_TTL_HOURS"):
+        replace(load_config(), audio_batch_ttl_hours=ttl)
+
+
 @pytest.mark.parametrize("endpoint", [
     "http://speech-fixture.cognitiveservices.azure.com",
     "https://speech-fixture.cognitiveservices.azure.com.evil.example",

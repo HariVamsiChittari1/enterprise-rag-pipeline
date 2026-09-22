@@ -43,6 +43,9 @@ param catalogPollSeconds int = 7200
 @description('Enable ACL filtering at retrieval time')
 param aclEnabled bool = true
 
+@description('Enable audio chunks in the retrieval reader')
+param audioRetrievalEnabled bool = false
+
 @description('Application Insights connection string (empty to disable tracing)')
 param appInsightsConnectionString string = ''
 
@@ -113,6 +116,10 @@ var envVars = [
   { name: 'DEPLOYMENT_INSTANCE_ID', value: deploymentInstanceId }
   { name: 'RETRIEVAL_CATALOG_POLL_SECONDS', value: string(catalogPollSeconds) }
   { name: 'ACL_ENABLED', value: string(aclEnabled) }
+  { name: 'AUDIO_RETRIEVAL_ENABLED', value: string(audioRetrievalEnabled) }
+  // Freshness windows required by the reader when audio retrieval is enabled (30 days).
+  { name: 'AUDIO_MAX_ACL_AGE_SECONDS', value: '2592000' }
+  { name: 'AUDIO_MAX_SOURCE_AGE_SECONDS', value: '2592000' }
   { name: 'INCLUDE_CITATIONS', value: string(includeCitations) }
   { name: 'MAX_EVIDENCE_CHUNKS', value: maxEvidenceChunks }
   { name: 'MAX_PLANNED_QUERIES', value: maxPlannedQueries }

@@ -373,6 +373,9 @@ class IngestionRepository:
                 "visualManifestHash",
                 "contentHash",
                 "extractionMode",
+                "audio",
+                "transcriptionJobUrl",
+                "stagingBlobName",
             },
         )
 
@@ -398,19 +401,21 @@ class IngestionRepository:
         document: SourceDocumentRecord,
         etag: str,
     ) -> VersionedRecord[SourceDocumentRecord]:
+        # Audio documents carry transcript chunks but no visual manifest.
+        is_audio = document.audio is not None
         if (
             document.status is not DocumentStatus.ADMITTING
             or document.stage is not DocumentStage.VERIFYING
             or document.expected_chunk_count is None
             or document.written_chunk_count != document.expected_chunk_count
-            or document.visual_manifest_page_count is None
-            or document.visual_manifest_hash is None
+            or (not is_audio and (document.visual_manifest_page_count is None or document.visual_manifest_hash is None))
             or not document.allowed_group_ids
             or not document.acl_hash
             or document.acl_evaluated_at is None
         ):
             raise ValueError("admitting document integrity fields are incomplete")
-        self._verify_visual_manifest(document)
+        if not is_audio:
+            self._verify_visual_manifest(document)
         return self._replace_document(
             document,
             etag,
@@ -427,6 +432,7 @@ class IngestionRepository:
                 "writtenChunkCount",
                 "visualManifestPageCount",
                 "visualManifestHash",
+                "sourceVerifiedAt",
             },
         )
 
@@ -584,7 +590,9 @@ class IngestionRepository:
             or document.error is not None
         ):
             raise ValueError("ready document integrity fields are incomplete")
-        self._verify_visual_manifest(document)
+        # Audio documents have transcript chunks but no visual manifest to verify.
+        if document.audio is None:
+            self._verify_visual_manifest(document)
         self._verify_exact_chunks(document)
         return self._replace_document(
             document,
@@ -1448,6 +1456,10 @@ def _document_from_item(item: Mapping[str, Any]) -> SourceDocumentRecord:
         values.pop(_removed, None)
     if values.get("error") is not None:
         values["error"] = SafeError(**_snake_keys(values["error"]))
+    if values.get("audio") is not None:
+        audio_values = _snake_keys(values["audio"])
+        audio_values.setdefault("channel_count", None)  # omitted from storage when absent
+        values["audio"] = AudioMetadata(**audio_values)
     return SourceDocumentRecord(**values)
 
 
@@ -1516,6 +1528,10 @@ def _chunk_from_item(item: Mapping[str, Any]) -> SearchChunkRecord:
         key_phrases=ModuleStatus(statuses["keyPhrases"]),
         entities=ModuleStatus(statuses["entities"]),
     )
+    if values.get("audio") is not None:
+        audio_values = _snake_keys(values["audio"])
+        audio_values.setdefault("channel_count", None)  # omitted from storage when absent
+        values["audio"] = AudioMetadata(**audio_values)
     return SearchChunkRecord(**values)
 
 

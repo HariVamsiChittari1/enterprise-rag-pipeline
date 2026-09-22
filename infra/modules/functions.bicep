@@ -79,6 +79,33 @@ param contentUnderstandingEnabled bool
 @description('Azure AI Language endpoint')
 param languageEndpoint string
 
+@description('Speech fast-transcription custom-domain endpoint; empty disables the audio writer')
+param speechEndpoint string = ''
+
+@description('Speech resource region')
+param speechRegion string = ''
+
+@description('Enable the audio ingestion writer')
+param audioWriterEnabled bool = false
+
+@description('Audio transcription locale')
+param audioLocale string = 'en-US'
+
+@description('Blob service endpoint of the dedicated audio-staging account; empty disables batch staging')
+param audioStagingBlobEndpoint string = ''
+
+@description('Source-audio container in the audio-staging account')
+param audioStagingContainer string = ''
+
+@description('Batch transcription result time-to-live in hours (6-744)')
+@minValue(6)
+@maxValue(744)
+param audioBatchTtlHours int = 48
+
+@description('Comma-separated allowed source file extensions')
+@minLength(1)
+param allowedFileExtensions string = '.md,.pdf,.docx,.pptx,.xlsx'
+
 @description('Key Vault URI')
 param keyVaultUri string
 
@@ -316,6 +343,42 @@ resource functionApp 'Microsoft.Web/sites@2025-03-01' = {
           value: languageEndpoint
         }
         {
+          name: 'SPEECH_ENDPOINT'
+          value: speechEndpoint
+        }
+        {
+          name: 'SPEECH_REGION'
+          value: speechRegion
+        }
+        {
+          name: 'AUDIO_DEPLOYMENT_REGION'
+          value: speechRegion
+        }
+        {
+          name: 'AUDIO_LOCALE'
+          value: audioWriterEnabled ? audioLocale : ''
+        }
+        {
+          name: 'AUDIO_WRITER_ENABLED'
+          value: string(audioWriterEnabled)
+        }
+        {
+          name: 'AUDIO_TRANSCRIPTION_PROVIDER'
+          value: audioWriterEnabled ? 'speech_batch' : 'speech_fast'
+        }
+        {
+          name: 'AUDIO_STAGING_BLOB_ENDPOINT'
+          value: audioStagingBlobEndpoint
+        }
+        {
+          name: 'AUDIO_STAGING_CONTAINER'
+          value: audioStagingContainer
+        }
+        {
+          name: 'AUDIO_BATCH_TTL_HOURS'
+          value: string(audioBatchTtlHours)
+        }
+        {
           name: 'KEY_VAULT_URI'
           value: keyVaultUri
         }
@@ -333,7 +396,7 @@ resource functionApp 'Microsoft.Web/sites@2025-03-01' = {
         }
         {
           name: 'ALLOWED_FILE_EXTENSIONS'
-          value: '.md,.pdf,.docx,.pptx,.xlsx'
+          value: allowedFileExtensions
         }
         {
           name: 'SHAREPOINT_ASSIGNED_DRIVE_ID'

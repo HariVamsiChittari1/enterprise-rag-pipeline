@@ -9,11 +9,19 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 
 from config import ExtractionProvider, IngestionConfig
-from ingestion.audio_transcription import build_transcript
+from ingestion.audio_staging import delete_audio, upload_audio
+from ingestion.audio_transcription import build_transcript, build_transcript_from_batch
 from ingestion.chunking import chunk_audio_segments, chunk_pages, token_count
 from ingestion.embedding import embed_texts
 from ingestion.enrichment import enrich_chunks
 from ingestion.errors import TerminalDocumentError
+from ingestion.speech_batch import (
+    delete_transcription,
+    download_transcription_result,
+    get_transcription,
+    list_transcription_files,
+    submit_transcription,
+)
 from ingestion.speech_fast import transcribe_audio
 from ingestion.extraction import (
     MIN_TEXT_CHARACTERS,
@@ -197,6 +205,7 @@ def process_document(
     *,
     cu_client: Any | None = None,
     speech_token_provider: Callable[[], str] | None = None,
+    blob_service_client: Any | None = None,
 ) -> ActivityOutcome:
     """Process a single document through the full pipeline."""
     try:
@@ -236,6 +245,38 @@ def process_document(
             if speech_token_provider is None:
                 raise TerminalDocumentError("audio_transcription_token_provider_missing")
             source_content_hash = content_sha256_bytes(content)
+            if config.audio_transcription_provider == "speech_batch":
+                if blob_service_client is None:
+                    raise TerminalDocumentError("audio_staging_client_missing")
+                blob_name = _staging_blob_name(current_doc)
+                content_url = upload_audio(
+                    blob_service_client=blob_service_client,
+                    container=config.audio_staging_container,
+                    blob_name=blob_name,
+                    data=content,
+                )
+                job_url = submit_transcription(
+                    endpoint=config.speech_endpoint,
+                    content_urls=[content_url],
+                    locale=config.audio_locale,
+                    display_name=current_doc.document_id,
+                    time_to_live_hours=config.audio_batch_ttl_hours,
+                    token_provider=speech_token_provider,
+                    timeout_seconds=config.speech_request_timeout_seconds,
+                )
+                submitted = replace(
+                    current_doc, stage=DocumentStage.TRANSCRIBING,
+                    content_hash=source_content_hash,
+                    extraction_mode=config.audio_transcription_provider,
+                    transcription_job_url=job_url, staging_blob_name=blob_name,
+                    updated_at=_fmt(_utc_now()),
+                )
+                repository.update_processing_document(submitted, current_etag)
+                # Submit succeeded; the poller finalizes this doc once the batch job completes.
+                return ActivityOutcome(
+                    document_id=document.document_id, status=ActivityStatus.SUCCEEDED,
+                    chunks_written=0, retry_count=document.attempt_count,
+                )
             response = transcribe_audio(
                 endpoint=config.speech_endpoint,
                 audio=content,
@@ -256,65 +297,11 @@ def process_document(
                 max_phrases=config.audio_max_phrases,
                 max_words=config.audio_max_words,
             )
-            chunks = chunk_audio_segments(segments, audio)
-            if config.enrichment_enabled and language_client is not None:
-                enrichments = enrich_chunks(
-                    language_client, [chunk.content for chunk in chunks],
-                    summary_enabled=config.summary_enabled,
-                    key_phrases_enabled=config.key_phrases_enabled,
-                    entities_enabled=config.entities_enabled,
-                )
-            else:
-                enrichments = enrich_chunks(None, [chunk.content for chunk in chunks])
-            searchable_texts = [
-                _build_searchable_text(chunk.content, enrichments[i]["key_phrases"], enrichments[i]["summary"])
-                for i, chunk in enumerate(chunks)
-            ]
-            embeddings = embed_texts(
-                openai_client, searchable_texts,
-                audit_container=audit_container,
-                source_id=config.source_id,
-                run_id=current_doc.source_run_id,
-                batch_size=config.embedding_batch_size,
+            written = _finalize_audio_document(
+                config, current_doc, current_etag, audio, segments, acl, source_snapshot,
+                repository, lifecycle_repository, connector, language_client, openai_client,
+                audit_container,
             )
-            now = _fmt(_utc_now())
-            chunk_records = _build_chunk_records(
-                current_doc, acl, chunks, searchable_texts, enrichments, embeddings, now, audio=audio,
-            )
-            current_doc = replace(
-                current_doc, stage=DocumentStage.PERSISTING, page_count=None,
-                expected_chunk_count=len(chunk_records), content_hash=source_content_hash,
-                extraction_mode=config.audio_transcription_provider, audio=audio,
-                updated_at=_fmt(_utc_now()),
-            )
-            updated = repository.update_processing_document(current_doc, current_etag)
-            current_doc, current_etag = updated.record, updated.etag
-            written = repository.write_chunks(chunk_records)
-            _read_and_validate_source_snapshot(connector, current_doc, expected_snapshot=source_snapshot)
-            final_acl = connector.read_verified_acl(current_doc.item_id, config.acl_max_pages)
-            if final_acl != acl:
-                raise TerminalDocumentError("source_acl_changed_during_processing")
-            admitting_doc = replace(
-                current_doc, status=DocumentStatus.ADMITTING, stage=DocumentStage.VERIFYING,
-                allowed_group_ids=acl.allowed_group_ids, acl_hash=acl.acl_hash,
-                acl_evaluated_at=_fmt(_utc_now()), expected_chunk_count=len(chunk_records),
-                written_chunk_count=written, source_verified_at=_fmt(_utc_now()),
-                updated_at=_fmt(_utc_now()),
-            )
-            admitting = repository.begin_document_admission(admitting_doc, current_etag)
-            current_doc, current_etag = admitting.record, admitting.etag
-            lifecycle_repository.set_document_chunks_retrievable(
-                document_key=current_doc.document_key,
-                lifecycle_generation=current_doc.lifecycle_generation,
-                is_retrievable=True,
-                allowed_group_ids=acl.allowed_group_ids,
-                expected_count=written,
-            )
-            ready_doc = replace(
-                current_doc, status=DocumentStatus.READY, stage=DocumentStage.TERMINAL,
-                ready_at=_fmt(_utc_now()), updated_at=_fmt(_utc_now()),
-            )
-            repository.verify_and_mark_document_ready(ready_doc, current_etag)
             return ActivityOutcome(
                 document_id=document.document_id, status=ActivityStatus.SUCCEEDED,
                 chunks_written=written, retry_count=document.attempt_count,
@@ -663,6 +650,209 @@ def process_document(
         return ActivityOutcome(document_id=document.document_id, status=ActivityStatus.FAILED, chunks_written=0, retry_count=document.attempt_count, error=safe)
 
 
+def _staging_blob_name(document: SourceDocumentRecord) -> str:
+    """Deterministic, collision-free staging blob name for one document version."""
+    dot = document.source_name.rfind(".")
+    extension = document.source_name[dot:].lower() if dot != -1 else ".wav"
+    return f"{document.document_key}{extension}"
+
+
+def _finalize_audio_document(
+    config: IngestionConfig,
+    current_doc: SourceDocumentRecord,
+    current_etag: str,
+    audio: Any,
+    segments: Any,
+    acl: Any,
+    source_snapshot: Any,
+    repository: IngestionRepository,
+    lifecycle_repository: DocumentLifecycleRepository,
+    connector: SourceConnector,
+    language_client: Any | None,
+    openai_client: Any,
+    audit_container: Any | None,
+) -> int:
+    """Chunk, enrich, embed, persist, admit, and mark ready a transcribed audio document."""
+    chunks = chunk_audio_segments(segments, audio)
+    if config.enrichment_enabled and language_client is not None:
+        enrichments = enrich_chunks(
+            language_client, [chunk.content for chunk in chunks],
+            summary_enabled=config.summary_enabled,
+            key_phrases_enabled=config.key_phrases_enabled,
+            entities_enabled=config.entities_enabled,
+        )
+    else:
+        enrichments = enrich_chunks(None, [chunk.content for chunk in chunks])
+    searchable_texts = [
+        _build_searchable_text(chunk.content, enrichments[i]["key_phrases"], enrichments[i]["summary"])
+        for i, chunk in enumerate(chunks)
+    ]
+    embeddings = embed_texts(
+        openai_client, searchable_texts,
+        audit_container=audit_container,
+        source_id=config.source_id,
+        run_id=current_doc.source_run_id,
+        batch_size=config.embedding_batch_size,
+    )
+    now = _fmt(_utc_now())
+    chunk_records = _build_chunk_records(
+        current_doc, acl, chunks, searchable_texts, enrichments, embeddings, now, audio=audio,
+    )
+    # Clearing the tracking fields is a no-op for the inline path and cleans up the batch path.
+    persisting = replace(
+        current_doc, stage=DocumentStage.PERSISTING, page_count=None,
+        expected_chunk_count=len(chunk_records), content_hash=audio.source_content_hash,
+        extraction_mode=config.audio_transcription_provider, audio=audio,
+        transcription_job_url=None, staging_blob_name=None, updated_at=_fmt(_utc_now()),
+    )
+    updated = repository.update_processing_document(persisting, current_etag)
+    current_doc, current_etag = updated.record, updated.etag
+    written = repository.write_chunks(chunk_records)
+    _read_and_validate_source_snapshot(connector, current_doc, expected_snapshot=source_snapshot)
+    final_acl = connector.read_verified_acl(current_doc.item_id, config.acl_max_pages)
+    if final_acl != acl:
+        raise TerminalDocumentError("source_acl_changed_during_processing")
+    admitting_doc = replace(
+        current_doc, status=DocumentStatus.ADMITTING, stage=DocumentStage.VERIFYING,
+        allowed_group_ids=acl.allowed_group_ids, acl_hash=acl.acl_hash,
+        acl_evaluated_at=_fmt(_utc_now()), expected_chunk_count=len(chunk_records),
+        written_chunk_count=written, source_verified_at=_fmt(_utc_now()),
+        updated_at=_fmt(_utc_now()),
+    )
+    admitting = repository.begin_document_admission(admitting_doc, current_etag)
+    current_doc, current_etag = admitting.record, admitting.etag
+    lifecycle_repository.set_document_chunks_retrievable(
+        document_key=current_doc.document_key,
+        lifecycle_generation=current_doc.lifecycle_generation,
+        is_retrievable=True,
+        allowed_group_ids=acl.allowed_group_ids,
+        expected_count=written,
+    )
+    ready_doc = replace(
+        current_doc, status=DocumentStatus.READY, stage=DocumentStage.TERMINAL,
+        ready_at=_fmt(_utc_now()), updated_at=_fmt(_utc_now()),
+    )
+    repository.verify_and_mark_document_ready(ready_doc, current_etag)
+    return written
+
+
+def finalize_audio_transcription(
+    config: IngestionConfig,
+    source_run_id: str,
+    document_id: str,
+    repository: IngestionRepository,
+    lifecycle_repository: DocumentLifecycleRepository,
+    connector: SourceConnector,
+    language_client: Any | None,
+    openai_client: Any,
+    *,
+    speech_token_provider: Callable[[], str],
+    blob_service_client: Any,
+    audit_container: Any | None = None,
+) -> str:
+    """Advance one submitted audio document by polling its batch job.
+
+    Returns 'succeeded', 'failed', 'pending' (still transcribing), or 'skipped' (not awaiting).
+    """
+    stored = repository.get_document(source_run_id, document_id)
+    if stored is None:
+        return "skipped"
+    current_doc, current_etag = stored.record, stored.etag
+    if current_doc.stage is not DocumentStage.TRANSCRIBING or not current_doc.transcription_job_url:
+        return "skipped"
+    job_url = current_doc.transcription_job_url
+    try:
+        job = get_transcription(
+            transcription_url=job_url, token_provider=speech_token_provider,
+            timeout_seconds=config.speech_request_timeout_seconds,
+        )
+    except TimeoutError:
+        return "pending"
+    if job.status in ("NotStarted", "Running"):
+        return "pending"
+    try:
+        if job.status == "Succeeded":
+            body = _download_batch_transcript(config, job, speech_token_provider)
+            audio, segments = build_transcript_from_batch(
+                body, locale=config.audio_locale,
+                profile_version=config.audio_transcription_provider,
+                source_version=current_doc.e_tag,
+                source_content_hash=current_doc.content_hash or "",
+                max_response_bytes=config.audio_max_response_bytes,
+                max_phrases=config.audio_max_phrases, max_words=config.audio_max_words,
+            )
+            acl = connector.read_verified_acl(current_doc.item_id, config.acl_max_pages)
+            source_snapshot = _read_and_validate_source_snapshot(connector, current_doc)
+            _finalize_audio_document(
+                config, current_doc, current_etag, audio, segments, acl, source_snapshot,
+                repository, lifecycle_repository, connector, language_client, openai_client,
+                audit_container,
+            )
+            _cleanup_batch_job(config, job_url, current_doc.staging_blob_name, speech_token_provider, blob_service_client)
+            return "succeeded"
+        _fail_document(current_doc, current_etag, TerminalDocumentError(f"audio_batch_status:{job.status}"), repository)
+        _cleanup_batch_job(config, job_url, current_doc.staging_blob_name, speech_token_provider, blob_service_client)
+        return "failed"
+    except TimeoutError:
+        return "pending"
+    except TerminalDocumentError as error:
+        _fail_reloaded_document(repository, source_run_id, document_id, error)
+        _cleanup_batch_job(config, job_url, current_doc.staging_blob_name, speech_token_provider, blob_service_client)
+        return "failed"
+    except Exception as error:  # defensive: never leave a poller pass unhandled
+        logger.error("audio finalize failed for %s: %s", document_id, error, exc_info=True)
+        _fail_reloaded_document(repository, source_run_id, document_id, error)
+        return "failed"
+
+
+def _fail_reloaded_document(
+    repository: IngestionRepository, source_run_id: str, document_id: str, error: BaseException,
+) -> None:
+    """Mark a document failed using its current etag (finalize may have advanced it)."""
+    reloaded = repository.get_document(source_run_id, document_id)
+    if reloaded is not None:
+        _fail_document(reloaded.record, reloaded.etag, error, repository)
+
+
+def _download_batch_transcript(config: IngestionConfig, job: Any, token_provider: Callable[[], str]) -> bytes:
+    if not job.files_url:
+        raise TerminalDocumentError("audio_batch_files_link_missing")
+    files = list_transcription_files(
+        files_url=job.files_url, token_provider=token_provider,
+        timeout_seconds=config.speech_request_timeout_seconds,
+    )
+    transcript = next((entry for entry in files if entry.kind == "Transcription"), None)
+    if transcript is None:
+        raise TerminalDocumentError("audio_batch_transcript_file_missing")
+    return download_transcription_result(
+        content_url=transcript.content_url,
+        max_response_bytes=config.audio_max_response_bytes,
+        timeout_seconds=config.speech_request_timeout_seconds,
+    )
+
+
+def _cleanup_batch_job(
+    config: IngestionConfig, job_url: str, blob_name: str | None,
+    token_provider: Callable[[], str], blob_service_client: Any,
+) -> None:
+    """Best-effort deletion of the finished job and its staging blob (TTL is the safety net)."""
+    try:
+        delete_transcription(
+            transcription_url=job_url, token_provider=token_provider,
+            timeout_seconds=config.speech_request_timeout_seconds,
+        )
+    except Exception:
+        logger.warning("failed to delete batch transcription job", exc_info=True)
+    if blob_service_client is not None and blob_name:
+        try:
+            delete_audio(
+                blob_service_client=blob_service_client,
+                container=config.audio_staging_container, blob_name=blob_name,
+            )
+        except Exception:
+            logger.warning("failed to delete staging blob", exc_info=True)
+
+
 def finalize(
     config: IngestionConfig,
     run_etag: str,
@@ -758,6 +948,8 @@ def run_delta_sync(
     audit_container: Any | None = None,
     *,
     cu_client: Any | None = None,
+    speech_token_provider: Callable[[], str] | None = None,
+    blob_service_client: Any | None = None,
 ) -> DeltaSyncOutcome:
     """One delta-sync tick: process adds/updates/deletes for source_id since the last
     cursor. Uses its own run_id per tick purely as a schema-compliant namespacing device
@@ -855,6 +1047,8 @@ def run_delta_sync(
                 connector, di_client, language_client, openai_client,
                 audit_container=audit_container,
                 cu_client=cu_client,
+                speech_token_provider=speech_token_provider,
+                blob_service_client=blob_service_client,
             )
         except Exception:
             logger.error("delta_sync item %s failed", item_id, exc_info=True)
@@ -939,6 +1133,50 @@ class LifecycleReconciliationOutcome:
     checked: int = 0
     repaired: int = 0
     failed: int = 0
+
+
+@dataclass(frozen=True)
+class AudioPollOutcome:
+    checked: int = 0
+    succeeded: int = 0
+    failed: int = 0
+    pending: int = 0
+    skipped: int = 0
+
+
+def run_audio_transcription_poll_page(
+    config: IngestionConfig,
+    repository: IngestionRepository,
+    lifecycle_repository: DocumentLifecycleRepository,
+    connector: SourceConnector,
+    language_client: Any | None,
+    openai_client: Any,
+    *,
+    speech_token_provider: Callable[[], str],
+    blob_service_client: Any,
+    page_size: int,
+    continuation_token: str | None = None,
+    audit_container: Any | None = None,
+) -> tuple[AudioPollOutcome, str | None]:
+    """Poll one bounded page of documents awaiting batch transcription and advance each."""
+    page = lifecycle_repository.list_transcribing_documents_page(
+        page_size=page_size, continuation_token=continuation_token,
+    )
+    tally = {"succeeded": 0, "failed": 0, "pending": 0, "skipped": 0}
+    for ref in page.items:
+        result = finalize_audio_transcription(
+            config, ref.source_run_id, ref.document_id,
+            repository, lifecycle_repository, connector, language_client, openai_client,
+            speech_token_provider=speech_token_provider,
+            blob_service_client=blob_service_client,
+            audit_container=audit_container,
+        )
+        tally[result] = tally.get(result, 0) + 1
+    outcome = AudioPollOutcome(
+        checked=len(page.items), succeeded=tally["succeeded"], failed=tally["failed"],
+        pending=tally["pending"], skipped=tally["skipped"],
+    )
+    return outcome, page.continuation_token
 
 
 def run_lifecycle_reconciliation_page(
