@@ -241,9 +241,10 @@ Authorization: Bearer <token>
 
 | Name | Required | Default | Description |
 |---|---|---|---|
-| `container` | Yes | — | One of: `ingestion-runs`, `source-documents`, `search-chunks`, `service-audit` |
+| `container` | Yes | — | One of: `ingestion-runs`, `source-documents`, `search-chunks`, `service-audit`, `retrieval-config` |
 | `limit` | No | `10` | Number of rows (max `200`) |
 | `runId` | No | — | Supported only with `container=source-documents`; filters the `/sourceRunId` partition as `<source_id>:<runId>` |
+| `deploymentInstanceId` | Conditional | — | Required with `container=retrieval-config` (its partition key); `runId` is rejected for that container |
 
 For `ingestion-runs`, `search-chunks`, and `service-audit`, omit `runId`; their partition keys are not `/sourceRunId`, and supplying it can return an empty result that does not prove absence. Without `runId`, `service-audit` is queried cross-partition and ordered by `recordedAt DESC`, so the result is the most recent rows. `search-chunks` has no equivalent ordering.
 
@@ -420,8 +421,9 @@ The deployed example catalog defines:
 | `citations[].evidence_version` | string, optional | Source version bound to audio evidence; absent for document citations. |
 | `request_id` | string | UUID for log correlation |
 
-Temporal citation fields are reader-first contracts. Audio discovery and transcription
-are not yet implemented; see the default-disabled [retrieval settings](CONFIGURATION.md#retrieval-behavior-and-limits).
+Temporal citation fields are reader-first contracts. Audio ingestion is implemented via
+asynchronous Azure Speech batch transcription (see [ADR 0001](adr/0001-audio-batch-transcription.md));
+audio retrieval remains default-disabled — see the [retrieval settings](CONFIGURATION.md#retrieval-behavior-and-limits).
 
 Both generation paths validate references before applying `INCLUDE_CITATIONS`.
 With evidence, a non-refusal answer must contain at least one canonical reference

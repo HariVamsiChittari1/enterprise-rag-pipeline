@@ -16,6 +16,9 @@ flowchart LR
         Functions --> CU[Content Understanding<br/>document search]
         Functions --> Language[Azure AI Language<br/>key phrases + entities]
         Functions --> OpenAI[Azure OpenAI<br/>vision descriptions + embeddings]
+        Functions -->|stage audio| AudioStg[(Audio-staging<br/>Storage account)]
+        Functions -->|submit + poll batch| Speech[Azure AI Speech<br/>batch transcription]
+        Speech -->|reads staged audio| AudioStg
         Functions --> Cosmos[(Cosmos DB NoSQL<br/>Strong consistency<br/>vectors + metadata)]
     end
 
@@ -66,6 +69,7 @@ flowchart LR
 | `acl_resync_timer` | Configurable (default weekly Sunday 03:00 UTC) | Re-verify ACLs on already-ingested documents |
 | `lifecycle_reconcile_timer` | Configurable (default every 10 minutes) | Repair interrupted transitions and orphan chunks; remove older duplicate ready versions only when the current full-sync run supplies the ready winner |
 | `subscription_renew_timer` | Configurable (default daily 02:00 UTC) | Create or renew Microsoft Graph webhook subscription |
+| `audio_transcription_poll_timer` | Configurable (default every 5 minutes, `AUDIO_POLL_SCHEDULE`) | Finalize completed Speech batch transcriptions: build transcript, chunk, embed, publish, then delete the job and staged blob |
 
 The Function App proxies `/api/query` to Azure Container Apps. Function routes use `AuthLevel.ANONYMOUS`, while App Service Authentication requires an Entra token for every path except `/api/webhook/*`. The SharePoint notification endpoint validates `clientState`; the lifecycle endpoint accepts and logs Graph lifecycle events. The query route additionally validates delegated user claims before creating the service-authenticated ACA request.
 
@@ -81,6 +85,8 @@ sequenceDiagram
     participant CU as Content Understanding
     participant Lang as Language AI
     participant OAI as Azure OpenAI
+    participant Speech as Azure AI Speech
+    participant AudioStg as Audio-staging
     participant Cosmos as Cosmos DB
 
     Operator->>Starter: POST /api/ingestion/full-sync
@@ -121,8 +127,13 @@ sequenceDiagram
                 Orch->>OAI: Describe required figures
             end
             Orch->>Orch: Merge source-bound visual descriptions
+        else Audio (Speech batch — deployed default)
+            Orch->>AudioStg: Upload source to audio-staging blob
+            Orch->>Speech: Submit batch transcription job
+            Orch->>Cosmos: Park document at TRANSCRIBING (job URL + staging blob name)
+            Note over Orch: Returns SUCCEEDED with zero chunks; the poll timer finalizes later (see Audio Transcription Poll Flow)
         end
-        Note over Orch: Reject incomplete coverage, then chunk canonical segments
+        Note over Orch: Text/Office only — reject incomplete coverage, then chunk canonical segments (audio finalizes in the poll flow)
         Orch->>Lang: Enrich batch (size=5): key phrases, entities, summary (each independently configurable)
         Orch->>OAI: Embed cleaned text (batch=100, 3072 dims)
         Orch->>Cosmos: Write initially ineligible chunks
@@ -147,6 +158,47 @@ One provider is selected per run: **Content Understanding takes precedence when 
 - **Provider precedence and flags** are owned by [CONFIGURATION.md](CONFIGURATION.md#content-understanding); they are not restated here.
 - **Native Office analysis (Document Intelligence) does not extract embedded images** — this is why the Office/Document Intelligence path renders a PDF derivative solely for visual augmentation (limitation L1).
 - **Coverage is enforced**: a document whose required visuals are not fully described is rejected before chunking.
+
+### Audio Transcription Poll Flow
+
+Audio uses asynchronous Azure Speech **batch** transcription so a long transcription cannot recycle the Function worker mid-write. The per-document activity uploads the source to the audio-staging account, submits the batch job, and parks the document at `transcribing` (returning immediately with zero chunks). A five-minute `audio_transcription_poll_timer` finalizes completed jobs; text and Office documents are unaffected. See [ADR 0001](adr/0001-audio-batch-transcription.md).
+
+```mermaid
+sequenceDiagram
+    participant Timer as audio_transcription_poll_timer
+    participant Orch as Durable Orchestrator
+    participant Act as audio poll page activity
+    participant Speech as Azure AI Speech
+    participant AudioStg as Audio-staging
+    participant Lang as Language AI
+    participant OAI as Azure OpenAI
+    participant Cosmos as Cosmos DB
+
+    Timer->>Orch: Start (skip if a prior poll pass is running)
+    loop Pages of AUDIO_POLL_PAGE_SIZE transcribing documents
+        Orch->>Act: call_activity
+        Act->>Cosmos: List documents at stage TRANSCRIBING (page)
+        loop Each document in page
+            Act->>Speech: GET batch job status
+            alt NotStarted or Running
+                Note over Act: Leave at TRANSCRIBING for a later tick
+            else Succeeded
+                Act->>Speech: List files and download transcript result
+                Act->>Act: Build timed transcript segments
+                Act->>Lang: Enrich (key phrases, entities) when enabled
+                Act->>OAI: Embed transcript chunks (3072 dims)
+                Act->>Cosmos: Write ineligible chunks, admit generation, mark READY
+                Act->>Speech: Delete transcription job
+                Act->>AudioStg: Delete staged audio blob
+            else Failed
+                Act->>Cosmos: Mark document FAILED (etag-guarded reload)
+                Act->>Speech: Delete transcription job
+                Act->>AudioStg: Delete staged audio blob
+            end
+        end
+        Act-->>Orch: succeeded/pending/failed counts + continuationToken
+    end
+```
 
 ## Delta Sync Flow
 
@@ -395,8 +447,13 @@ Documents and audio use the same source-document manifest and chunk contracts wi
 `schemaVersion: 1`. There is no separate audio schema version. Manifest MIME type
 and chunk `locatorKind: time` select audio-specific validation; audio metadata and
 temporal fields extend the shared records without changing document serialization,
-containers, partition keys, or run/control schemas. No audio discovery, transcription,
-checkpoint persistence, or lifecycle writer is implemented yet.
+containers, partition keys, or run/control schemas. Audio ingestion is implemented and
+deployed as an asynchronous path: the per-document activity stages the validated source
+to a dedicated audio-staging storage account and submits an Azure Speech **batch** job,
+parks the document at `transcribing`, and a five-minute poll timer finalizes completed
+jobs (build transcript → chunk → embed → write → admit `ready`, then delete the job and
+staged blob). Text and Office documents keep the synchronous path. See
+[ADR 0001](adr/0001-audio-batch-transcription.md).
 
 Retrieval filters the supported schema version and locator kinds before ranking. Audio is
 default-disabled; when enabled under the [explicit freshness policy](CONFIGURATION.md#retrieval-behavior-and-limits),
@@ -864,7 +921,7 @@ AKS manifests remain under `app/retrieval/kubernetes/`, but `infra/main.bicep` h
 | UC-34 | Service audit trail | Best-effort Cosmos records for explicitly instrumented service calls and lifecycle events, retained for 90 days by default |
 | UC-35 | Azure Monitor telemetry | Retain optional Monitor setup with GenAI instrumentation disabled; see [Observability](#observability) |
 | UC-36 | Health probes | Liveness (`/health/live`) and readiness (`/health/ready` with Cosmos connectivity check) endpoints |
-| UC-37 | Inspect endpoint | Read up to 200 rows from `ingestion-runs`, `source-documents`, `search-chunks`, or `service-audit` with Cosmos `_` system properties removed; optional `runId` filtering is valid only for the `source-documents` `/sourceRunId` partition |
+| UC-37 | Inspect endpoint | Read up to 200 rows from `ingestion-runs`, `source-documents`, `search-chunks`, `service-audit`, or `retrieval-config` with Cosmos `_` system properties removed; `runId` filtering is valid only for the `source-documents` `/sourceRunId` partition, and `retrieval-config` requires an explicit `deploymentInstanceId` partition |
 
 ## Known Limitations and Future Work
 
@@ -885,4 +942,4 @@ AKS manifests remain under `app/retrieval/kubernetes/`, but `infra/main.bicep` h
 | L13 | **No individual user ACL** — Only Entra security groups are accepted. Files shared directly with a single user (not via group) are rejected. | Direct-share-only files are not retrievable | Extract `user` identities from `grantedToV2` and match against caller's `oid` |
 | L14 | **No cumulative cap across operator retries** — each `POST /api/ingestion/retry-failed` request resets `attemptCount` to zero before the bounded activity retry loop. The endpoint can be invoked repeatedly for a chronically failing document. | Repeated operator retries can incur extraction/embedding cost without a persisted cumulative limit | Persist and enforce an operator retry policy before resetting failed documents |
 | L15 | **Function App admin endpoints lack per-user role enforcement** — EasyAuth `requireAuthentication` + `allowedApplications` restrict which client apps can call the API, but no endpoint checks the caller's Entra role. `require_easy_auth_role()` exists in code but is unused in `function_app.py`. | Any user of an allowed client application can call destructive endpoints (`purge`, `terminate`) | Call `require_easy_auth_role()` with an `Ingestion.Admin` app role check at the top of each admin/destructive endpoint |
-| L16 | **Inspect endpoint is a bounded diagnostic sample, not a bulk export API** — Responses are capped at 200 rows and `retrieval-config` is not allowlisted. | Large containers cannot be downloaded completely through the Function endpoint, and a 200-row response does not prove the container has only 200 rows. | Use an approved private-network export mechanism when complete container snapshots are required; keep the public diagnostic endpoint bounded. |
+| L16 | **Inspect endpoint is a bounded diagnostic sample, not a bulk export API** — Responses are capped at 200 rows. `retrieval-config` is allowlisted read-only and requires an explicit `deploymentInstanceId` partition. | Large containers cannot be downloaded completely through the Function endpoint, and a 200-row response does not prove the container has only 200 rows. | Use an approved private-network export mechanism when complete container snapshots are required; keep the public diagnostic endpoint bounded. |

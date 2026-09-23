@@ -1,6 +1,6 @@
 # Enterprise RAG Pipeline
 
-Secure, ACL-trimmed RAG system that ingests Markdown, PDF, DOCX, PPTX, and XLSX from one SharePoint document library and serves grounded answers with per-document security trimming. Ingestion preserves native source identity, adds required visual descriptions, and then chunks, enriches, and embeds canonical content into Cosmos DB. Retrieval uses an LLM query planner to route one planned query through the standard path and two or more planned queries through an Agent Framework path with automatic fallback.
+Secure, ACL-trimmed RAG system that ingests Markdown, PDF, DOCX, PPTX, and XLSX — plus optional WAV, MP3, and FLAC audio (transcribed via Azure Speech batch) — from one SharePoint document library and serves grounded answers with per-document security trimming. Ingestion preserves native source identity, adds required visual descriptions, and then chunks, enriches, and embeds canonical content into Cosmos DB. Retrieval uses an LLM query planner to route one planned query through the standard path and two or more planned queries through an Agent Framework path with automatic fallback.
 
 ## Architecture
 
@@ -8,7 +8,7 @@ Secure, ACL-trimmed RAG system that ingests Markdown, PDF, DOCX, PPTX, and XLSX 
 - **Retrieval:** Hybrid RAG (standard + agentic) on Azure Container Apps with automatic routing
 - **Durable Backend:** Durable Task Scheduler (fresh instance ID per run, tracked via Cosmos)
 - **Storage:** Cosmos DB NoSQL (ingestion-runs, source-documents, search-chunks, retrieval-config, service-audit)
-- **AI Services:** Document Intelligence, optional Content Understanding rollback, Azure AI Language, Azure OpenAI
+- **AI Services:** Document Intelligence, optional Content Understanding rollback, Azure AI Language, Azure AI Speech (optional audio transcription), Azure OpenAI
 - **Auth:** Managed Identity (Azure services) + Certificate credential (Microsoft Graph)
 - **Networking:** VNet-integrated with Private Endpoints
 

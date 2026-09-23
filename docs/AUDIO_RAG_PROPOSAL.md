@@ -2,9 +2,17 @@
 
 ## Status and authority
 
-This document is the stakeholder-approved target design for audio ingestion and
-text-only retrieval. It is not implemented or deployed behavior. Design approval does
-not authorize code, infrastructure, deployment, or commit changes.
+> **Superseded (2026-09-23).** Audio ingestion has been implemented and deployed. The
+> shipped design uses asynchronous Azure Speech **batch** transcription, not the Fast
+> provider recommended below. The authoritative record is
+> [ADR 0001 — Audio batch transcription](adr/0001-audio-batch-transcription.md). This
+> document is retained as the original proposal and historical context; where it
+> conflicts with ADR 0001 or [CONFIGURATION.md](CONFIGURATION.md), those documents win.
+
+This document was the stakeholder-approved *target design* for audio ingestion and
+text-only retrieval. It predates implementation; design approval did not by itself
+authorize the code, infrastructure, deployment, or commit changes that have since
+shipped.
 
 The committed `HEAD` document pipeline is the compatibility baseline. Existing
 uncommitted audio-specific code and documentation are excluded as design evidence and

@@ -245,16 +245,22 @@ The deployed Durable Task Scheduler retains terminal orchestration history for 3
 | Variable | Value/default | Accepted values and effect |
 | --- | --- | --- |
 | `EXTRACTION_ENABLED` | Runtime fallback `true` | Boolean parser treats `true`, `1`, and `yes` as true; other nonempty values are false. Disabling causes documents to fail because no extraction alternative exists. Current Bicep does not emit an override. |
-| `AUDIO_WRITER_ENABLED` | `false` | Ingestion (writer) audio gate: strict boolean, trimmed and case-normalized. Enabling requires `EXTRACTION_ENABLED=true` and the Speech settings below; DI/CU selection is unchanged. Independent of the retrieval gate. When enabled, discovered `.wav`, `.mp3`, and `.flac` items (add the extensions to `ALLOWED_FILE_EXTENSIONS`) are sent to Speech fast transcription, which validates and decodes the format server-side, and are published as time-located chunks. Audio is admitted by file extension; the Graph `file.mimeType` is [server-determined](https://learn.microsoft.com/en-us/graph/api/resources/file) and not used to gate audio. No client-side audio decoder is used; source channel count is not recorded (the default transcribe response does not report it). Requires a live Speech resource, private endpoint, and the `Cognitive Services Speech User` role before real use. |
-| `AUDIO_TRANSCRIPTION_PROVIDER` | `speech_fast` | Fixed v1 value; only `speech_fast` after trimming and case normalization. Any other value fails configuration loading even when audio is disabled. |
+| `AUDIO_WRITER_ENABLED` | `false` | Ingestion (writer) audio gate: strict boolean, trimmed and case-normalized. Enabling requires `EXTRACTION_ENABLED=true` and the Speech settings below; DI/CU selection is unchanged. Independent of the retrieval gate. When enabled, discovered `.wav`, `.mp3`, and `.flac` items (Bicep appends these extensions to `ALLOWED_FILE_EXTENSIONS` automatically) are transcribed by Azure Speech — **batch** transcription when the provider is `speech_batch` (the deployed default while the writer is enabled), which stages the file to the audio-staging account, submits an asynchronous job, and finalizes it from the audio poll timer — and are published as time-located chunks. Speech validates and decodes the format server-side. Audio is admitted by file extension; the Graph `file.mimeType` is [server-determined](https://learn.microsoft.com/en-us/graph/api/resources/file) and not used to gate audio. No client-side audio decoder is used; source channel count is not recorded (the default transcribe response does not report it). Requires a live Speech resource, private endpoint, and the `Cognitive Services Speech User` role before real use. |
+| `AUDIO_TRANSCRIPTION_PROVIDER` | `speech_fast` (code default); Bicep emits `speech_batch` when the writer is enabled | Accepts `speech_fast` or `speech_batch` after trimming and case normalization; any other value fails configuration loading even when audio is disabled. `speech_batch` (asynchronous submit → poll → finalize) is the deployed audio path and requires the `AUDIO_STAGING_*` settings below; `speech_fast` is the legacy synchronous path. |
 | `SPEECH_ENDPOINT` | Empty; required when the writer is enabled | HTTPS custom-domain base URL with one lowercase DNS label before `.cognitiveservices.azure.com`. Optional root slash; no credentials, port, other path, query, fragment, or embedded whitespace. Independent of DI/CU endpoints. |
 | `SPEECH_REGION` | Empty; required when the writer is enabled | Initial project allowlist: `eastus2`, `centralindia`, `southeastasia`; trimmed and lowercased. |
 | `AUDIO_DEPLOYMENT_REGION` | Empty; required when the writer is enabled | Declared ingestion deployment region; same initial allowlist and normalization. Must equal `SPEECH_REGION` when both are supplied. No inferred region or cross-region fallback. |
 | `AUDIO_LOCALE` | Empty; required when the writer is enabled | Initial project allowlist: `en-US`, `en-GB`, `en-IN`; trimmed, case-sensitive. No automatic locale selection. This does not detect or reject non-English speech. |
+| `SPEECH_REQUEST_TIMEOUT_SECONDS` | `120` | Positive number; per-request HTTP timeout for Speech transcription calls (batch submit, poll, and result download). |
+| `AUDIO_STAGING_BLOB_ENDPOINT` | Empty; required when the writer is enabled with `speech_batch` | HTTPS blob endpoint of the dedicated audio-staging account. Validated for scheme and absence of control characters. Speech reads staged audio from here; no SAS is minted. |
+| `AUDIO_STAGING_CONTAINER` | Empty; required when the writer is enabled with `speech_batch` | Blob container that holds staged audio pending transcription. |
+| `AUDIO_BATCH_TTL_HOURS` | `48` | Integer `6` through `744`. Retention bound for the staged blob and batch job before cleanup. |
+| `AUDIO_POLL_SCHEDULE` | `0 */5 * * * *` | NCRONTAB for the audio-transcription poll timer that finalizes completed batch jobs (default every 5 minutes). |
+| `AUDIO_POLL_PAGE_SIZE` | `20` | Maximum `transcribing` documents processed per poll tick. |
 | `KEY_PHRASES_ENABLED` | Runtime fallback `true` | Enables key-phrase enrichment. Same boolean parsing. |
 | `ENTITIES_ENABLED` | Runtime fallback `true` | Enables entity enrichment. Same boolean parsing. |
 | `SUMMARY_ENABLED` | Runtime fallback `false` | Enables summary enrichment. Same boolean parsing. |
-| `ALLOWED_FILE_EXTENSIONS` | Bicep value `.md,.pdf,.docx,.pptx,.xlsx`; runtime fallback `.pdf` | Comma-separated, case-normalized suffixes. The deployed five-format contract is emitted by Bicep. |
+| `ALLOWED_FILE_EXTENSIONS` | Bicep value `.md,.pdf,.docx,.pptx,.xlsx`, plus `.wav,.mp3,.flac` appended when `AUDIO_WRITER_ENABLED=true`; runtime fallback `.pdf` | Comma-separated, case-normalized suffixes. Bicep emits the five-format document contract and appends the three audio extensions when the audio writer is enabled. |
 | `CHUNK_MAX_TOKENS` | `800` | Maximum chunk token count. |
 | `CHUNK_OVERLAP_TOKENS` | `100` | Token overlap between adjacent chunks. |
 | `ACL_MAX_PAGES` | `10` | Maximum permission/group paging calls per ACL read. |
@@ -268,13 +274,15 @@ The deployed Durable Task Scheduler retains terminal orchestration history for 3
 
 Shared application limits also reject source files over 100 MB and rendered Office-to-PDF derivatives over 200 MB. These limits are stricter than some provider-tier limits and apply before or around provider analysis. Document Intelligence S0 supports up to 500 MB and 2,000 PDF/TIFF pages; F0 supports 4 MB and processes only the first two pages. The effective limit is always the lowest applicable application, provider-tier, and format-specific limit.
 
-Keep audio disabled. The ingestion configuration validator is a preparation step,
-not an audio execution path. Supplied Speech settings are validated even when
-audio is disabled; missing Speech settings are permitted only while disabled.
+Audio is default-disabled and enabled per environment via `AUDIO_WRITER_ENABLED`.
+When disabled, the ingestion configuration validator is only a preparation step:
+supplied Speech and staging settings are still validated, but missing ones are
+permitted. When enabled with `speech_batch`, the Speech resource, the audio-staging
+account, and the `AUDIO_STAGING_*` settings are required.
 These are initial project allowlists, not the complete Azure region or English
 locale lists. Their service eligibility is grounded in [Speech regions](https://learn.microsoft.com/en-us/azure/ai-services/speech-service/regions),
 [language support](https://learn.microsoft.com/en-us/azure/ai-services/speech-service/language-support?tabs=stt),
-and the [fast transcription endpoint guide](https://learn.microsoft.com/en-us/azure/ai-services/speech-service/fast-transcription-create).
+the [batch transcription guide](https://learn.microsoft.com/en-us/azure/ai-services/speech-service/batch-transcription), and the [fast transcription endpoint guide](https://learn.microsoft.com/en-us/azure/ai-services/speech-service/fast-transcription-create).
 
 URL validation and matching declared regions do not verify account ownership,
 actual region/residency, worker identity, private routing, or permission to process

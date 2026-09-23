@@ -24,6 +24,8 @@ This document describes the resources created or consumed by the active Bicep de
 | Document Intelligence | `ai-services.bicep` | PDF and native Office extraction when selected; public access disabled |
 | Azure AI Language | `ai-services.bicep` | Key phrases, entities, and optional summaries; public access disabled |
 | Microsoft Foundry and Content Understanding | `content-understanding.bicep` | Optional extraction provider with pinned completion and embedding deployments, system-assigned identity, local auth disabled, and public access disabled |
+| Azure AI Speech | `speech.bicep` | Optional audio batch transcription; keyless (system-assigned identity), custom subdomain, network default-deny with private endpoint. Created only when the audio writer is enabled |
+| Audio-staging storage account | `audio-staging.bicep` | Optional dedicated staging for audio batch transcription; shared-key access disabled, public endpoint network default-deny allowlisted to the Speech resource instance, blob private endpoint. Created only when the audio writer is enabled |
 | Virtual network, private DNS, private endpoints | `networking.bicep` | Function integration, ACA infrastructure, and private endpoint subnets |
 | ACA managed environment | `aca-environment.bicep` | Internal VNet-integrated environment with Log Analytics |
 | Azure Container Registry | `acr.bicep` | Retrieval image storage; serving uses an immutable digest |
@@ -92,6 +94,13 @@ The Function's existing account-level grant remains unchanged. Incremental
 deployment does not remove prior broad grants: inspect inherited/effective
 assignments and obtain separate approval for each exact removal. Do not claim
 least privilege from desired Bicep alone.
+
+### Audio transcription (optional)
+
+Created by `audio-staging-rbac.bicep` only when the audio writer is enabled:
+
+- Speech resource system-assigned identity: Storage Blob Data Reader on the audio-staging account (reads staged audio for batch jobs).
+- Function UAMI: Storage Blob Data Contributor on the audio-staging account (stages audio blobs and cleans them up after transcription).
 
 ### Diagnostics and Cost
 
