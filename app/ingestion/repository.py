@@ -624,7 +624,7 @@ class IngestionRepository:
             raise ValueError("run counters cannot be negative")
         source_run_id = create_source_run_id(source_id, run_id)
         query = (
-            "SELECT c.status, c.writtenChunkCount FROM c "
+            "SELECT c.status, c.stage, c.writtenChunkCount FROM c "
             "WHERE c.sourceRunId = @sourceRunId AND c.recordType = @recordType"
         )
         parameters = [
@@ -632,6 +632,7 @@ class IngestionRepository:
             {"name": "@recordType", "value": SOURCE_DOCUMENT_RECORD_TYPE},
         ]
         counts = {status.value: 0 for status in DocumentStatus}
+        transcribing = 0
         chunks_written = 0
         continuation: str | None = None
         while True:
@@ -647,6 +648,15 @@ class IngestionRepository:
                 status = row.get("status")
                 if status not in counts:
                     raise RepositoryDataError("source document has an invalid persisted status")
+                # Audio parked for async batch transcription is finalized by the poll timer
+                # outside the run, so it is a distinct in-flight state that must not block
+                # run finalization.
+                if (
+                    status == DocumentStatus.PROCESSING.value
+                    and row.get("stage") == DocumentStage.TRANSCRIBING.value
+                ):
+                    transcribing += 1
+                    continue
                 counts[status] += 1
                 if status == DocumentStatus.READY.value:
                     written = row.get("writtenChunkCount")
@@ -658,6 +668,7 @@ class IngestionRepository:
         return RunCounters(
             discovered=counts[DocumentStatus.DISCOVERED.value],
             processing=counts[DocumentStatus.PROCESSING.value],
+            transcribing=transcribing,
             ready=counts[DocumentStatus.READY.value],
             failed=counts[DocumentStatus.FAILED.value],
             chunks_written=chunks_written,

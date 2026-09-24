@@ -443,6 +443,7 @@ class Settings:
 class RunCounters:
     discovered: int = 0
     processing: int = 0
+    transcribing: int = 0
     ready: int = 0
     failed: int = 0
     chunks_written: int = 0

@@ -902,6 +902,32 @@ def test_finalization_requires_all_documents_to_be_terminal() -> None:
         repository.finalize_run(terminal_run, activated.run.etag, retries=0, items_scanned=1)
 
 
+def test_transcribing_documents_are_counted_separately_and_do_not_block_finalization() -> None:
+    runs = StatefulContainer("sourceId")
+    documents = StatefulContainer("sourceRunId")
+    repository = IngestionRepository(runs, documents, StatefulContainer("documentKey"))
+    activated = repository.activate_run(build_run("run-a", UTC), build_control("run-a", UTC))
+    # Audio parked for async batch transcription (status=processing, stage=transcribing) is
+    # finalized by the poll timer outside the run and must not block run finalization.
+    item = build_document(item_id="audio-1").to_cosmos_item()
+    item["status"] = DocumentStatus.PROCESSING.value
+    item["stage"] = DocumentStage.TRANSCRIBING.value
+    documents._store(item)
+
+    counters = repository.compute_run_counters("source", "run-a", retries=0, items_scanned=1)
+    assert counters.transcribing == 1
+    assert counters.processing == 0
+
+    finalized = repository.finalize_run(
+        build_terminal_run(activated.run.record, RunStatus.COMPLETED),
+        activated.run.etag,
+        retries=0,
+        items_scanned=1,
+    )
+    assert finalized.record.status is RunStatus.COMPLETED
+    assert finalized.record.counters.transcribing == 1
+
+
 def test_finalization_detects_document_that_becomes_nonterminal_during_scan(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

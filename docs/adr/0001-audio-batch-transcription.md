@@ -93,6 +93,14 @@ Text/Office documents keep the current synchronous path — unchanged.
   non-blocking.
 - Open risk: the result `contentUrl` is a public `*.blob.core.windows.net` URL, so the
   VNet-integrated Function needs outbound egress to reach it — verify during Phase 3/e2e.
+- **Run finalization:** a full-sync run finalizes while its audio docs are still parked at
+  `stage=TRANSCRIBING`; the poll timer owns their transition to `ready`. `compute_run_counters`
+  classifies these as a distinct `RunCounters.transcribing` count (excluded from `processing`), so
+  they do not trip the "cannot finalize while documents are nonterminal" guard. Without this, a
+  small or audio-only run finishes before the 5-minute poll timer and finalization fails, leaving
+  the run at `status=RUNNING` and blocking both full-sync and delta/acl-resync. Residual: a new
+  full-sync may start while a prior run's audio still transcribes; re-discovery of the not-yet-ready
+  file is reconciled by the existing duplicate-version repair.
 - Config: `AUDIO_TRANSCRIPTION_PROVIDER` gains `speech_batch`; new staging/results/TTL/poll settings.
 
 ## Implementation phases (see tracker `.copilot-tasks/audio-batch-transcription.md`)
