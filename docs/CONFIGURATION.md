@@ -287,7 +287,7 @@ the [batch transcription guide](https://learn.microsoft.com/en-us/azure/ai-servi
 URL validation and matching declared regions do not verify account ownership,
 actual region/residency, worker identity, private routing, or permission to process
 recordings. Decoder integrity/containment, policy approvals, and live verification
-remain open; see the [audio implementation plan](AUDIO_RAG_PROPOSAL.md#implementation-plan).
+remain open; see [ADR 0001](adr/0001-audio-batch-transcription.md).
 No Speech client is created by configuration loading. These ingestion audio/Speech
 settings are not emitted by Bicep or the deployment controller.
 

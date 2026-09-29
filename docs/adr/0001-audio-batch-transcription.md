@@ -1,8 +1,8 @@
 # ADR 0001: Audio transcription via async Batch (replacing inline Fast)
 
-Status: Accepted (design) — implementation pending
+Status: Accepted — implemented (2026-09-29)
 Date: 2026-09-22
-Supersedes: the Fast-transcription writer choice in `docs/AUDIO_RAG_PROPOSAL.md` (audio only)
+Supersedes: the earlier Fast-transcription writer design (audio only)
 
 ## Context
 

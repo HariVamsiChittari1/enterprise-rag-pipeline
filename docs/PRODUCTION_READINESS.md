@@ -128,7 +128,7 @@ The evaluator verifies ranking/ground-truth hashes bound by the manifest. Source
 ## Readiness Verdict
 
 The results below describe the 2026-09-05 release, not the current worktree.
-The mutable-catalog candidate and [audio implementation](AUDIO_RAG_PROPOSAL.md#current-status)
+The mutable-catalog candidate and [audio implementation](adr/0001-audio-batch-transcription.md)
 have not established same-source deployment and end-to-end acceptance here.
 
 - **Historical-release deployment smoke:** passed on 2026-09-05.
