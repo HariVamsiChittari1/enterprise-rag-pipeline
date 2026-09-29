@@ -166,6 +166,36 @@ Cosmos, Storage, Document Intelligence, Language, and Content Understanding disa
 - Retrieval URL and Container App name when serving is deployed.
 - Retrieval configuration map.
 
+## Dev and Production SKU Sizing
+
+Dev SKUs are the values emitted by `infra/` (defaults in `main.parameters.bicepparam` and module params); external Azure OpenAI and Key Vault SKUs were read live from the dev/e2e environment. Production recommendations use only the knobs the project already exposes, each justified by Microsoft Learn. The load target for these recommendations is **10,000 SharePoint files (ingestion) and 5,000 retrieval users**.
+
+Rows marked `(baseline, validate)` are starting assumptions, not measured values. Finalizing them requires four inputs: average/maximum file size and type mix, ingestion window, peak queries per second, and tokens per query. All other prod SKUs are discrete tier decisions that do not depend on load.
+
+| # | Resource | Dev SKU | Prod SKU | Basis |
+| --- | --- | --- | --- | --- |
+| 1 | Cosmos DB NoSQL | Serverless | Provisioned, autoscale + zone-redundant (+2nd region if geo-HA). Search-chunks 10,000 RU/s max, metadata shared 4,000 RU/s max `(baseline, validate)` | Learn: serverless caps 5,000 RU/s per physical partition and is single-region; provisioned for sustained load |
+| 2 | Function App | Flex Consumption, 2048 MB, max 40 | Flex Consumption, 2048 MB. maxInstances 100 `(baseline, validate)` | Learn: 2048 MB is the default; Flex max 1,000; 100×1 core is under the 250-core regional quota |
+| 3 | Retrieval Container App | 0.5 vCPU / 1 GiB, 1–5 replicas | zoneRedundant on. 1 vCPU / 2 GiB, min 2 / max 10 replicas `(baseline, validate)` | HA needs min replicas ≥ 2; replica count sized by QPS |
+| 4 | ACA managed environment | Consumption, zoneRedundant=false | Consumption, zoneRedundant=true | Learn ACA reliability |
+| 5 | Azure Container Registry | Basic | Premium | Learn: only Premium supports Private Link / private endpoints |
+| 6 | Document Intelligence | S0 | S0 | Standard paid tier; no higher account SKU |
+| 7 | Azure AI Language | S | S | Standard paid tier; no higher account SKU |
+| 8 | Azure AI Speech (optional) | S0 | S0 | Standard paid tier |
+| 9 | Content Understanding / Foundry (optional) | S0 (AIServices) | S0 | Standard paid tier |
+| 10 | Functions/Durable Storage | Standard_ZRS | Standard_ZRS (GZRS if geo-DR) | ZRS is already zone-redundant |
+| 11 | Audio-staging Storage (optional) | Standard_ZRS | Standard_ZRS | transient audio only |
+| 12 | Durable Task Scheduler | Consumption | Consumption | only SKU in Bicep; validate fan-out capacity |
+| 13 | Log Analytics | PerGB2018, 90-day retention | PerGB2018 (retention per compliance) | standard workspace SKU |
+| 14 | Application Insights | Workspace-based, daily cap 5 GB | Workspace-based, daily cap 30 GB or unlimited `(baseline, validate)` | 5 GB clips at scale |
+| 15 | VNet / Private DNS / Private Endpoints | Standard (no tier) | Standard | no SKU tier |
+| 16 | 3× User-assigned Managed Identities | no SKU | no SKU | not billable |
+| 17 | Azure OpenAI account (external) | S0 | S0 | account SKU is fixed |
+| 18 | → chat `gpt-5.4` (external) | GlobalStandard, capacity 30 (~30K TPM) | GlobalStandard or ProvisionedManaged/PTU. Capacity 250 (~250K TPM) `(baseline, validate)` | Learn: chat Tier-1 = 1,000,000 TPM; PTU for latency-critical load |
+| 19 | → embedding `text-embedding-3-large` (external) | GlobalStandard, capacity 30 (~30K TPM) | GlobalStandard. Capacity 350 (~350K TPM) `(baseline, validate)` | Learn: embedding Tier-1 = 1,000,000 TPM |
+| 20 | Key Vault (external) | Standard (family A) | Standard (Premium only if HSM-backed keys are mandated) | dev vault is Standard |
+| 21 | Entra app registrations (3) | no SKU | no SKU | Microsoft Entra directory objects, not billable |
+
 ## Sources of Truth
 
 - Resource graph: `infra/main.bicep` and `infra/modules/*.bicep`.
