@@ -7,7 +7,7 @@ Supersedes: the earlier Fast-transcription writer design (audio only)
 ## Context
 
 The deployed audio writer calls Azure Speech **Fast transcription** synchronously inside a
-Durable Functions `process_document_activity`. In the `rg-rag-aca-e2e-20260827` environment
+Durable Functions `process_document_activity`. In the e2e test environment
 audio documents consistently freeze at `status=processing/stage=acl` and never persist chunks.
 
 Evidence (this environment, App Insights + metrics + live repro):
@@ -103,7 +103,7 @@ Text/Office documents keep the current synchronous path — unchanged.
   file is reconciled by the existing duplicate-version repair.
 - Config: `AUDIO_TRANSCRIPTION_PROVIDER` gains `speech_batch`; new staging/results/TTL/poll settings.
 
-## Implementation phases (see tracker `.copilot-tasks/audio-batch-transcription.md`)
+## Implementation phases
 
 1. `speech_batch.py` adapter (submit/get/download-result/delete), injectable transport + unit tests;
    config additions. No infra/deploy.
