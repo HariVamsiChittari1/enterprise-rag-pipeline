@@ -99,8 +99,8 @@ sequenceDiagram
     loop Waves of WAVE_SIZE documents (parallel fan-out)
         Orch->>Graph: Read /permissions for file
         Note over Orch: Extract Entra group IDs + site group IDs
-        Orch->>Orch: Site group IDs? → resolve via SP REST API
-        Orch->>Graph: Verify each Entra group via GET /groups/{id} (securityEnabled check, 404=skip)
+        Orch->>Orch: Resolve site group IDs via SharePoint REST API
+        Orch->>Graph: Verify Entra groups and keep only security-enabled groups
         Orch->>Graph: Download original source bytes
         alt Markdown, provider independent
             Orch->>Orch: Direct UTF-8 extraction
@@ -127,13 +127,13 @@ sequenceDiagram
                 Orch->>OAI: Describe required figures
             end
             Orch->>Orch: Merge source-bound visual descriptions
-        else Audio (Speech batch — deployed default)
+        else Audio (Speech batch - deployed default)
             Orch->>AudioStg: Upload source to audio-staging blob
             Orch->>Speech: Submit batch transcription job
             Orch->>Cosmos: Park document at TRANSCRIBING (job URL + staging blob name)
-            Note over Orch: Returns SUCCEEDED with zero chunks; the poll timer finalizes later (see Audio Transcription Poll Flow)
+            Note over Orch: Returns SUCCEEDED with zero chunks, and the poll timer finalizes later (see Audio Transcription Poll Flow)
         end
-        Note over Orch: Text/Office only — reject incomplete coverage, then chunk canonical segments (audio finalizes in the poll flow)
+        Note over Orch: Text and Office reject incomplete coverage before chunking, while audio finalizes in the poll flow
         Orch->>Lang: Enrich batch (size=5): key phrases, entities, summary (each independently configurable)
         Orch->>OAI: Embed cleaned text (batch=100, 3072 dims)
         Orch->>Cosmos: Write initially ineligible chunks
@@ -234,6 +234,7 @@ sequenceDiagram
                 Act->>Cosmos: Update allowedGroupIds on doc + chunks, or retire (acl_revoked)
             else Item added or updated
                 Act->>Pipeline: Full pipeline (ACL → extract → chunk → enrich → embed)
+                Note over Pipeline: Audio instead stages + submits a Speech batch job and parks at TRANSCRIBING; the audio poll timer finalizes it to READY later
                 Pipeline->>Cosmos: Write ineligible chunks, admit generation, then mark READY
                 Act->>Cosmos: Write document_ingested audit
                 Act->>Cosmos: Delete previous version + chunks (reason=superseded), write document_deleted audit
@@ -249,7 +250,7 @@ sequenceDiagram
 - **Bootstrap**: On the first tick (no cursor in `delta-control`), the timer fetches `?token=latest` with the same `Prefer` headers used for steady-state reads (`deltashowremovedasdeleted, deltatraversepermissiongaps, deltashowsharingchanges`). This ensures the bootstrap token is compatible with subsequent delta reads.
 - **Permission-change contract**: Microsoft documents the three permission-scanning headers with `Sites.FullControl.All`. The connector sends those headers, but the approved prerequisite set does not include that permission. This is an unresolved permission-contract gap; weekly explicit ACL resync remains the safety net, and sharing-change delta events must not be treated as complete evidence until the design is reconciled.
 - **Steady state**: Each tick follows Graph's opaque `@odata.nextLink` and `@odata.deltaLink` URLs without editing their tokens, deduplicates by item ID (latest occurrence wins), and processes additions, updates, and deletions. Ordering and at-most-once delivery are not assumed.
-- **Additions/updates**: Run through the full processing pipeline (ACL verification → selected extraction provider → chunking → Language AI enrichment → embedding → Cosmos write). Previous versions are hard-deleted (document + chunks) via `lifecycle_repository.delete_document_and_chunks()`, ETag-guarded against concurrent changes, once the replacement is already `ready`.
+- **Additions/updates**: Documents run through the full processing pipeline (ACL verification → selected extraction provider → chunking → Language AI enrichment → embedding → Cosmos write); **audio instead stages the file and submits a Speech batch job, parking the document at `transcribing` for the `audio_transcription_poll_timer` to finalize to `ready`** (see [Audio Transcription Poll Flow](#audio-transcription-poll-flow)). Previous versions are hard-deleted (document + chunks) via `lifecycle_repository.delete_document_and_chunks()`, ETag-guarded against concurrent changes, once the replacement activity succeeds — for documents that is the `ready` version, while for a changed audio file the supersede runs while the new version is still `transcribing`.
 - **Permission-only changes**: When Graph flags `@microsoft.graph.sharedChanged` on an item with no content change, `resync_document_acl()` re-verifies that document's ACL directly (same outcome as ACL Resync below) instead of running the full pipeline. ACL revocation still soft-retires (`status=retired`, `retiredReason=acl_revoked`) rather than hard-deleting, since it reflects a permission change, not a confirmed source deletion.
 - **Deletions**: The document and its chunks are hard-deleted from Cosmos via `lifecycle_repository.delete_document_and_chunks()`, guarded by the document's ETag so a concurrent change (e.g. a racing ACL resync) is detected as a conflict and safely skipped rather than deleting stale data.
 - **Concurrency guard**: Skips if a full-sync orchestration or a previous delta tick is still running.
@@ -816,7 +817,11 @@ flowchart TB
         FuncApp -->|PE| Cosmos[(Cosmos DB)]
         FuncApp -->|PE| Storage[(Storage<br/>blob + queue + table)]
         FuncApp -->|PE| KV[Key Vault]
+        FuncApp -->|PE| DI[Document Intelligence]
         FuncApp -->|PE| Lang[Language AI]
+        FuncApp -->|PE + MI| Speech[Azure AI Speech<br/>batch transcription<br/>audio writer only]
+        FuncApp -->|PE + MI| AudioStg[(Audio-staging Storage<br/>audio writer only)]
+        Speech -->|resource-instance rule| AudioStg
         FuncApp -->|UAMI token + gateway context| ACA[Azure Container Apps<br/>Retrieval Service]
         ACA -->|MI| Cosmos
     end
@@ -828,6 +833,7 @@ flowchart TB
 ```
 
 - **Private data services** — this deployment disables public access for Cosmos, Storage, Document Intelligence, and Language AI and connects through private endpoints. The certificate Key Vault is externally supplied; this template adds a private endpoint and RBAC but does not change the vault's existing public-access policy.
+- **Audio writer network posture** — when the audio writer is enabled, the dedicated Speech resource is private-only (private endpoint, MI auth) with an optional temporary allowed IP for a guarded transcription spike, and the audio-staging Storage account is reached over a private endpoint for Function writes while its public endpoint denies all traffic except the Speech resource instance that reads staged audio for batch transcription.
 - **Credential handling** — service access uses managed identities; the SharePoint application certificate is loaded from Key Vault. `WEBHOOK_CLIENT_STATE` remains a secure deployment parameter and Function app setting rather than a client secret embedded in source.
 - **Public surface** — the Function App is internet-facing. EasyAuth protects all paths except `/api/webhook/*`; the SharePoint webhook validates `clientState`, while the lifecycle webhook currently only parses and logs events. The ACA managed environment is configured as internal and receives query traffic through its private DNS name.
 - **Retrieval service network** — ACA connects to Cosmos DB via MI, Azure OpenAI via MI RBAC, and Microsoft Graph via MI token for ACL group resolution at query time
