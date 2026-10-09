@@ -787,7 +787,7 @@ function Invoke-ImageBuild {
         [ordered]@{ action = 'preview'; image = "rag-retrieval:$buildId" } | ConvertTo-Json -Compress
         return
     }
-    az acr build --registry $registryName --image "rag-retrieval:$buildId" --file app/retrieval/Dockerfile app --no-logs --only-show-errors
+    az acr build --registry $registryName --image "rag-retrieval:$buildId" --file app/retrieval/Dockerfile app --no-logs --only-show-errors | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'ACR build failed.' }
     $digest = az acr repository show --name $registryName --image "rag-retrieval:$buildId" --query digest --output tsv --only-show-errors
     if ($LASTEXITCODE -ne 0 -or $digest -notmatch '^sha256:[a-f0-9]{64}$') { throw 'ACR did not return an immutable digest.' }

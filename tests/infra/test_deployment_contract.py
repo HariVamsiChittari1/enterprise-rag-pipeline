@@ -70,7 +70,7 @@ def test_deployment_controller_has_no_implicit_or_destructive_target() -> None:
     assert "az deployment group what-if" in source
     assert source.index("az deployment group what-if") < source.index("az deployment group create")
     assert "az acr build" in source
-    assert "--no-logs" in source
+    assert "--no-logs --only-show-errors | Out-Null" in source
     assert "--mode Incremental" in source
     assert "az group create" not in source
     assert "azd down" not in source
