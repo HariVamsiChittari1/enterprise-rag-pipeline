@@ -1256,6 +1256,44 @@ def test_deferred_delta_cursor_commit_requires_ready_candidate_and_completes_rou
     assert events == ["atomic-commit"]
 
 
+def test_audio_poll_releases_ended_owner_before_reading_coordinator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = _plan("source-a", "site-a", "a", "drive-a")
+    config = SimpleNamespace(
+        audio_writer_enabled=True,
+        audio_transcription_provider="speech_batch",
+    )
+    events = []
+
+    class Registry:
+        def get_drive_coordinator(self, _source_id):
+            events.append("read")
+            return None
+
+    async def release(_client, _registry, source_id):
+        assert source_id == "source-a"
+        events.append("release")
+
+    async def start(_client, _repo, source_id, _control, _orchestrator, **_kwargs):
+        assert source_id == "source-a"
+        events.append("start")
+
+    monkeypatch.setattr(config_module, "load_config", lambda: config)
+    monkeypatch.setattr(function_app, "_build_lifecycle_repository", lambda _config: object())
+    monkeypatch.setattr(function_app, "_build_source_registry_repository", lambda _config: Registry())
+    monkeypatch.setattr(function_app, "_load_validated_source_plans", lambda _config: (plan,))
+    monkeypatch.setattr("ingestion.source_registry.config_for_source", lambda _config, _plan: config)
+    monkeypatch.setattr(function_app, "_release_coordinator_of_ended_owner", release)
+    monkeypatch.setattr(function_app, "_start_if_not_running", start)
+
+    asyncio.run(inspect.unwrap(function_app.audio_transcription_poll_timer._function._func)(
+        SimpleNamespace(), object(),
+    ))
+
+    assert events == ["release", "read", "start"]
+
+
 @pytest.mark.parametrize(
     ("desired_state", "coordinator_state", "expected"),
     [

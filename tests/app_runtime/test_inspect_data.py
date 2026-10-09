@@ -21,10 +21,12 @@ import function_app
 class FakeContainer:
     def __init__(self) -> None:
         self.queries: list[str] = []
+        self.parameters: list[list[dict] | None] = []
         self.partition_keys: list[Any] = []
 
     def query_items(self, query: str, parameters: list[dict] | None = None, **kwargs: Any) -> list[dict]:
         self.queries.append(query)
+        self.parameters.append(parameters)
         self.partition_keys.append(kwargs.get("partition_key"))
         return []
 
@@ -83,17 +85,97 @@ def test_inspect_data_does_not_order_other_containers(monkeypatch: pytest.Monkey
     assert "ORDER BY" not in container.queries[0]
 
 
-def test_inspect_data_run_id_filter_does_not_add_ordering(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_inspect_data_run_filter_uses_explicit_source_partition(monkeypatch: pytest.MonkeyPatch) -> None:
     container = FakeContainer()
     monkeypatch.setattr(azure.cosmos, "CosmosClient", _fake_cosmos_client_factory(container))
-    request = FakeRequest({"container": "service-audit", "limit": "50", "runId": "run-1"})
-    monkeypatch.setenv("INGESTION_SOURCE_ID", "source-1")
+    request = FakeRequest({
+        "container": "source-documents",
+        "sourceId": "source-1",
+        "runId": "run-1",
+        "limit": "50",
+    })
 
     response = function_app.inspect_data(request)
 
     assert response.status_code == 200
-    assert len(container.queries) == 1
+    assert container.partition_keys == ["source-1:run-1"]
     assert "ORDER BY" not in container.queries[0]
+
+
+def test_inspect_data_run_filter_requires_source_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    container = FakeContainer()
+    monkeypatch.setattr(azure.cosmos, "CosmosClient", _fake_cosmos_client_factory(container))
+    request = FakeRequest({"container": "source-documents", "runId": "run-1"})
+
+    response = function_app.inspect_data(request)
+
+    assert response.status_code == 400
+    assert container.queries == []
+
+
+def test_inspect_data_filters_chunks_by_document_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    container = FakeContainer()
+    monkeypatch.setattr(azure.cosmos, "CosmosClient", _fake_cosmos_client_factory(container))
+    request = FakeRequest({
+        "container": "search-chunks",
+        "documentKey": "source-1:run-1:doc-1",
+    })
+
+    response = function_app.inspect_data(request)
+
+    assert response.status_code == 200
+    assert container.partition_keys == ["source-1:run-1:doc-1"]
+
+
+def test_inspect_data_rejects_document_key_for_other_containers(monkeypatch: pytest.MonkeyPatch) -> None:
+    container = FakeContainer()
+    monkeypatch.setattr(azure.cosmos, "CosmosClient", _fake_cosmos_client_factory(container))
+    request = FakeRequest({
+        "container": "source-documents",
+        "documentKey": "source-1:run-1:doc-1",
+    })
+
+    response = function_app.inspect_data(request)
+
+    assert response.status_code == 400
+    assert container.queries == []
+
+
+def test_inspect_data_filters_unresolved_work_by_source_and_owner(monkeypatch: pytest.MonkeyPatch) -> None:
+    container = FakeContainer()
+    monkeypatch.setattr(azure.cosmos, "CosmosClient", _fake_cosmos_client_factory(container))
+    request = FakeRequest({
+        "container": "ingestion-runs",
+        "sourceId": "source-1",
+        "ownerInstanceId": "instance-1",
+        "unresolvedOnly": "true",
+        "limit": "50",
+    })
+
+    response = function_app.inspect_data(request)
+
+    assert response.status_code == 200
+    assert container.partition_keys == ["source-1"]
+    assert "c.recordType = @recordType" in container.queries[0]
+    assert "c.ownerInstanceId = @owner" in container.queries[0]
+    assert "ARRAY_CONTAINS(@states, c.state)" in container.queries[0]
+    assert container.parameters[0] == [
+        {"name": "@limit", "value": 50},
+        {"name": "@recordType", "value": "document-operation"},
+        {"name": "@owner", "value": "instance-1"},
+        {"name": "@states", "value": ["claimed", "running", "unresolved"]},
+    ]
+
+
+def test_inspect_data_rejects_partial_recovery_filter(monkeypatch: pytest.MonkeyPatch) -> None:
+    container = FakeContainer()
+    monkeypatch.setattr(azure.cosmos, "CosmosClient", _fake_cosmos_client_factory(container))
+    request = FakeRequest({"container": "ingestion-runs", "sourceId": "source-1"})
+
+    response = function_app.inspect_data(request)
+
+    assert response.status_code == 400
+    assert container.queries == []
 
 
 def test_inspect_data_catalog_uses_deployment_partition(monkeypatch: pytest.MonkeyPatch) -> None:

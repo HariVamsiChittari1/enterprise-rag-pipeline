@@ -686,6 +686,39 @@ def inspect_data(req: func.HttpRequest) -> func.HttpResponse:
     limit = min(int(req.params.get("limit", "10")), 200)
     run_id = (req.params.get("runId") or "").strip()
     deployment_instance = (req.params.get("deploymentInstanceId") or "").strip()
+    source_id = (req.params.get("sourceId") or "").strip()
+    owner_instance_id = (req.params.get("ownerInstanceId") or "").strip()
+    unresolved_only = (req.params.get("unresolvedOnly") or "").strip().lower()
+    document_key = (req.params.get("documentKey") or "").strip()
+    recovery_filter_requested = bool(owner_instance_id or unresolved_only)
+
+    if recovery_filter_requested and (
+        container_name != "ingestion-runs"
+        or not source_id
+        or not owner_instance_id
+        or unresolved_only != "true"
+        or bool(run_id)
+    ):
+        return _json_response({
+            "error": (
+                "sourceId, ownerInstanceId, and unresolvedOnly=true are required "
+                "only with ingestion-runs"
+            ),
+        }, 400)
+    if not recovery_filter_requested and (run_id or source_id) and (
+        container_name != "source-documents" or not run_id or not source_id
+    ):
+        return _json_response({
+            "error": "sourceId and runId are required only with source-documents",
+        }, 400)
+    if document_key and (
+        container_name != "search-chunks"
+        or recovery_filter_requested
+        or bool(run_id or source_id or deployment_instance)
+    ):
+        return _json_response({
+            "error": "documentKey is supported only by itself with search-chunks",
+        }, 400)
 
     # retrieval-config is partitioned by deploymentInstanceId; the same catalog id can exist
     # in multiple deployment partitions, so require an explicit partition and reject runId.
@@ -700,14 +733,34 @@ def inspect_data(req: func.HttpRequest) -> func.HttpResponse:
         db = cosmos.get_database_client(os.getenv("COSMOS_DATABASE_NAME", ""))
         container = db.get_container_client(container_name)
 
-        if container_name == "retrieval-config":
+        if document_key:
+            rows = list(container.query_items(
+                query="SELECT TOP @limit * FROM c",
+                parameters=[{"name": "@limit", "value": limit}],
+                partition_key=document_key,
+            ))
+        elif recovery_filter_requested:
+            rows = list(container.query_items(
+                query=(
+                    "SELECT TOP @limit * FROM c WHERE c.recordType = @recordType "
+                    "AND c.ownerInstanceId = @owner "
+                    "AND ARRAY_CONTAINS(@states, c.state)"
+                ),
+                parameters=[
+                    {"name": "@limit", "value": limit},
+                    {"name": "@recordType", "value": "document-operation"},
+                    {"name": "@owner", "value": owner_instance_id},
+                    {"name": "@states", "value": ["claimed", "running", "unresolved"]},
+                ],
+                partition_key=source_id,
+            ))
+        elif container_name == "retrieval-config":
             rows = list(container.query_items(
                 query="SELECT TOP @limit * FROM c",
                 parameters=[{"name": "@limit", "value": limit}],
                 partition_key=deployment_instance,
             ))
         elif run_id:
-            source_id = os.getenv("INGESTION_SOURCE_ID", "").strip()
             rows = list(container.query_items(
                 query="SELECT TOP @limit * FROM c",
                 parameters=[{"name": "@limit", "value": limit}],
@@ -2568,6 +2621,9 @@ async def audio_transcription_poll_timer(timer: func.TimerRequest, client) -> No
         source_config = config_for_source(config, plan)
         if not (source_config.audio_writer_enabled and source_config.audio_transcription_provider == "speech_batch"):
             continue
+        await _release_coordinator_of_ended_owner(
+            client, source_registry_repository, plan.source_id,
+        )
         coordinator = source_registry_repository.get_drive_coordinator(plan.source_id)
         poll_mode = _audio_poll_dispatch_mode(plan.source.desired_state, coordinator)
         if poll_mode is None:

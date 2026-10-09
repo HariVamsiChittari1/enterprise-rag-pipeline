@@ -186,7 +186,7 @@ unverified finalization remains unresolved.
 #### Request
 
 ```http
-POST /api/ingestion/terminate?instanceId=<id> HTTP/1.1
+POST /api/ingestion/terminate?sourceId=<source-id>&instanceId=<id> HTTP/1.1
 Authorization: Bearer <token>
 ```
 
@@ -194,7 +194,8 @@ Authorization: Bearer <token>
 
 | Name | Required | Default | Description |
 |---|---|---|---|
-| `instanceId` | No | Current full-sync instance, resolved via Cosmos | Instance to terminate |
+| `sourceId` | Yes | — | Registered source whose coordinator and run are being recovered |
+| `instanceId` | No | Current full-sync instance, resolved via Cosmos | Instance to terminate; must own the source coordinator |
 | `abandonWork` | No | `false` | Set `true` only for separately authorized operator recovery of one exact permit |
 | `workId`, `attemptId`, `sourceRunId`, `documentId` | Required with `abandonWork=true` | None | Exact permit identity to abandon |
 | `workersStopped` | Required with `abandonWork=true` | None | Must equal `yes` after the shared Function workers are stopped |
@@ -517,10 +518,14 @@ Authorization: Bearer <token>
 |---|---|---|---|
 | `container` | Yes | — | One of: `ingestion-runs`, `source-documents`, `search-chunks`, `service-audit`, `retrieval-config` |
 | `limit` | No | `10` | Number of rows (max `200`) |
-| `runId` | No | — | Supported only with `container=source-documents`; filters the `/sourceRunId` partition as `<source_id>:<runId>` |
+| `runId` | Conditional | — | With `container=source-documents`, filters one `/sourceRunId` partition; requires the matching `sourceId` |
 | `deploymentInstanceId` | Conditional | — | Required with `container=retrieval-config` (its partition key); `runId` is rejected for that container |
+| `sourceId` | Conditional | — | Required with `runId` for `source-documents`, or with `ownerInstanceId` and `unresolvedOnly=true` for a source-partitioned `ingestion-runs` recovery query |
+| `ownerInstanceId` | Conditional | — | Exact coordinator owner for unresolved-work recovery; requires `sourceId` and `unresolvedOnly=true` |
+| `unresolvedOnly` | Conditional | — | Must equal `true` with both recovery identity parameters; returns only claimed, running, or unresolved document operations |
+| `documentKey` | Conditional | — | With `container=search-chunks`, reads only the exact `/documentKey` partition; cannot be combined with other inspection filters |
 
-For `ingestion-runs`, `search-chunks`, and `service-audit`, omit `runId`; their partition keys are not `/sourceRunId`, and supplying it can return an empty result that does not prove absence. Without `runId`, `service-audit` is queried cross-partition and ordered by `recordedAt DESC`, so the result is the most recent rows. `search-chunks` has no equivalent ordering.
+For `ingestion-runs`, `search-chunks`, and `service-audit`, omit `runId`; their partition keys are not `/sourceRunId`, and supplying it can return an empty result that does not prove absence. The three recovery parameters are accepted only together for `ingestion-runs`, producing a source-partitioned, owner-scoped query suitable for comparison with the coordinator's `activeWorkCount`. Without `runId`, `service-audit` is queried cross-partition and ordered by `recordedAt DESC`, so the result is the most recent rows. `search-chunks` has no equivalent ordering.
 
 Inspect removes Cosmos `_` system properties only. Source documents, chunk content, audit user/tenant IDs, and historical questions and answer previews can remain in the response. Restrict endpoint access and handle diagnostic output according to its data classification.
 
