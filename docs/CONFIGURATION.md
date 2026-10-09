@@ -119,9 +119,9 @@ Content Understanding uses `prebuilt-documentSearch`. Microsoft can update a pre
 | --- | --- | --- | --- |
 | `SHAREPOINT_TENANT_ID` | Yes | Tenant GUID | Tenant for SharePoint certificate auth and Function/retrieval identity validation. |
 | `SHAREPOINT_APP_CLIENT_ID` | Yes | Application client GUID | Certificate-authenticated SharePoint ingestion application. |
-| `SHAREPOINT_ASSIGNED_DRIVE_ID` | Yes | Graph drive ID | Single SharePoint document-library drive ingested by this deployment. |
-| `SHAREPOINT_SITE_URL` | Yes | `https://tenant.sharepoint.com/sites/site` | HTTPS site used to verify drive ownership and expand SharePoint site groups. No query string, fragment, credentials, or nonstandard port. |
-| `INGESTION_SOURCE_ID` | Yes | Stable identifier such as `sharepoint-drive` | Source namespace for runs, document keys, task hub, and controls. Keep stable across redeployments. |
+| `SHAREPOINT_ASSIGNED_DRIVE_ID` | Legacy deployment input | Existing Graph drive ID | Still emitted by Bicep for compatibility; multi-source dispatch does not use it as a catalog fallback. |
+| `SHAREPOINT_SITE_URL` | Legacy deployment input | `https://tenant.sharepoint.com/sites/site` | Still emitted by Bicep for compatibility; each runtime source uses its validated registry value. |
+| `INGESTION_SOURCE_ID` | Legacy deployment input | Stable identifier such as `sharepoint-drive` | Still used to derive `TASKHUB_NAME` and as an audit fallback; multi-source dispatch reads source IDs from Cosmos. |
 | `SHAREPOINT_KEY_VAULT_NAME` | Yes | Existing vault name | Existing vault holding the certificate PFX secret. Must be in the deployment subscription. |
 | `SHAREPOINT_KEY_VAULT_RESOURCE_GROUP` | Yes | Existing resource group | Resource group containing that vault in the deployment subscription. |
 | `SHAREPOINT_CERTIFICATE_SECRET_NAME` | No | `sharepoint-app-cert` | Key Vault secret containing the exportable PFX bytes. |
@@ -193,7 +193,7 @@ The active Function Bicep module injects the following settings. Values shown as
 | Variable | Value/default | Purpose |
 | --- | --- | --- |
 | `DURABLE_TASK_SCHEDULER_CONNECTION_STRING` | Generated endpoint plus Function UAMI | Managed-identity Durable Task Scheduler connection. |
-| `TASKHUB_NAME` | Generated from `INGESTION_SOURCE_ID`, maximum 45 characters | Source-specific Durable task hub. |
+| `TASKHUB_NAME` | Generated from legacy `INGESTION_SOURCE_ID`, maximum 45 characters | Deployment-wide Durable task hub used by all registered sources. |
 | `WAVE_SIZE` | Runtime fallback `4` | Documents dispatched concurrently per full-sync wave. Current Bicep does not emit an override. |
 | `WAVE_TIMEOUT_MINUTES` | Runtime fallback `20` | Deadline for one full-sync/retry wave. Current Bicep does not emit an override. |
 | `PROCESS_DOCUMENT_MAX_ATTEMPTS` | Runtime fallback `5` | Maximum retries inside `process_document_activity`. Current Bicep does not emit an override. |
@@ -203,9 +203,10 @@ The active Function Bicep module injects the following settings. Values shown as
 worker's one-function-at-a-time model ([Durable Functions concurrency](https://learn.microsoft.com/azure/azure-functions/durable/durable-functions-perf-and-scale#language-runtime-considerations)):
 each document activity is long-running and memory-heavy (extraction, figure rendering, vision,
 embeddings), so a higher per-worker limit would pin idle activities in one worker's memory instead
-of letting the scale controller distribute them across workers. Increase ingestion throughput by
-scaling out to more workers (and/or raising `FUNCTIONS_WORKER_PROCESS_COUNT` where per-worker memory
-allows), not by raising the activity throttle.
+of letting the scale controller distribute them across workers. Flex Consumption does not support
+`FUNCTIONS_WORKER_PROCESS_COUNT`; increase throughput through platform scale-out rather than
+raising the activity throttle or worker-process count
+([Flex Consumption](https://learn.microsoft.com/azure/azure-functions/flex-consumption-plan)).
 
 The deployed Durable Task Scheduler retains terminal orchestration history for 30 days by default. This is scheduler-owned state, not an application environment variable. Confirm the scheduler configuration against organizational retention requirements before relying on that duration; explicit purge operations can remove terminal history earlier.
 
@@ -213,9 +214,9 @@ The deployed Durable Task Scheduler retains terminal orchestration history for 3
 
 | Variable | Value/default | Purpose |
 | --- | --- | --- |
-| `INGESTION_SOURCE_ID` | Client input | Stable source namespace. |
-| `SHAREPOINT_ASSIGNED_DRIVE_ID` | Client input | Configured document-library drive. |
-| `SHAREPOINT_SITE_URL` | Client input | Required site URL for drive binding and site-group expansion. |
+| `INGESTION_SOURCE_ID` | Legacy deployment input | Task-hub seed and audit fallback; not the runtime source inventory. |
+| `SHAREPOINT_ASSIGNED_DRIVE_ID` | Legacy deployment input | Retained for compatibility; runtime sources use catalog drive IDs. |
+| `SHAREPOINT_SITE_URL` | Legacy deployment input | Retained for compatibility; runtime sources use catalog site URLs. |
 | `SHAREPOINT_TENANT_ID` | Client input | Certificate-auth tenant. |
 | `SHAREPOINT_APP_CLIENT_ID` | Client input | Certificate-auth application. |
 | `SHAREPOINT_CERTIFICATE_SECRET_NAME` | `sharepoint-app-cert` unless overridden | Certificate PFX secret name. |
@@ -237,8 +238,15 @@ The deployed Durable Task Scheduler retains terminal orchestration history for 3
 | `COSMOS_ENDPOINT` | Generated private endpoint | Cosmos account endpoint. |
 | `COSMOS_DATABASE_NAME` | Generated; active database is `rag-db` | Ingestion database name. Retrieval intentionally uses `COSMOS_DATABASE` instead. |
 | `COSMOS_INGESTION_RUNS_CONTAINER_NAME` | `ingestion-runs` | Runs/control container. |
+| `COSMOS_INGESTION_SOURCES_CONTAINER_NAME` | `ingestion-sources` | Common explicitly configured source registry. |
 | `COSMOS_SOURCE_DOCUMENTS_CONTAINER_NAME` | `source-documents` | Source manifest container. |
 | `COSMOS_SEARCH_CHUNKS_CONTAINER_NAME` | `search-chunks` | Chunk container. |
+
+Retrieval additionally reads `COSMOS_INGESTION_SOURCES_CONTAINER` and
+`COSMOS_INGESTION_RUNS_CONTAINER` through its managed identity for source-policy
+eligibility. The reader uses Strong consistency and denies all content when complete
+registry enumeration fails; verify actual account settings and container RBAC before
+deployment.
 
 ### Ingestion behavior
 
@@ -345,11 +353,8 @@ remove reference markers from generated answer text.
 
 | Variable | Required | Value/default | Accepted values and effect |
 | --- | --- | --- | --- |
-| `ACL_ENABLED` | No | `true` | `false`, `0`, or `no` disable ACL filtering; any other value enables it. Never disable in a shared secure environment merely to make a test pass. |
+| `ACL_ENABLED` | No | `true` | `false`, `0`, or `no` disable group-based ACL filtering for document and transcript evidence; any other value enables it. Source lifecycle checks remain enforced. Never disable in a shared secure environment merely to make a test pass. |
 | `INCLUDE_CITATIONS` | No | `true` | Only literal `false` disables citations. |
-| `AUDIO_RETRIEVAL_ENABLED` | No | `false` | Retrieval (reader) audio gate: only `true` or `false` after trimming and case normalization. Independent of the ingestion writer gate. Keep disabled until reader and enablement gates pass. |
-| `AUDIO_MAX_ACL_AGE_SECONDS` | When retrieval audio is enabled | No default | Positive integer maximum age of the audio manifest's verified ACL. Audio requires `ACL_ENABLED=true`; missing, expired, or future verification timestamps hide the evidence. |
-| `AUDIO_MAX_SOURCE_AGE_SECONDS` | When retrieval audio is enabled | No default | Positive integer maximum age of source-version verification for audio. Obtain security/product approval for both freshness limits; no production freshness policy is supplied by the code. |
 | `MAX_EVIDENCE_CHUNKS` | No | `5` | Default top-K when omitted by request; public request allows 1–20. |
 | `MAX_PLANNED_QUERIES` | No | `3` | Maximum planner queries used by retrieval. |
 | `RETRIEVAL_TIMEOUT_SECONDS` | No | `5.0` | Retrieval fan-out wait bound and query embedding timeout; not a Cosmos SDK query timeout. |

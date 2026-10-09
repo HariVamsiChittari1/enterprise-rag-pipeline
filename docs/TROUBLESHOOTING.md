@@ -99,7 +99,7 @@ Verify:
 - The ingestion app has the required Graph and SharePoint application permissions and site grant.
 - The certificate secret is readable by the Function UAMI.
 - SharePoint site groups contain Entra security groups, not only direct users or sharing links.
-- Entra groups return `securityEnabled=true`.
+- Entra groups return `securityEnabled=true` and `groupTypes` does not contain `Unified`.
 
 An ACL-revoked document can be restored only when its current source eTag matches, no active version exists, and it is the authoritative matching historical version.
 

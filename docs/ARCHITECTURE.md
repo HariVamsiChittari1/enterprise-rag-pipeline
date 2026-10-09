@@ -5,6 +5,11 @@ description: System boundaries, flows, data contracts, security, and limitations
 
 For environment-variable ownership, defaults, accepted values, and runtime effects, see [CONFIGURATION.md](CONFIGURATION.md).
 
+The current implementation routes ingestion through the common Cosmos source registry and
+creates per-drive full-sync children. Requirements, decisions, and completion status for
+multi-SharePoint ingestion are in
+[MULTI_SHAREPOINT_SOURCES.md](MULTI_SHAREPOINT_SOURCES.md).
+
 ## System Overview
 
 ```mermaid
@@ -45,7 +50,7 @@ flowchart LR
 | --- | --- | --- |
 | POST | `/api/ingestion/full-sync` | Start durable full-sync orchestrator (fresh instance ID per run, returns 202) |
 | GET | `/api/ingestion/status` | Query orchestration instance status and output |
-| POST | `/api/ingestion/terminate` | Terminate orchestration, force-fail stuck docs, finalize run as TERMINATED |
+| POST | `/api/ingestion/terminate` | Drain document work; finalize as TERMINATED only when registered permits settle, otherwise return 202 |
 | POST | `/api/ingestion/retry-failed` | Retry only the failed documents from the current run |
 | DELETE | `/api/ingestion/purge` | Delete items from a Cosmos container (targeted IDs or purge-all with confirmation) |
 | GET | `/api/ingestion/inspect` | Read up to 200 rows from allowlisted containers with Cosmos `_` system properties removed |
@@ -386,7 +391,7 @@ External app-registration prerequisites are Graph `Files.ReadWrite.All` for sour
 2. Discovery finds all files matching configured extensions (BFS traversal)
 3. ACL verification reads `/permissions` for each file, extracts `grantedToV2`/`grantedToIdentitiesV2` group IDs and `siteGroup` IDs
 4. Site group IDs are resolved to their nested Entra security groups via SharePoint REST API (`/_api/web/sitegroups({id})/users`, filter `PrincipalType=4`)
-5. Each Entra group is verified via `GET /groups/{id}?$select=securityEnabled` — accepted only if `securityEnabled=true`. 404 means the group was deleted from Entra and is **skipped** (fail-safe)
+5. Each Entra group is verified via `GET /groups/{id}?$select=securityEnabled,groupTypes` — accepted only if `securityEnabled=true` and `groupTypes` does not contain `Unified`. Microsoft 365 groups are rejected even when security-enabled. A 404 means the group was deleted from Entra and is **skipped** (fail-safe)
 6. Sharing links → FAILED (rejected). No verified security groups found → FAILED (never retrievable)
 7. Retrieval requires: caller's transitive security groups ∩ document's `allowedGroupIds` ≠ ∅
 8. A candidate is searchable only when its chunk has `isRetrievable=true` and its point-read source manifest still has `status=ready`; retrieval does not rely on the full-sync current-run pointer.
@@ -456,14 +461,14 @@ jobs (build transcript → chunk → embed → write → admit `ready`, then del
 staged blob). Text and Office documents keep the synchronous path. See
 [ADR 0001](adr/0001-audio-batch-transcription.md).
 
-Retrieval filters the supported schema version and locator kinds before ranking. Audio is
-default-disabled; when enabled under the [explicit freshness policy](CONFIGURATION.md#retrieval-behavior-and-limits),
-raw and typed results require a ready manifest with matching source version/hash,
-document identity, generation, authorized groups, and fresh ACL/source verification.
-Malformed or stale candidates are omitted. [Temporal citations](API_REFERENCE.md#response-schema)
-identify the evidence version but do not provide historical playback.
-Shared schema numbering does not make older readers audio-aware: deploy compatible
-readers before audio writers, and hide or retire audio before rolling readers back.
+Retrieval filters the supported schema version and locator kinds before ranking.
+Transcript chunks use the same ACL and source-lifecycle policy as other extracted text.
+Raw and typed transcript results additionally require a ready manifest with matching
+source version/hash, document identity, generation, and valid temporal metadata.
+Malformed or mismatched candidates are omitted. [Temporal citations](API_REFERENCE.md#response-schema)
+identify the evidence version but do not provide historical playback. Shared schema
+numbering does not make older readers audio-aware: deploy compatible readers before
+audio writers; rolling back to an older reader safely omits unsupported time locators.
 
 ### service-audit (partition: /id)
 
@@ -483,10 +488,11 @@ Best-effort audit records for explicitly instrumented service calls and document
 | `query_request` | retrieval/main.py | Per query | citations_count, path, planned_queries, e2e_latency_ms, catalog_version, catalog_etag, catalog_operation_id, scoring_profile, synonym_map, retrieval_degraded |
 | `acl_resynced` | services.py | Per delta ACL event | documentId, result, method, previousGroupIds |
 | `document_retired` | services.py | Per ACL revocation (soft-retire only) | documentId, retiredReason, sourceName, sourceUrl |
-| `document_deleted` | services.py, function_app.py | Per delta deletion or version supersession (full-sync or delta-sync) | documentId, reason (deleted\|superseded), method, replacedDocumentKey |
+| `document_deleted` | services.py, function_app.py | Per delta deletion, version supersession (full-sync or delta-sync) or retired-source deletion | documentId, reason (deleted\|superseded\|source_retired), method, replacedDocumentKey |
 | `document_ingested` | services.py | Per delta add/update | documentId, sourceName, action, chunks |
 | `webhook_received` | function_app.py | Per webhook notification | action (delta_sync_triggered) |
-| `purge` | function_app.py | Per purge request | container, operator, deletedCount, failedCount, purgeAll |
+| `purge` | function_app.py | Per purge request | container, operatorObjectId, operator, deletedCount, failedCount, purgeAll |
+| `source_state_changed` | function_app.py | Per successful source state PATCH | desiredState, catalogEtag, operatorObjectId, operator |
 
 ### retrieval-config (partition: /deploymentInstanceId)
 
@@ -888,7 +894,7 @@ AKS manifests remain under `app/retrieval/kubernetes/`, but `infra/main.bicep` h
 | UC-5 | Token-based source-unit-aware chunking | cl100k_base tokenizer splits content into 800-token chunks with 100-token overlap without crossing incompatible page, section, slide, or worksheet units |
 | UC-6 | Language AI enrichment | Key phrases, named entities, and abstractive summary — each independently toggleable via env vars |
 | UC-7 | OpenAI embedding | text-embedding-3-large at 3072 dimensions, batched (default 100 texts per call) |
-| UC-8 | ACL verification (direct Entra groups) | Read `/permissions` per file, verify each group's `securityEnabled=true` via Graph, reject sharing links |
+| UC-8 | ACL verification (direct Entra groups) | Read `/permissions` per file, accept only security-enabled non-`Unified` groups via Graph, and reject Microsoft 365 groups and sharing links |
 | UC-9 | ACL verification (site groups) | Resolve SharePoint site group members to nested Entra security groups via SP REST API |
 | UC-10 | Periodic ACL resync | Re-verify ready and ACL-revoked documents; update `allowedGroupIds`, retire on revocation, or safely restore access when source-version guards pass |
 | UC-11 | Auto ACL resync on zero-delta | When webhook fires but delta has no content changes, automatically run ACL resync to catch permission-only changes |

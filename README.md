@@ -52,12 +52,21 @@ See the [architecture security model and known limitations](docs/ARCHITECTURE.md
 
 ## Local Development
 
+Use [Azure-backed local development](docs/LOCAL_DEVELOPMENT.md) to run Azure
+Functions locally against approved Azure development data and services.
+Azurite remains local for Functions host and Durable task-hub state.
+
+Quick-start for a local developer:
+
 ```powershell
-python -m venv .venv-py312
-.\.venv-py312\Scripts\Activate.ps1
-python -m pip install -r requirements-dev.txt
-python -m pytest -q
+py -3.12 -m venv C:\DevEnvs\enterprise-rag-pipeline\.venv
+& "C:\DevEnvs\enterprise-rag-pipeline\.venv\Scripts\Activate.ps1"
+python -m pip install -r requirements-dev.txt -r app\retrieval\requirements.txt
+python -m pytest tests\app_runtime -q -p no:cacheprovider
 ```
+
+After the Python environment is ready, continue with the local-development
+guide above.
 
 ## Deployment
 

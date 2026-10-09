@@ -5,6 +5,9 @@ Use this index to locate the owner of each maintained documentation concern.
 | Document | Audience and responsibility |
 | --- | --- |
 | [Architecture](ARCHITECTURE.md) | System boundaries, flows, data model, security model, quality attributes, and known limitations |
+| [Multi-SharePoint sources](MULTI_SHAREPOINT_SOURCES.md) | Requirements, decisions, task plan, and completion status for multi-SharePoint ingestion |
+| [Local multi-SharePoint testing](LOCAL_MULTI_SHAREPOINT_TESTING.md) | Ordered PowerShell, curl, and Postman validation for two local SharePoint sources |
+| [Azure-backed local development](LOCAL_DEVELOPMENT.md) | Beginner setup for local Functions using approved Azure development resources |
 | [ADR 0001 — Audio batch transcription](adr/0001-audio-batch-transcription.md) | Decision record for the deployed asynchronous Azure Speech batch audio path |
 | [API reference](API_REFERENCE.md) | HTTP authentication, routes, request and response contracts, errors, and retrieval catalog properties |
 | [Configuration reference](CONFIGURATION.md) | Deployment inputs and runtime environment variables, ownership, defaults, and accepted values |
