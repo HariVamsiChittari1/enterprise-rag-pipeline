@@ -102,6 +102,8 @@ resource ingestionRunsContainer 'Microsoft.DocumentDB/databaseAccounts/sqlDataba
         indexingMode: 'consistent'
         automatic: true
         includedPaths: [
+          { path: '/sourceId/?' }
+          { path: '/itemId/?' }
           { path: '/runId/?' }
           { path: '/status/?' }
           { path: '/stage/?' }
@@ -132,6 +134,8 @@ resource sourceDocumentsContainer 'Microsoft.DocumentDB/databaseAccounts/sqlData
         indexingMode: 'consistent'
         automatic: true
         includedPaths: [
+          { path: '/sourceId/?' }
+          { path: '/driveId/?' }
           { path: '/recordType/?' }
           { path: '/runId/?' }
           { path: '/status/?' }
@@ -276,6 +280,34 @@ resource retrievalConfigContainer 'Microsoft.DocumentDB/databaseAccounts/sqlData
   }
 }
 
+resource ingestionSourcesContainer 'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers@2026-03-15' = {
+  parent: database
+  name: 'ingestion-sources'
+  properties: {
+    resource: {
+      id: 'ingestion-sources'
+      partitionKey: {
+        paths: ['/sourceId']
+        kind: 'Hash'
+        version: 2
+      }
+      indexingPolicy: {
+        indexingMode: 'consistent'
+        automatic: true
+        includedPaths: [
+          { path: '/recordType/?' }
+          { path: '/sourceKind/?' }
+          { path: '/desiredState/?' }
+        ]
+        excludedPaths: [
+          { path: '/*' }
+        ]
+      }
+    }
+    options: {}
+  }
+}
+
 resource serviceAuditContainer 'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers@2026-03-15' = {
   parent: database
   name: 'service-audit'
@@ -316,6 +348,9 @@ output databaseName string = database.name
 
 @description('Retrieval configuration container name')
 output retrievalConfigContainerName string = retrievalConfigContainer.name
+
+@description('Ingestion source registry container name')
+output ingestionSourcesContainerName string = ingestionSourcesContainer.name
 
 @description('Ingestion runs container name')
 output ingestionRunsContainerName string = ingestionRunsContainer.name

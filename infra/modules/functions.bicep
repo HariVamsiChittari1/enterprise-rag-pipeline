@@ -279,6 +279,10 @@ resource functionApp 'Microsoft.Web/sites@2025-03-01' = {
           value: cosmosContainerNames.ingestionRuns
         }
         {
+          name: 'COSMOS_INGESTION_SOURCES_CONTAINER_NAME'
+          value: cosmosContainerNames.ingestionSources
+        }
+        {
           name: 'COSMOS_SOURCE_DOCUMENTS_CONTAINER_NAME'
           value: cosmosContainerNames.sourceDocuments
         }

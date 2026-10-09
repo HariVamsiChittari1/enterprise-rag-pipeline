@@ -43,9 +43,6 @@ param catalogPollSeconds int = 7200
 @description('Enable ACL filtering at retrieval time')
 param aclEnabled bool = true
 
-@description('Enable audio chunks in the retrieval reader')
-param audioRetrievalEnabled bool = false
-
 @description('Application Insights connection string (empty to disable tracing)')
 param appInsightsConnectionString string = ''
 
@@ -94,6 +91,12 @@ param includeCitations bool = true
 @description('Cosmos container containing the mutable runtime catalog.')
 param retrievalConfigContainer string = 'retrieval-config'
 
+@description('Cosmos container containing registered ingestion sources.')
+param ingestionSourcesContainer string = 'ingestion-sources'
+
+@description('Cosmos container containing ingestion source-serving controls.')
+param ingestionRunsContainer string = 'ingestion-runs'
+
 @description('Wall-clock operation deadline at ACA ingress')
 param operationTimeoutSeconds string = '27.0'
 
@@ -105,6 +108,8 @@ var envVars = [
   { name: 'COSMOS_CHUNKS_CONTAINER', value: cosmosChunksContainer }
   { name: 'COSMOS_MANIFESTS_CONTAINER', value: cosmosManifestsContainer }
   { name: 'COSMOS_AUDIT_CONTAINER', value: cosmosAuditContainer }
+  { name: 'COSMOS_INGESTION_SOURCES_CONTAINER', value: ingestionSourcesContainer }
+  { name: 'COSMOS_INGESTION_RUNS_CONTAINER', value: ingestionRunsContainer }
   { name: 'AZURE_OPENAI_ENDPOINT', value: openAiEndpoint }
   { name: 'EMBEDDING_DEPLOYMENT', value: embeddingDeploymentName }
   { name: 'CHAT_DEPLOYMENT', value: chatDeploymentName }
@@ -116,10 +121,6 @@ var envVars = [
   { name: 'DEPLOYMENT_INSTANCE_ID', value: deploymentInstanceId }
   { name: 'RETRIEVAL_CATALOG_POLL_SECONDS', value: string(catalogPollSeconds) }
   { name: 'ACL_ENABLED', value: string(aclEnabled) }
-  { name: 'AUDIO_RETRIEVAL_ENABLED', value: string(audioRetrievalEnabled) }
-  // Freshness windows required by the reader when audio retrieval is enabled (30 days).
-  { name: 'AUDIO_MAX_ACL_AGE_SECONDS', value: '2592000' }
-  { name: 'AUDIO_MAX_SOURCE_AGE_SECONDS', value: '2592000' }
   { name: 'INCLUDE_CITATIONS', value: string(includeCitations) }
   { name: 'MAX_EVIDENCE_CHUNKS', value: maxEvidenceChunks }
   { name: 'MAX_PLANNED_QUERIES', value: maxPlannedQueries }

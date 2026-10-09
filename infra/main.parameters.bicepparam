@@ -16,7 +16,6 @@ param contentUnderstandingAnalyzerId = readEnvironmentVariable(
 )
 param contentUnderstandingAllowedIpAddress = readEnvironmentVariable('CONTENT_UNDERSTANDING_ALLOWED_IP_ADDRESS', '')
 param audioWriterEnabled = readEnvironmentVariable('AUDIO_WRITER_ENABLED', 'false') == 'true'
-param audioRetrievalEnabled = readEnvironmentVariable('AUDIO_RETRIEVAL_ENABLED', 'false') == 'true'
 param audioLocale = readEnvironmentVariable('AUDIO_LOCALE', 'en-US')
 param speechAllowedIpAddress = readEnvironmentVariable('SPEECH_ALLOWED_IP_ADDRESS', '')
 param sharePointTenantId = readEnvironmentVariable('SHAREPOINT_TENANT_ID')

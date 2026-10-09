@@ -4,6 +4,24 @@ param principalId string
 @description('Cosmos DB account resource ID')
 param cosmosAccountId string
 
+@description('Cosmos DB database name')
+param cosmosDatabaseName string
+
+@description('Ingestion runs container name')
+param ingestionRunsContainerName string
+
+@description('Ingestion source registry container name')
+param ingestionSourcesContainerName string
+
+@description('Source documents container name')
+param sourceDocumentsContainerName string
+
+@description('Search chunks container name')
+param searchChunksContainerName string
+
+@description('Service audit container name')
+param serviceAuditContainerName string
+
 @description('Storage account resource ID')
 param storageAccountId string
 
@@ -61,13 +79,59 @@ var roles = {
   MonitoringMetricsPublisher: '3913510d-42f4-4e42-8a64-420c390055eb'
 }
 
-resource cosmosDataContributor 'Microsoft.DocumentDB/databaseAccounts/sqlRoleAssignments@2024-05-15' = {
+var writableCosmosContainerNames = [
+  ingestionRunsContainerName
+  sourceDocumentsContainerName
+  searchChunksContainerName
+]
+
+resource cosmosDataContributors 'Microsoft.DocumentDB/databaseAccounts/sqlRoleAssignments@2024-05-15' = [
+  for containerName in writableCosmosContainerNames: {
   parent: cosmosAccount
-  name: guid(cosmosAccountId, principalId, 'CosmosDBDataContributor')
+  name: guid(cosmosAccountId, principalId, 'function-data-contributor', containerName)
   properties: {
     roleDefinitionId: '${cosmosAccountId}/sqlRoleDefinitions/${roles.CosmosDBDataContributor}'
     principalId: principalId
-    scope: cosmosAccountId
+    scope: '${cosmosAccountId}/dbs/${cosmosDatabaseName}/colls/${containerName}'
+  }
+}]
+
+resource cosmosSourceRegistryReader 'Microsoft.DocumentDB/databaseAccounts/sqlRoleAssignments@2024-05-15' = {
+  parent: cosmosAccount
+  name: guid(cosmosAccountId, principalId, 'function-source-registry-reader')
+  properties: {
+    roleDefinitionId: '${cosmosAccountId}/sqlRoleDefinitions/00000000-0000-0000-0000-000000000001'
+    principalId: principalId
+    scope: '${cosmosAccountId}/dbs/${cosmosDatabaseName}/colls/${ingestionSourcesContainerName}'
+  }
+}
+
+resource functionAuditWriterRole 'Microsoft.DocumentDB/databaseAccounts/sqlRoleDefinitions@2024-05-15' = {
+  parent: cosmosAccount
+  name: guid(cosmosAccountId, principalId, 'function-audit-create-read-role')
+  properties: {
+    roleName: 'Function audit create and read'
+    type: 'CustomRole'
+    assignableScopes: [cosmosAccountId]
+    permissions: [
+      {
+        dataActions: [
+          'Microsoft.DocumentDB/databaseAccounts/readMetadata'
+          'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/items/create'
+          'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/items/read'
+        ]
+      }
+    ]
+  }
+}
+
+resource functionAuditWriter 'Microsoft.DocumentDB/databaseAccounts/sqlRoleAssignments@2024-05-15' = {
+  parent: cosmosAccount
+  name: guid(cosmosAccountId, principalId, 'function-audit-create-read')
+  properties: {
+    roleDefinitionId: functionAuditWriterRole.id
+    principalId: principalId
+    scope: '${cosmosAccountId}/dbs/${cosmosDatabaseName}/colls/${serviceAuditContainerName}'
   }
 }
 

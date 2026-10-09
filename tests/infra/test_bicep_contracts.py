@@ -55,6 +55,7 @@ def test_cosmos_container_topology_and_partition_keys() -> None:
         "search-chunks",
         "retrieval-config",
         "service-audit",
+        "ingestion-sources",
     }
     assert containers_by_id["ingestion-runs"]["properties"]["resource"][
         "partitionKey"
@@ -68,9 +69,31 @@ def test_cosmos_container_topology_and_partition_keys() -> None:
     assert containers_by_id["retrieval-config"]["properties"]["resource"][
         "partitionKey"
     ]["paths"] == ["/deploymentInstanceId"]
+    assert containers_by_id["ingestion-sources"]["properties"]["resource"][
+        "partitionKey"
+    ]["paths"] == ["/sourceId"]
     assert containers_by_id["service-audit"]["properties"]["resource"][
         "partitionKey"
     ]["paths"] == ["/id"]
+
+
+def test_ingestion_runs_indexes_order_by_paths() -> None:
+    # Real Cosmos rejects ORDER BY on an excluded path; the emulator does not enforce this.
+    template = _compile_bicep("infra/modules/cosmos.bicep")
+    containers = _resources(
+        template,
+        "Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers",
+    )
+    ingestion_runs = next(
+        container for container in containers
+        if container["properties"]["resource"]["id"] == "ingestion-runs"
+    )
+    included = {
+        entry["path"]
+        for entry in ingestion_runs["properties"]["resource"]["indexingPolicy"]["includedPaths"]
+    }
+
+    assert {"/sourceId/?", "/itemId/?", "/startedAt/?"} <= included
 
 
 def test_cosmos_search_policy_and_throughput_ownership() -> None:
@@ -159,6 +182,8 @@ def test_retrieval_catalog_and_gateway_env_contracts() -> None:
         "RETRIEVAL_GATEWAY_CLIENT_ID",
         "RETRIEVAL_GATEWAY_PRINCIPAL_ID",
         "RETRIEVAL_OPERATION_TIMEOUT_SECONDS",
+        "COSMOS_INGESTION_SOURCES_CONTAINER",
+        "COSMOS_INGESTION_RUNS_CONTAINER",
     ):
         assert name in config_source
 
@@ -183,6 +208,13 @@ def test_retrieval_catalog_and_gateway_env_contracts() -> None:
     assert len(reader_roles) == 1
     reader_role = reader_roles[0]
     assert reader_role["copy"]["count"] == "[length(variables('readableContainerNames'))]"
+    assert retrieval_rbac["variables"]["readableContainerNames"] == [
+        "[parameters('searchChunksContainerName')]",
+        "[parameters('sourceDocumentsContainerName')]",
+        "[parameters('ingestionSourcesContainerName')]",
+        "[parameters('ingestionRunsContainerName')]",
+        "[parameters('retrievalConfigContainerName')]",
+    ]
     assert "colls/{2}" in reader_role["properties"]["scope"]
     assert "readableContainerNames" in reader_role["properties"]["scope"]
     assert any(
@@ -226,6 +258,28 @@ def test_catalog_roles_have_no_delete_upsert_or_wildcard_actions():
         "Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/items/create",
         "Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/items/read",
     }
+
+
+def test_function_cosmos_data_roles_are_container_scoped() -> None:
+    template = _compile_bicep("infra/modules/rbac.bicep")
+    assignments = _resources(
+        template,
+        "Microsoft.DocumentDB/databaseAccounts/sqlRoleAssignments",
+    )
+    scopes = [assignment["properties"]["scope"] for assignment in assignments]
+
+    assert len([scope for scope in scopes if "colls/{" in scope]) == 3
+    assert any("function-source-registry-reader" in assignment["name"] for assignment in assignments)
+    assert any("function-audit-create-read" in assignment["name"] for assignment in assignments)
+    assert not any(
+        scope == "[parameters('cosmosAccountId')]"
+        for scope in scopes
+    )
+    assert template["variables"]["writableCosmosContainerNames"] == [
+        "[parameters('ingestionRunsContainerName')]",
+        "[parameters('sourceDocumentsContainerName')]",
+        "[parameters('searchChunksContainerName')]",
+    ]
 
 
 def test_catalog_diagnostics_and_observer_wiring_compile():

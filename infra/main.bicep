@@ -38,9 +38,6 @@ param contentUnderstandingAllowedIpAddress string = ''
 @description('Enable the audio ingestion writer and provision a dedicated Speech resource')
 param audioWriterEnabled bool = false
 
-@description('Enable audio chunks in the retrieval reader')
-param audioRetrievalEnabled bool = false
-
 @description('Audio transcription locale')
 @allowed(['en-US', 'en-GB', 'en-IN'])
 param audioLocale string = 'en-US'
@@ -412,6 +409,7 @@ module functions './modules/functions.bicep' = if (deployServing) {
     cosmosDatabaseName: cosmos.outputs.databaseName
     cosmosContainerNames: {
       ingestionRuns: cosmos.outputs.ingestionRunsContainerName
+      ingestionSources: cosmos.outputs.ingestionSourcesContainerName
       sourceDocuments: cosmos.outputs.sourceDocumentsContainerName
       searchChunks: cosmos.outputs.searchChunksContainerName
     }
@@ -457,6 +455,12 @@ module rbac './modules/rbac.bicep' = {
   params: {
     principalId: identity.outputs.identityPrincipalId
     cosmosAccountId: cosmos.outputs.cosmosAccountId
+    cosmosDatabaseName: cosmos.outputs.databaseName
+    ingestionRunsContainerName: cosmos.outputs.ingestionRunsContainerName
+    ingestionSourcesContainerName: cosmos.outputs.ingestionSourcesContainerName
+    sourceDocumentsContainerName: cosmos.outputs.sourceDocumentsContainerName
+    searchChunksContainerName: cosmos.outputs.searchChunksContainerName
+    serviceAuditContainerName: cosmos.outputs.serviceAuditContainerName
     storageAccountId: storage.outputs.storageAccountId
     documentIntelligenceId: documentIntelligence.outputs.documentIntelligenceId
     contentUnderstandingId: contentUnderstanding.?outputs.?accountId ?? ''
@@ -532,6 +536,8 @@ module acaRetrievalCosmosRbac './modules/retrieval-cosmos-rbac.bicep' = {
     serviceAuditContainerName: cosmos.outputs.serviceAuditContainerName
     searchChunksContainerName: cosmos.outputs.searchChunksContainerName
     sourceDocumentsContainerName: cosmos.outputs.sourceDocumentsContainerName
+    ingestionSourcesContainerName: cosmos.outputs.ingestionSourcesContainerName
+    ingestionRunsContainerName: cosmos.outputs.ingestionRunsContainerName
     retrievalConfigContainerName: cosmos.outputs.retrievalConfigContainerName
   }
 }
@@ -592,10 +598,11 @@ module retrievalConfig './modules/retrieval-config.bicep' = if (deployServing) {
     deploymentInstanceId: deploymentInstanceId
     catalogPollSeconds: retrievalCatalogPollSeconds
     aclEnabled: aclEnabled
-    audioRetrievalEnabled: audioRetrievalEnabled
     includeCitations: includeCitations
     appInsightsConnectionString: monitoring.outputs.connectionString
     retrievalConfigContainer: cosmos.outputs.retrievalConfigContainerName
+    ingestionSourcesContainer: cosmos.outputs.ingestionSourcesContainerName
+    ingestionRunsContainer: cosmos.outputs.ingestionRunsContainerName
   }
 }
 
