@@ -56,6 +56,7 @@ class FakeRequest:
 @pytest.fixture(autouse=True)
 def patch_azure_identity(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(azure.identity, "DefaultAzureCredential", lambda **kwargs: object())
+    monkeypatch.setattr(function_app, "_require_ingestion_operator", lambda _req: None)
 
 
 def test_inspect_data_orders_service_audit_scan_by_recorded_at_desc(monkeypatch: pytest.MonkeyPatch) -> None:

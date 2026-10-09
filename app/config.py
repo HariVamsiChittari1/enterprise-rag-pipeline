@@ -93,6 +93,8 @@ class IngestionConfig:
     vision_max_figures: int
     query_proxy_timeout_seconds: float
     sharepoint_site_url: str
+    cosmos_ingestion_sources_container: str = "ingestion-sources"
+    sharepoint_site_id: str | None = None
     document_intelligence_enabled: bool = True
     content_understanding_enabled: bool = False
     audio_writer_enabled: bool = False
@@ -222,8 +224,8 @@ def load_config() -> IngestionConfig:
         key_phrases_enabled=key_phrases and any_enrichment,
         entities_enabled=entities and any_enrichment,
         allowed_extensions=extensions,
-        source_id=_required("INGESTION_SOURCE_ID"),
-        drive_id=_required("SHAREPOINT_ASSIGNED_DRIVE_ID"),
+        source_id=os.getenv("INGESTION_SOURCE_ID", "").strip(),
+        drive_id=os.getenv("SHAREPOINT_ASSIGNED_DRIVE_ID", "").strip(),
         tenant_id=_required("SHAREPOINT_TENANT_ID"),
         app_client_id=_required("SHAREPOINT_APP_CLIENT_ID"),
         certificate_secret_name=os.getenv("SHAREPOINT_CERTIFICATE_SECRET_NAME", "sharepoint-app-cert"),
@@ -263,7 +265,10 @@ def load_config() -> IngestionConfig:
         vision_max_image_bytes=_int("VISION_MAX_IMAGE_BYTES", 2 * 1024 * 1024),
         vision_max_figures=_int("VISION_MAX_FIGURES", 60),
         query_proxy_timeout_seconds=float(os.getenv("QUERY_PROXY_TIMEOUT_SECONDS", "30.0")),
-        sharepoint_site_url=_required("SHAREPOINT_SITE_URL"),
+        sharepoint_site_url=os.getenv("SHAREPOINT_SITE_URL", "").strip(),
+        cosmos_ingestion_sources_container=os.getenv(
+            "COSMOS_INGESTION_SOURCES_CONTAINER_NAME", "ingestion-sources",
+        ).strip() or "ingestion-sources",
         document_intelligence_enabled=document_intelligence_enabled,
         content_understanding_enabled=content_understanding_enabled,
         audio_writer_enabled=audio_enabled_raw == "true",

@@ -242,12 +242,19 @@ def test_audio_locale_allowlist(monkeypatch: pytest.MonkeyPatch, locale: str) ->
             load_config()
 
 
-def test_load_config_requires_sharepoint_site_url(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_legacy_single_source_settings_are_optional_for_registry_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     _set_required_environment(monkeypatch)
     monkeypatch.delenv("SHAREPOINT_SITE_URL", raising=False)
+    monkeypatch.delenv("SHAREPOINT_ASSIGNED_DRIVE_ID", raising=False)
+    monkeypatch.delenv("INGESTION_SOURCE_ID", raising=False)
 
-    with pytest.raises(EnvironmentError, match="SHAREPOINT_SITE_URL"):
-        load_config()
+    config = load_config()
+
+    assert config.source_id == ""
+    assert config.drive_id == ""
+    assert config.sharepoint_site_url == ""
 
 
 def test_load_config_reads_required_sharepoint_site_url(monkeypatch: pytest.MonkeyPatch) -> None:

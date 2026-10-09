@@ -160,12 +160,14 @@ def _config(**overrides: Any) -> IngestionConfig:
     return IngestionConfig(**values)
 
 
-def _document(name: str) -> SourceDocumentRecord:
-    document_id = create_document_id("source", "drive", "item-1")
+def _document(
+    name: str, source_id: str = "source", drive_id: str = "drive",
+) -> SourceDocumentRecord:
+    document_id = create_document_id(source_id, drive_id, "item-1")
     return SourceDocumentRecord(
-        source_id="source",
+        source_id=source_id,
         run_id="run-1",
-        drive_id="drive",
+        drive_id=drive_id,
         item_id="item-1",
         parent_item_id="parent-1",
         source_name=name,
@@ -185,8 +187,8 @@ def _document(name: str) -> SourceDocumentRecord:
         updated_at=UTC,
         id=document_id,
         document_id=document_id,
-        source_run_id=create_source_run_id("source", "run-1"),
-        document_key=create_document_key("source", "run-1", document_id),
+        source_run_id=create_source_run_id(source_id, "run-1"),
+        document_key=create_document_key(source_id, "run-1", document_id),
     )
 
 
@@ -354,6 +356,7 @@ def _stub_markdown_image_extraction(monkeypatch: Any) -> None:
     monkeypatch.setattr(services, "extract_markdown", fake_extract_markdown)
 
 
+@pytest.mark.parametrize("source_id", ["source-a", "source-b"])
 @pytest.mark.parametrize(
     ("name", "mime_type", "locator_kind", "locator_label"),
     [
@@ -383,12 +386,16 @@ def test_given_office_visual_when_processing_then_merges_rendered_description(
     mime_type: str,
     locator_kind: LocatorKind,
     locator_label: str,
+    source_id: str,
 ) -> None:
     connector = _Connector(
         name,
         mime_type,
         b"PK\x03\x04original-office-content",
     )
+    drive_id = f"drive-{source_id}"
+    acl = VerifiedAcl((f"group-{source_id}",), content_sha256(source_id))
+    connector.document_acls = [acl, acl]
     locator = SourceLocator(locator_kind, locator_label, 1, 1)
     inventory = OfficeVisualInventory(
         content_units=(OfficeContentUnit("office/unit1.xml", locator, False),),
@@ -435,8 +442,9 @@ def test_given_office_visual_when_processing_then_merges_rendered_description(
 
     repository, lifecycle, outcome = _run(
         monkeypatch,
-        _document(name),
+        _document(name, source_id, drive_id),
         connector,
+        config=_config(source_id=source_id, drive_id=drive_id),
     )
 
     assert outcome.status is ActivityStatus.SUCCEEDED
@@ -467,10 +475,22 @@ def test_given_office_visual_when_processing_then_merges_rendered_description(
         tuple(repository.manifest_pages)
     )
     assert len(lifecycle.calls) == 1
+    assert outcome.chunks_written == len(repository.chunks) >= 1
+    assert all(chunk.source_id == source_id for chunk in repository.chunks)
+    assert all(chunk.allowed_group_ids == acl.allowed_group_ids for chunk in repository.chunks)
+    assert repository.admitted_document.source_run_id == create_source_run_id(source_id, "run-1")
+    assert lifecycle.calls[0]["document_key"] == repository.admitted_document.document_key
 
 
-def test_given_markdown_when_processing_then_uses_direct_extraction_and_relative_loader(monkeypatch: Any) -> None:
+@pytest.mark.parametrize("source_id", ["source-a", "source-b"])
+def test_given_markdown_when_processing_then_uses_direct_extraction_and_relative_loader(
+    monkeypatch: Any, source_id: str,
+) -> None:
     connector = _Connector("guide.md", "text/markdown", b"# Guide\n\nDirect Markdown content")
+    drive_id = f"drive-{source_id}"
+    acl = VerifiedAcl((f"group-{source_id}",), content_sha256(source_id))
+    connector.document_acls = [acl, acl]
+    connector.image_acls = [acl, acl]
 
     def fake_extract_markdown(content: bytes, **kwargs: Any) -> CanonicalExtractionResult:
         kwargs["image_loader"]("images/chart.png")
@@ -480,8 +500,9 @@ def test_given_markdown_when_processing_then_uses_direct_extraction_and_relative
 
     repository, _, outcome = _run(
         monkeypatch,
-        _document("guide.md"),
+        _document("guide.md", source_id, drive_id),
         connector,
+        config=_config(source_id=source_id, drive_id=drive_id),
     )
 
     assert outcome.status is ActivityStatus.SUCCEEDED
@@ -490,10 +511,21 @@ def test_given_markdown_when_processing_then_uses_direct_extraction_and_relative
     assert connector.relative_paths == ["images/chart.png"]
     assert connector.image_downloads == 1
     assert repository.chunks[0].is_retrievable is False
+    assert outcome.chunks_written == len(repository.chunks) >= 1
+    assert all(chunk.source_id == source_id for chunk in repository.chunks)
+    assert all(chunk.allowed_group_ids == acl.allowed_group_ids for chunk in repository.chunks)
+    assert repository.admitted_document is not None
+    assert repository.admitted_document.document_id == create_document_id(source_id, drive_id, "item-1")
 
 
-def test_given_pdf_when_processing_then_uses_original_without_conversion(monkeypatch: Any) -> None:
+@pytest.mark.parametrize("source_id", ["source-a", "source-b"])
+def test_given_pdf_when_processing_then_uses_original_without_conversion(
+    monkeypatch: Any, source_id: str,
+) -> None:
     connector = _Connector("report.pdf", "application/pdf", b"%PDF-original")
+    drive_id = f"drive-{source_id}"
+    acl = VerifiedAcl((f"group-{source_id}",), content_sha256(source_id))
+    connector.document_acls = [acl, acl]
     extracted: list[bytes] = []
     monkeypatch.setattr(
         services,
@@ -502,15 +534,22 @@ def test_given_pdf_when_processing_then_uses_original_without_conversion(monkeyp
         or _canonical(Page(1, "Extracted PDF content with enough text for one production chunk.")),
     )
 
-    _, _, outcome = _run(
+    repository, lifecycle, outcome = _run(
         monkeypatch,
-        _document("report.pdf"),
+        _document("report.pdf", source_id, drive_id),
         connector,
+        config=_config(source_id=source_id, drive_id=drive_id),
     )
 
     assert outcome.status is ActivityStatus.SUCCEEDED
     assert connector.conversions == 0
     assert extracted == [b"%PDF-original"]
+    assert outcome.chunks_written == len(repository.chunks) >= 1
+    assert all(chunk.source_id == source_id for chunk in repository.chunks)
+    assert all(chunk.allowed_group_ids == acl.allowed_group_ids for chunk in repository.chunks)
+    assert repository.admitted_document is not None
+    assert repository.admitted_document.document_id == create_document_id(source_id, drive_id, "item-1")
+    assert lifecycle.calls[0]["document_key"] == repository.admitted_document.document_key
 
 
 def test_approved_document_capacity_limits_are_fixed() -> None:

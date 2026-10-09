@@ -368,11 +368,15 @@ def test_activation_preserves_last_completed_run_pointer() -> None:
     repository = IngestionRepository(
         runs, StatefulContainer("sourceRunId"), StatefulContainer("documentKey")
     )
-    repository.activate_run(build_run("run-a", UTC), build_control("run-a", UTC))
+    first = repository.activate_run(build_run("run-a", UTC), build_control("run-a", UTC))
     stored = repository.get_source_control("source")
     assert stored is not None
     runs._store(replace(stored.record, last_completed_run_id="run-a").to_cosmos_item())
     later = "2026-08-05T12:01:00Z"
+    runs._store(replace(
+        first.run.record, status=RunStatus.FAILED, stage=RunStage.TERMINAL,
+        completed_at=later, updated_at=later,
+    ).to_cosmos_item())
 
     activated = repository.activate_run(
         build_run("run-b", later),
@@ -385,8 +389,12 @@ def test_activation_preserves_last_completed_run_pointer() -> None:
 def test_stale_activation_cannot_restore_old_current_run() -> None:
     runs = StatefulContainer("sourceId")
     repository = IngestionRepository(runs, StatefulContainer("sourceRunId"), StatefulContainer("documentKey"))
-    repository.activate_run(build_run("run-a", UTC), build_control("run-a", UTC))
+    first = repository.activate_run(build_run("run-a", UTC), build_control("run-a", UTC))
     later = "2026-08-05T12:01:00Z"
+    runs._store(replace(
+        first.run.record, status=RunStatus.FAILED, stage=RunStage.TERMINAL,
+        completed_at=later, updated_at=later,
+    ).to_cosmos_item())
     repository.activate_run(build_run("run-b", later), build_control("run-b", later))
 
     with pytest.raises(RepositoryConflictError, match="stale"):
@@ -395,6 +403,20 @@ def test_stale_activation_cannot_restore_old_current_run() -> None:
     current = repository.get_source_control("source")
     assert current is not None
     assert current.record.current_run_id == "run-b"
+
+
+def test_activation_refuses_to_replace_an_unsettled_run() -> None:
+    runs = StatefulContainer("sourceId")
+    repository = IngestionRepository(
+        runs, StatefulContainer("sourceRunId"), StatefulContainer("documentKey"),
+    )
+    repository.activate_run(build_run("run-a", UTC), build_control("run-a", UTC))
+
+    with pytest.raises(RepositoryConflictError, match="unresolved active work"):
+        repository.activate_run(
+            build_run("run-b", "2026-08-05T12:01:00Z"),
+            build_control("run-b", "2026-08-05T12:01:00Z"),
+        )
 
 
 def test_discovered_document_identical_retry_succeeds_but_different_content_conflicts() -> None:
@@ -607,6 +629,57 @@ def test_ready_verification_rejects_missing_and_extra_chunks() -> None:
     repository.write_chunks(build_chunks(3, is_retrievable=True))
     with pytest.raises(RepositoryConflictError, match="missing or extra"):
         repository.verify_and_mark_document_ready(ready, admitting.etag)
+
+
+def test_clear_transcription_work_identity_requires_matching_terminal_document() -> None:
+    documents = StatefulContainer("sourceRunId")
+    repository = IngestionRepository(StatefulContainer("sourceId"), documents, StatefulContainer("documentKey"))
+    failed_audio = replace(
+        build_document(item_id="audio-1"),
+        mime_type="audio/wav",
+        size_bytes=1,
+        status=DocumentStatus.FAILED,
+        stage=DocumentStage.TERMINAL,
+        failed_at=UTC,
+        error=SafeError("speech_failed", "transcribing", False),
+        transcription_work_id="work-audio-1",
+        transcription_attempt_id="attempt-audio-1",
+    )
+    processing_audio = replace(
+        build_document(item_id="audio-2"),
+        mime_type="audio/wav",
+        size_bytes=1,
+        status=DocumentStatus.PROCESSING,
+        stage=DocumentStage.TRANSCRIBING,
+        transcription_job_url="https://speech.example/jobs/2",
+        staging_blob_name="audio-2.wav",
+        transcription_work_id="work-audio-2",
+        transcription_attempt_id="attempt-audio-2",
+    )
+    documents.create_item(body=failed_audio.to_cosmos_item())
+    documents.create_item(body=processing_audio.to_cosmos_item())
+
+    with pytest.raises(RepositoryConflictError, match="identity changed"):
+        repository.clear_transcription_work_identity(
+            failed_audio.source_run_id, failed_audio.document_id,
+            "wrong-work", "attempt-audio-1",
+        )
+    assert repository.clear_transcription_work_identity(
+        failed_audio.source_run_id, failed_audio.document_id,
+        "work-audio-1", "attempt-audio-1",
+    ) is True
+    cleared = repository.get_document(failed_audio.source_run_id, failed_audio.document_id)
+    assert cleared is not None
+    assert cleared.record.transcription_work_id is None
+    assert cleared.record.transcription_attempt_id is None
+    assert repository.clear_transcription_work_identity(
+        failed_audio.source_run_id, failed_audio.document_id,
+        "work-audio-1", "attempt-audio-1",
+    ) is True
+    assert repository.clear_transcription_work_identity(
+        processing_audio.source_run_id, processing_audio.document_id,
+        "work-audio-2", "attempt-audio-2",
+    ) is False
 
 
 def test_manifest_write_is_idempotent_and_required_for_admission() -> None:
@@ -1124,8 +1197,12 @@ def test_run_history_is_ordered_by_started_at_descending() -> None:
     repository = IngestionRepository(
         runs, StatefulContainer("sourceRunId"), StatefulContainer("documentKey")
     )
-    repository.activate_run(build_run("run-a", UTC), build_control("run-a", UTC))
+    first = repository.activate_run(build_run("run-a", UTC), build_control("run-a", UTC))
     later = "2026-08-05T12:01:00Z"
+    runs._store(replace(
+        first.run.record, status=RunStatus.FAILED, stage=RunStage.TERMINAL,
+        completed_at=later, updated_at=later,
+    ).to_cosmos_item())
     repository.activate_run(build_run("run-b", later), build_control("run-b", later))
 
     page = repository.list_run_page("source", page_size=2)
@@ -1513,6 +1590,11 @@ def test_bounded_cleanup_never_deletes_the_current_run() -> None:
         "status": "unknown",
     })
     later = "2026-08-05T12:01:00Z"
+    runs._store(replace(
+        repository.get_run("source", "run-a").record,
+        status=RunStatus.FAILED, stage=RunStage.TERMINAL,
+        completed_at=later, updated_at=later,
+    ).to_cosmos_item())
     repository.activate_run(build_run("run-b", later), build_control("run-b", later))
 
     first = repository.cleanup_run_page("source", "run-a", page_size=2)
@@ -1533,6 +1615,10 @@ def test_stale_run_writes_never_change_source_control() -> None:
     repository = IngestionRepository(runs, documents, StatefulContainer("documentKey"))
     old = repository.activate_run(build_run("run-a", UTC), build_control("run-a", UTC))
     later = "2026-08-05T12:01:00Z"
+    runs._store(replace(
+        old.run.record, status=RunStatus.COMPLETED, stage=RunStage.TERMINAL,
+        completed_at=later, updated_at=later,
+    ).to_cosmos_item())
     repository.activate_run(build_run("run-b", later), build_control("run-b", later))
     terminal_old = replace(
         old.run.record,

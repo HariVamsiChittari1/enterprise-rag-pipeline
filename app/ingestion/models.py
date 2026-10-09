@@ -90,6 +90,7 @@ class ActivityStatus(str, Enum):
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     SKIPPED = "skipped"
+    PENDING = "pending"
 
 
 class LocatorKind(str, Enum):
@@ -787,9 +788,12 @@ class SourceDocumentRecord:
     schema_version: int = SCHEMA_VERSION
     audio: AudioMetadata | None = field(default=None, metadata={"omit_none": True})
     source_verified_at: str | None = field(default=None, metadata={"omit_none": True})
+    processing_profile_digest: str | None = field(default=None, metadata={"omit_none": True})
     # Transient batch-transcription tracking, set together while stage == TRANSCRIBING.
     transcription_job_url: str | None = field(default=None, metadata={"omit_none": True})
     staging_blob_name: str | None = field(default=None, metadata={"omit_none": True})
+    transcription_work_id: str | None = field(default=None, metadata={"omit_none": True})
+    transcription_attempt_id: str | None = field(default=None, metadata={"omit_none": True})
 
     def __post_init__(self) -> None:
         expected_document_id = create_document_id(self.source_id, self.drive_id, self.item_id)
@@ -801,6 +805,10 @@ class SourceDocumentRecord:
             raise ValueError("document run keys do not match their deterministic value")
         if self.record_type != SOURCE_DOCUMENT_RECORD_TYPE:
             raise ValueError("invalid source-document record type")
+        if self.processing_profile_digest is not None and re.fullmatch(
+            r"[0-9a-f]{64}", self.processing_profile_digest,
+        ) is None:
+            raise ValueError("processing profile digest is invalid")
         is_audio = self.mime_type in SUPPORTED_AUDIO_MIME_TYPES
         if type(self.schema_version) is not int or self.schema_version != SCHEMA_VERSION:
             raise ValueError("unsupported source-document schema version")
@@ -820,9 +828,13 @@ class SourceDocumentRecord:
                 _require_utc("source_verified_at", self.source_verified_at)
             if (self.transcription_job_url is None) != (self.staging_blob_name is None):
                 raise ValueError("transcription job url and staging blob name must be set together")
+            if (self.transcription_work_id is None) != (self.transcription_attempt_id is None):
+                raise ValueError("transcription work and attempt IDs must be set together")
             for _name, _value in (
                 ("transcription_job_url", self.transcription_job_url),
                 ("staging_blob_name", self.staging_blob_name),
+                ("transcription_work_id", self.transcription_work_id),
+                ("transcription_attempt_id", self.transcription_attempt_id),
             ):
                 if _value is not None and (not isinstance(_value, str) or not _value.strip()):
                     raise ValueError(f"{_name} must be a non-empty string when set")
@@ -831,6 +843,8 @@ class SourceDocumentRecord:
             or self.source_verified_at is not None
             or self.transcription_job_url is not None
             or self.staging_blob_name is not None
+            or self.transcription_work_id is not None
+            or self.transcription_attempt_id is not None
         ):
             raise ValueError("document schema does not accept audio fields")
         _validate_document_fields(self)

@@ -101,6 +101,72 @@ def test_read_drive_delta_deduplicates_repeated_item_ids_keeping_latest_state() 
     assert delta.items[0]["name"] == "renamed.pdf"
 
 
+def test_read_drive_delta_replays_sealed_pages_without_graph_refetch() -> None:
+    first_url = "https://graph.microsoft.com/v1.0/drives/drive-1/root/delta"
+    next_url = "https://graph.microsoft.com/v1.0/drives/drive-1/root/delta?skip=2"
+    final_link = "https://graph.microsoft.com/v1.0/drives/drive-1/root/delta?token=sealed"
+
+    class Capture:
+        def __init__(self) -> None:
+            self.begun: list[tuple[str, int, str | None]] = []
+
+        def begin_page(self, request_url, page_ordinal, predecessor_receipt_id):
+            self.begun.append((request_url, page_ordinal, predecessor_receipt_id))
+            if page_ordinal == 0:
+                return {
+                    "state": "sealed", "receiptId": "receipt-0",
+                    "items": [{"id": "item-1", "name": "one.pdf"}],
+                    "nextLink": next_url, "deltaLink": None,
+                }
+            return {
+                "state": "sealed", "receiptId": "receipt-1",
+                "items": [{"id": "item-2", "name": "two.pdf"}],
+                "nextLink": None, "deltaLink": final_link,
+            }
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        raise AssertionError("sealed Graph pages must replay without a provider refetch")
+
+    capture = Capture()
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        delta = read_drive_delta(client, "drive-1", max_pages=10, page_capture=capture)
+
+    assert [item["id"] for item in delta.items] == ["item-1", "item-2"]
+    assert delta.delta_link == final_link
+    assert capture.begun == [(first_url, 0, None), (next_url, 1, "receipt-0")]
+
+
+def test_read_drive_delta_seals_fresh_pages_with_their_begin_ordinal() -> None:
+    first_url = "https://graph.microsoft.com/v1.0/drives/drive-1/root/delta"
+    next_url = "https://graph.microsoft.com/v1.0/drives/drive-1/root/delta?skip=1"
+    final_link = "https://graph.microsoft.com/v1.0/drives/drive-1/root/delta?token=t"
+
+    class Capture:
+        def __init__(self) -> None:
+            self.begun: list[tuple[str, int]] = []
+            self.sealed: list[tuple[str, int, str | None]] = []
+
+        def begin_page(self, request_url, page_ordinal, predecessor_receipt_id):
+            self.begun.append((request_url, page_ordinal))
+            return {"state": "capturing", "receiptId": f"receipt-{page_ordinal}"}
+
+        def seal_page(self, request_url, page_ordinal, predecessor_receipt_id, *_rest):
+            self.sealed.append((request_url, page_ordinal, predecessor_receipt_id))
+            return f"receipt-{page_ordinal}"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == first_url:
+            return httpx.Response(200, json={"value": [{"id": "a"}], "@odata.nextLink": next_url})
+        return httpx.Response(200, json={"value": [{"id": "b"}], "@odata.deltaLink": final_link})
+
+    capture = Capture()
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        read_drive_delta(client, "drive-1", max_pages=10, page_capture=capture)
+
+    assert capture.begun == [(first_url, 0), (next_url, 1)]
+    assert capture.sealed == [(first_url, 0, None), (next_url, 1, "receipt-0")]
+
+
 def test_read_drive_delta_handles_double_410_reset() -> None:
     """Graph can return 410 on the reset URL itself during server-side transitions."""
     first_reset = "https://graph.microsoft.com/v1.0/drives/drive-1/root/delta?reset=1"

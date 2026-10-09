@@ -284,6 +284,13 @@ class IngestionRepository:
             current.record.activated_at
         ):
             raise RepositoryConflictError("run activation is stale")
+        if current is not None:
+            active_run = self.get_run(
+                run.source_id,
+                current.record.current_run_id,
+            )
+            if active_run is None or active_run.record.status is RunStatus.RUNNING:
+                raise RepositoryConflictError("source already has unresolved active work")
 
         operations: list[tuple[Any, ...]] = [("create", (run.to_cosmos_item(),))]
         if current is None:
@@ -376,7 +383,51 @@ class IngestionRepository:
                 "audio",
                 "transcriptionJobUrl",
                 "stagingBlobName",
+                "transcriptionWorkId",
+                "transcriptionAttemptId",
             },
+        )
+
+    def clear_transcription_work_identity(
+        self,
+        source_run_id: str,
+        document_id: str,
+        work_id: str,
+        attempt_id: str,
+    ) -> bool:
+        """Clear a settled audio permit pointer after verifying terminal document state."""
+        stored = self.get_document(source_run_id, document_id)
+        if stored is None:
+            return False
+        record = stored.record
+        if record.transcription_work_id is None and record.transcription_attempt_id is None:
+            return True
+        if (
+            record.transcription_work_id != work_id
+            or record.transcription_attempt_id != attempt_id
+        ):
+            raise RepositoryConflictError("transcription work identity changed")
+        if (
+            record.status not in {DocumentStatus.READY, DocumentStatus.FAILED}
+            or record.stage is not DocumentStage.TERMINAL
+        ):
+            return False
+        cleared = replace(
+            record,
+            transcription_work_id=None,
+            transcription_attempt_id=None,
+            updated_at=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        )
+        settled = self._replace_document(
+            cleared,
+            stored.etag,
+            expected_status=record.status,
+            allowed_status=record.status,
+            allowed_changes={"transcriptionWorkId", "transcriptionAttemptId", "updatedAt"},
+        )
+        return (
+            settled.record.transcription_work_id is None
+            and settled.record.transcription_attempt_id is None
         )
 
     def mark_document_failed(
@@ -482,6 +533,31 @@ class IngestionRepository:
 
     def get_failed_documents(self, source_id: str, run_id: str) -> list[dict[str, Any]]:
         """Return all failed documents for a given run."""
+        results: list[dict[str, Any]] = []
+        continuation_token: str | None = None
+        while True:
+            page = self.list_failed_documents_page(
+                source_id,
+                run_id,
+                page_size=INTERNAL_PAGE_SIZE,
+                continuation_token=continuation_token,
+            )
+            results.extend(page.items)
+            continuation_token = page.continuation_token
+            if continuation_token is None:
+                return results
+
+    def list_failed_documents_page(
+        self,
+        source_id: str,
+        run_id: str,
+        *,
+        page_size: int,
+        continuation_token: str | None = None,
+    ) -> QueryPage:
+        """Return one bounded failed-document page for retry orchestration."""
+        if isinstance(page_size, bool) or not isinstance(page_size, int) or page_size < 1:
+            raise ValueError("failed document page size must be positive")
         source_run_id = create_source_run_id(source_id, run_id)
         query = (
             "SELECT * FROM c WHERE c.sourceRunId = @sourceRunId "
@@ -491,17 +567,15 @@ class IngestionRepository:
             {"name": "@sourceRunId", "value": source_run_id},
             {"name": "@recordType", "value": SOURCE_DOCUMENT_RECORD_TYPE},
         ]
-        results: list[dict[str, Any]] = []
-        continuation: str | None = None
-        while True:
-            page, continuation = self._query_page(
-                self._source_documents, query, parameters,
-                source_run_id, INTERNAL_PAGE_SIZE, continuation,
-            )
-            results.extend(page)
-            if continuation is None:
-                break
-        return results
+        page, continuation = self._query_page(
+            self._source_documents,
+            query,
+            parameters,
+            source_run_id,
+            page_size,
+            continuation_token,
+        )
+        return QueryPage(tuple(page), continuation)
 
     def reset_failed_to_discovered(self, doc: dict[str, Any]) -> dict[str, Any] | None:
         """Reset a failed document back to discovered so it can be reprocessed."""

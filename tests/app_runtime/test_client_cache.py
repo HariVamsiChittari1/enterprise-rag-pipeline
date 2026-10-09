@@ -178,7 +178,7 @@ def test_build_sharepoint_client_rejects_missing_site_url(monkeypatch: pytest.Mo
     with pytest.raises(EnvironmentError, match="SharePoint site URL"):
         function_app._build_sharepoint_client(config)
 
-    assert "sharepoint_client" not in function_app._client_cache
+    assert not any(key.startswith("sharepoint_client:") for key in function_app._client_cache)
 
 
 def test_build_sharepoint_client_constructs_client_once(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -205,20 +205,35 @@ def test_build_sharepoint_client_constructs_client_once(monkeypatch: pytest.Monk
     monkeypatch.setattr(function_app, "_build_graph_client", lambda config: graph_client)
     monkeypatch.setattr(
         "ingestion.graph.validate_sharepoint_drive_site",
-        lambda client, drive_id, site_url, max_pages: binding_calls.append(
-            (client, drive_id, site_url, max_pages)
+        lambda client, drive_id, site_url, max_pages, **kwargs: binding_calls.append(
+            (client, drive_id, site_url, max_pages, kwargs.get("expected_site_id"))
         ),
     )
     config = _fake_config(sharepoint_site_url="https://tenant.sharepoint.com/sites/site")
 
     first = function_app._build_sharepoint_client(config)
-    second = function_app._build_sharepoint_client(config)
+    second_config = _fake_config(
+        sharepoint_site_url="https://tenant.sharepoint.com/sites/another-site",
+        drive_id="another-drive",
+        sharepoint_site_id="another-site-id",
+    )
+    second = function_app._build_sharepoint_client(second_config)
 
     assert first is second
     assert len(secret_clients) == 1
-    assert binding_calls == [(
-        graph_client,
-        config.drive_id,
-        "https://tenant.sharepoint.com/sites/site",
-        config.acl_max_pages,
-    )]
+    assert binding_calls == [
+        (
+            graph_client,
+            config.drive_id,
+            "https://tenant.sharepoint.com/sites/site",
+            config.acl_max_pages,
+            getattr(config, "sharepoint_site_id", None),
+        ),
+        (
+            graph_client,
+            second_config.drive_id,
+            second_config.sharepoint_site_url,
+            second_config.acl_max_pages,
+            second_config.sharepoint_site_id,
+        ),
+    ]

@@ -639,6 +639,9 @@ def test_identifiers_are_deterministic_and_run_scoped() -> None:
 
     assert first_document_id == second_document_id
     assert len(first_document_id) == 64
+    assert create_document_id("source", "drive-a", "same-item") != create_document_id(
+        "source", "drive-b", "same-item",
+    )
     assert create_document_key("source", "run-a", first_document_id) != create_document_key(
         "source", "run-b", first_document_id
     )

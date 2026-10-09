@@ -7,7 +7,7 @@ Production code is never modified by these tests.
 
 from __future__ import annotations
 
-import logging
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -20,16 +20,49 @@ from ingestion.lifecycle_repository import LifecycleConflictError, ReadyDocument
 class FakeConfig:
     def __init__(self, source_id: str = "source") -> None:
         self.source_id = source_id
+        self.drive_id = "drive"
 
 
 class FakeLifecycleRepo:
-    def __init__(self, ref: ReadyDocumentRef | None = None, raise_error: Exception | None = None) -> None:
+    def __init__(
+        self,
+        ref: ReadyDocumentRef | None = None,
+        raise_error: Exception | None = None,
+        pages: list[tuple[tuple[ReadyDocumentRef, ...], str | None]] | None = None,
+    ) -> None:
         self._ref = ref
         self._raise_error = raise_error
+        self._pages = pages
+        self.list_calls = 0
+        self.page_calls: list[dict[str, Any]] = []
         self.delete_calls: list[dict[str, Any]] = []
 
-    def list_ready_document_versions(self, document_id: str) -> tuple[ReadyDocumentRef, ...]:
+    def list_ready_document_versions(self, source_id: str, document_id: str) -> tuple[ReadyDocumentRef, ...]:
+        self.list_calls += 1
         return (self._ref,) if self._ref is not None else ()
+
+    def list_ready_document_versions_page(
+        self,
+        *,
+        source_id: str,
+        document_id: str,
+        page_size: int,
+        continuation_token: str | None = None,
+    ) -> SimpleNamespace:
+        self.page_calls.append({
+            "source_id": source_id,
+            "document_id": document_id,
+            "page_size": page_size,
+            "continuation_token": continuation_token,
+        })
+        if self._pages is None:
+            return SimpleNamespace(
+                items=(self._ref,) if self._ref is not None else (),
+                continuation_token=None,
+            )
+        page_index = 0 if continuation_token is None else 1
+        items, token = self._pages[page_index]
+        return SimpleNamespace(items=items, continuation_token=token)
 
     def delete_document_and_chunks(
         self, *, source_run_id: str, document_id: str, document_key: str, etag: str
@@ -46,6 +79,7 @@ def _prior_ref(source_run_id: str = "source:run-old") -> ReadyDocumentRef:
     return ReadyDocumentRef(
         document_id="doc-1", source_run_id=source_run_id, document_key=f"{source_run_id}:doc-1",
         item_id="item-1", allowed_group_ids=("group-a",), acl_hash="hash-a", etag="etag-old",
+        source_id="source", drive_id="drive",
     )
 
 
@@ -113,7 +147,7 @@ def test_retire_prior_version_is_a_no_op_when_ref_is_the_current_run(
     assert records == []
 
 
-def test_retire_prior_version_swallows_conflict_error_silently(
+def test_retire_prior_version_propagates_conflict_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     ref = _prior_ref()
@@ -121,23 +155,26 @@ def test_retire_prior_version_swallows_conflict_error_silently(
     _patch_repo(monkeypatch, repo)
     records = _patch_audit(monkeypatch)
 
-    function_app._retire_prior_version(FakeConfig(), "doc-1", "source:run-new", "sentinel-container")
+    with pytest.raises(LifecycleConflictError, match="already changed"):
+        function_app._retire_prior_version(
+            FakeConfig(), "doc-1", "source:run-new", "sentinel-container",
+        )
 
     assert records == []  # delete failed before the audit write line was reached
 
 
-def test_retire_prior_version_swallows_unexpected_errors_and_logs_warning(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+def test_retire_prior_version_propagates_unexpected_errors(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     ref = _prior_ref()
     repo = FakeLifecycleRepo(ref=ref, raise_error=RuntimeError("boom"))
     _patch_repo(monkeypatch, repo)
     _patch_audit(monkeypatch)
-    caplog.set_level(logging.WARNING)
 
-    function_app._retire_prior_version(FakeConfig(), "doc-1", "source:run-new", "sentinel-container")
-
-    assert any("retire_prior_version failed" in record.message for record in caplog.records)
+    with pytest.raises(RuntimeError, match="boom"):
+        function_app._retire_prior_version(
+            FakeConfig(), "doc-1", "source:run-new", "sentinel-container",
+        )
 
 
 def test_retire_prior_version_omits_audit_when_container_is_none(
@@ -152,3 +189,39 @@ def test_retire_prior_version_omits_audit_when_container_is_none(
 
     assert len(repo.delete_calls) == 1
     assert records == []
+
+
+def test_retire_prior_version_rejects_a_different_drive_binding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ref = _prior_ref()
+    ref = ReadyDocumentRef(
+        **{**ref.__dict__, "drive_id": "other-drive"},
+    )
+    repo = FakeLifecycleRepo(ref=ref)
+    _patch_repo(monkeypatch, repo)
+
+    with pytest.raises(RuntimeError, match="superseded_document_identity_mismatch"):
+        function_app._retire_prior_version(FakeConfig(), "doc-1", "source:run-new")
+
+    assert repo.delete_calls == []
+
+
+def test_retire_prior_version_streams_all_pages_without_materializing_versions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = _prior_ref("source:run-old-1")
+    current = _prior_ref("source:run-new")
+    second = _prior_ref("source:run-old-2")
+    repo = FakeLifecycleRepo(pages=[((first,), "page-2"), ((current, second), None)])
+    _patch_repo(monkeypatch, repo)
+    _patch_audit(monkeypatch)
+
+    function_app._retire_prior_version(FakeConfig(), "doc-1", "source:run-new")
+
+    assert repo.list_calls == 0
+    assert [call["source_run_id"] for call in repo.delete_calls] == [
+        "source:run-old-1", "source:run-old-2",
+    ]
+    assert [call["continuation_token"] for call in repo.page_calls] == [None, "page-2"]
+    assert all(call["page_size"] == 50 for call in repo.page_calls)

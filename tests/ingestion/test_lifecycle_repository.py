@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
 from azure.core import MatchConditions
@@ -12,9 +13,9 @@ from ingestion.lifecycle_repository import (
     DocumentLifecycleRepository,
     LifecycleConflictError,
     LifecycleRepositoryError,
-    ReadyDocumentRef,
 )
-from ingestion.models import create_audio_control_partition_id
+from ingestion.models import DocumentStatus, create_audio_control_partition_id
+from ingestion.services import run_source_retirement_page
 
 
 class FakeCosmosError(Exception):
@@ -94,7 +95,7 @@ class FakeContainer:
         self.items[key] = deepcopy(body)
         return deepcopy(body)
 
-    def create_item(self, *, body: dict[str, Any]) -> dict[str, Any]:
+    def create_item(self, body: dict[str, Any]) -> dict[str, Any]:
         key = (body[self.partition_field], body["id"])
         if key in self.items:
             raise FakeCosmosError(409)
@@ -152,7 +153,12 @@ class FakeContainer:
                 and stored.get("status") == "retired"
                 and stored.get("retiredReason") == "acl_revoked"
             )
-            if stored.get("status") not in ("ready", "acl_refreshing") and not is_acl_restoration:
+            allowed_statuses = ("ready", "acl_refreshing")
+            if "OR c.status = 'retired'" in filter_predicate:
+                allowed_statuses += ("retired",)
+            if "OR c.status = 'failed'" in filter_predicate:
+                allowed_statuses += ("failed",)
+            if stored.get("status") not in allowed_statuses and not is_acl_restoration:
                 raise FakeCosmosError(412)
         elif filter_predicate is not None and "status = 'acl_refreshing'" in filter_predicate:
             if stored.get("status") != "acl_refreshing":
@@ -240,11 +246,45 @@ class FakeContainer:
                     continue
             if "@documentId" in parameter_values and stored.get("documentId") != parameter_values["@documentId"]:
                 continue
+            if "@status" in parameter_values and stored.get("status") != parameter_values["@status"]:
+                continue
+            if "@stage" in parameter_values and stored.get("stage") != parameter_values["@stage"]:
+                continue
+            if "@processing" in parameter_values:
+                in_progress = (
+                    stored.get("status") == parameter_values["@processing"]
+                    and stored.get("stage") == parameter_values["@transcribing"]
+                )
+                terminal_permit = (
+                    stored.get("status") in {
+                        parameter_values["@ready"], parameter_values["@failed"],
+                    }
+                    and stored.get("stage") == parameter_values["@terminal"]
+                    and stored.get("transcriptionWorkId") is not None
+                    and stored.get("transcriptionAttemptId") is not None
+                )
+                if not (in_progress or terminal_permit):
+                    continue
+                if (
+                    parameter_values.get("@settlementOnly") is True
+                    and in_progress
+                    and (
+                        stored.get("transcriptionWorkId") is None
+                        or stored.get("transcriptionAttemptId") is None
+                    )
+                ):
+                    continue
+            if "@sourceId" in parameter_values and stored.get("sourceId") != parameter_values["@sourceId"]:
+                continue
             if "@documentKey" in parameter_values and stored.get("documentKey") != parameter_values["@documentKey"]:
                 continue
             if "@recordType" in parameter_values and stored.get("recordType") != parameter_values["@recordType"]:
                 continue
+            if "c.isRetrievable = true" in query and stored.get("isRetrievable") is not True:
+                continue
             rows.append(deepcopy(stored))
+        if "@pageSize" in parameter_values:
+            rows = rows[:parameter_values["@pageSize"]]
         return FakeQueryIterator(rows, None)
 
 
@@ -253,6 +293,8 @@ def _ready_document(document_id: str = "doc-1", **overrides: Any) -> dict[str, A
         "id": document_id,
         "schemaVersion": 1,
         "recordType": "source_document",
+        "sourceId": "source",
+        "driveId": "drive",
         "documentId": document_id,
         "sourceRunId": "source:run-a",
         "documentKey": f"source:run-a:{document_id}",
@@ -268,154 +310,6 @@ def _ready_document(document_id: str = "doc-1", **overrides: Any) -> dict[str, A
     return base
 
 
-@pytest.mark.parametrize("status", ["discovered", "processing", "admitting", "ready"])
-def test_timeout_closure_fails_manifest_before_disabling_chunks(status: str) -> None:
-    document = _ready_document(status=status, lifecycleGeneration=1, stage="embedding")
-    if status == "ready":
-        document["readyAt"] = "2026-08-05T12:00:00Z"
-    documents = FakeContainer(
-        "sourceRunId", {(document["sourceRunId"], document["id"]): document}
-    )
-    chunk = {
-        "id": "chunk-1",
-        "documentKey": document["documentKey"],
-        "lifecycleGeneration": 1,
-        "isRetrievable": status in {"admitting", "ready"},
-    }
-    chunks = FakeContainer(
-        "documentKey", {(chunk["documentKey"], chunk["id"]): chunk}
-    )
-    repository = DocumentLifecycleRepository(FakeContainer("sourceId"), documents, chunks)
-
-    changed = repository.fail_timed_out_document(
-        source_run_id=document["sourceRunId"],
-        document_id=document["id"],
-        error_code="wave_timeout",
-    )
-
-    assert changed is True
-    stored_document = documents.items[(document["sourceRunId"], document["id"])]
-    assert stored_document["status"] == "failed"
-    assert stored_document["stage"] == "terminal"
-    assert stored_document["lifecycleGeneration"] == 2
-    assert stored_document["readyAt"] is None
-    assert stored_document["failedAt"]
-    assert stored_document["error"] == {
-        "code": "wave_timeout",
-        "stage": "orchestration",
-        "retryable": True,
-    }
-    stored_chunk = chunks.items[(chunk["documentKey"], chunk["id"])]
-    assert stored_chunk["lifecycleGeneration"] == 2
-    assert stored_chunk["isRetrievable"] is False
-    assert documents.patch_calls[0]["patch_operations"][0]["path"] == "/status"
-    assert chunks.batch_calls
-
-
-def test_timeout_closure_compensates_when_ready_wins_first_etag_race() -> None:
-    document = _ready_document(status="admitting", lifecycleGeneration=1, _etag="etag-1")
-    documents = FakeContainer(
-        "sourceRunId", {(document["sourceRunId"], document["id"]): document}
-    )
-    chunks = FakeContainer("documentKey")
-    repository = DocumentLifecycleRepository(FakeContainer("sourceId"), documents, chunks)
-
-    def _publish_ready() -> None:
-        stored = documents.items[(document["sourceRunId"], document["id"])]
-        stored["status"] = "ready"
-        stored["readyAt"] = "2026-08-05T12:00:00Z"
-        stored["_etag"] = "etag-2"
-
-    documents.before_patch = _publish_ready
-
-    changed = repository.fail_timed_out_document(
-        source_run_id=document["sourceRunId"],
-        document_id=document["id"],
-        error_code="wave_timeout",
-    )
-
-    assert changed is True
-    stored = documents.items[(document["sourceRunId"], document["id"])]
-    assert stored["status"] == "failed"
-    assert stored["readyAt"] is None
-    assert stored["lifecycleGeneration"] == 2
-    assert len(documents.patch_calls) == 2
-
-
-def test_timeout_generation_rejects_late_activity_chunk_enablement() -> None:
-    document = _ready_document(status="admitting", lifecycleGeneration=1)
-    documents = FakeContainer(
-        "sourceRunId", {(document["sourceRunId"], document["id"]): document}
-    )
-    chunk = {
-        "id": "chunk-1",
-        "documentKey": document["documentKey"],
-        "lifecycleGeneration": 1,
-        "isRetrievable": True,
-    }
-    chunks = FakeContainer(
-        "documentKey", {(chunk["documentKey"], chunk["id"]): chunk}
-    )
-    repository = DocumentLifecycleRepository(FakeContainer("sourceId"), documents, chunks)
-    repository.fail_timed_out_document(
-        source_run_id=document["sourceRunId"],
-        document_id=document["id"],
-        error_code="wave_timeout",
-    )
-
-    with pytest.raises(LifecycleConflictError, match="generation"):
-        repository.set_document_chunks_retrievable(
-            document_key=document["documentKey"],
-            lifecycle_generation=1,
-            is_retrievable=True,
-        )
-
-    stored_chunk = chunks.items[(chunk["documentKey"], chunk["id"])]
-    assert stored_chunk["lifecycleGeneration"] == 2
-    assert stored_chunk["isRetrievable"] is False
-
-
-def test_timeout_closure_resumes_chunk_compensation_after_partial_failure() -> None:
-    document = _ready_document(status="ready", lifecycleGeneration=1)
-    documents = FakeContainer(
-        "sourceRunId", {(document["sourceRunId"], document["id"]): document}
-    )
-    chunk = {
-        "id": "chunk-1",
-        "documentKey": document["documentKey"],
-        "lifecycleGeneration": 1,
-        "isRetrievable": True,
-    }
-    chunks = FakeContainer(
-        "documentKey", {(chunk["documentKey"], chunk["id"]): chunk}
-    )
-    chunks.batch_error = FakeCosmosError(400)
-    repository = DocumentLifecycleRepository(FakeContainer("sourceId"), documents, chunks)
-
-    with pytest.raises(LifecycleRepositoryError, match="batch patch failed"):
-        repository.fail_timed_out_document(
-            source_run_id=document["sourceRunId"],
-            document_id=document["id"],
-            error_code="wave_timeout",
-        )
-
-    stored_document = documents.items[(document["sourceRunId"], document["id"])]
-    assert stored_document["status"] == "failed"
-    assert stored_document["lifecycleGeneration"] == 2
-    assert chunks.items[(chunk["documentKey"], chunk["id"])]["isRetrievable"] is True
-
-    changed = repository.fail_timed_out_document(
-        source_run_id=document["sourceRunId"],
-        document_id=document["id"],
-        error_code="wave_timeout",
-    )
-
-    assert changed is True
-    stored_chunk = chunks.items[(chunk["documentKey"], chunk["id"])]
-    assert stored_chunk["lifecycleGeneration"] == 2
-    assert stored_chunk["isRetrievable"] is False
-
-
 def test_cross_partition_scans_consume_internal_pages_without_continuation() -> None:
     documents = FakeContainer("sourceRunId")
     chunks = FakeContainer("documentKey")
@@ -425,7 +319,7 @@ def test_cross_partition_scans_consume_internal_pages_without_continuation() -> 
         [_ready_document("doc-1")],
         [_ready_document("doc-2", itemId="item-2")],
     ])
-    ready_page = repo.list_ready_documents_page(page_size=50)
+    ready_page = repo.list_ready_documents_page(source_id="source", page_size=50)
     assert tuple(item.document_id for item in ready_page.items) == ("doc-1", "doc-2")
     assert ready_page.continuation_token is None
 
@@ -433,7 +327,7 @@ def test_cross_partition_scans_consume_internal_pages_without_continuation() -> 
         [_ready_document("doc-1", status="acl_refreshing")],
         [_ready_document("doc-2", status="retiring")],
     ])
-    transition_page = repo.list_lifecycle_transitions_page(page_size=50)
+    transition_page = repo.list_lifecycle_transitions_page(source_id="source", page_size=50)
     assert tuple(item.document_id for item in transition_page.items) == ("doc-1", "doc-2")
     assert transition_page.continuation_token is None
 
@@ -441,7 +335,7 @@ def test_cross_partition_scans_consume_internal_pages_without_continuation() -> 
         [{"documentId": "doc-1"}],
         [{"documentId": "doc-2"}],
     ])
-    duplicate_page = repo.list_duplicate_ready_document_ids_page(page_size=50)
+    duplicate_page = repo.list_duplicate_ready_document_ids_page(source_id="source", page_size=50)
     assert duplicate_page.document_ids == ("doc-1", "doc-2")
     assert duplicate_page.continuation_token is None
 
@@ -449,7 +343,7 @@ def test_cross_partition_scans_consume_internal_pages_without_continuation() -> 
         [{"id": "chunk-1", "documentKey": "key-1", "sourceRunId": "run-1", "documentId": "doc-1"}],
         [{"id": "chunk-2", "documentKey": "key-2", "sourceRunId": "run-2", "documentId": "doc-2"}],
     ])
-    manifest_page = repo.list_chunk_manifest_refs_page(page_size=50)
+    manifest_page = repo.list_chunk_manifest_refs_page(source_id="source", page_size=50)
     assert tuple(item.chunk_id for item in manifest_page.items) == ("chunk-1", "chunk-2")
     assert manifest_page.continuation_token is None
 
@@ -476,6 +370,7 @@ def test_duplicate_ready_scan_is_streamable_and_deduplicates_each_page() -> None
     )
 
     page = repo.list_duplicate_ready_document_ids_page(
+        source_id="source",
         page_size=10, continuation_token="current-page"
     )
 
@@ -483,10 +378,12 @@ def test_duplicate_ready_scan_is_streamable_and_deduplicates_each_page() -> None
     assert page.continuation_token == "next-page"
     assert iterator.requested_continuation_token == "current-page"
     assert captured["query"] == (
-        "SELECT c.documentId FROM c WHERE c.recordType = @recordType "
+        "SELECT c.documentId FROM c WHERE c.sourceId = @sourceId "
+        "AND c.recordType = @recordType "
         "AND c.status = 'ready'"
     )
     assert captured["parameters"] == [
+        {"name": "@sourceId", "value": "source"},
         {"name": "@recordType", "value": "source_document"}
     ]
     assert "GROUP BY" not in captured["query"]
@@ -504,7 +401,7 @@ def test_duplicate_ready_scan_rejects_malformed_rows(row: dict[str, Any]) -> Non
     )
 
     with pytest.raises(LifecycleRepositoryError, match="duplicate-ready row"):
-        repo.list_duplicate_ready_document_ids_page(page_size=10)
+        repo.list_duplicate_ready_document_ids_page(source_id="source", page_size=10)
 
 
 def test_retire_document_flips_status_and_requires_ready_precondition() -> None:
@@ -736,7 +633,7 @@ def test_refresh_document_acl_stays_fail_closed_and_is_retryable_after_chunk_fai
     stored = documents.items[("source:run-a", "doc-1")]
     assert stored["status"] == "acl_refreshing"
     assert stored["aclHash"] == "hash-a"
-    assert repo.list_ready_documents_page(page_size=10).items[0].status.value == "acl_refreshing"
+    assert repo.list_ready_documents_page(source_id="source", page_size=10).items[0].status.value == "acl_refreshing"
 
     chunks.execute_item_batch = original_batch  # type: ignore[method-assign]
     repo.refresh_document_acl(
@@ -924,6 +821,175 @@ def test_delete_document_and_chunks_removes_everything() -> None:
     assert ("source:run-a:doc-1", "chunk:000000") not in chunks.items
 
 
+@pytest.mark.parametrize(
+    "status", ["ready", "failed", "processing", "admitting", "acl_refreshing", "retiring", "deleting", "retired"],
+)
+def test_source_retirement_deletes_each_document_state_and_audits(status: str) -> None:
+    document = _ready_document(status=status, retiredReason="acl_revoked")
+    documents = FakeContainer("sourceRunId", {
+        ("source:run-a", "doc-1"): document,
+        ("source:run-a", "visual-page"): {
+            "id": "visual-page", "sourceRunId": "source:run-a",
+            "recordType": "visual_manifest_page", "documentId": "doc-1",
+        },
+    })
+    chunks = FakeContainer("documentKey", {
+        ("source:run-a:doc-1", "chunk-1"): {
+            "id": "chunk-1", "documentKey": "source:run-a:doc-1",
+            "sourceId": "source", "content": "retained text", "embedding": [0.1],
+            "isRetrievable": True, "lifecycleGeneration": 0, "_etag": "chunk-etag",
+        },
+    })
+    repo = DocumentLifecycleRepository(FakeContainer("sourceId"), documents, chunks)
+
+    audit = MagicMock()
+    assert _delete_source_page(repo, audit) == 1
+    assert _delete_source_page(repo, audit) == 0
+    assert ("source:run-a", "doc-1") not in documents.items
+    assert ("source:run-a", "visual-page") not in documents.items
+    assert ("source:run-a:doc-1", "chunk-1") not in chunks.items
+    audit.create_item.assert_called_once()
+    record = audit.create_item.call_args.args[0]
+    assert record["operation"] == "document_deleted"
+    assert record["sourceId"] == "source"
+    assert record["documentId"] == "doc-1"
+    assert record["reason"] == "source_retired"
+    assert record["method"] == "source_retirement"
+    assert "content" not in record
+
+
+def _delete_source_page(repo: DocumentLifecycleRepository, audit: Any = None) -> int:
+    registry = MagicMock()
+    registry.get_document_winner.return_value = None
+    return run_source_retirement_page(
+        repo, audit if audit is not None else MagicMock(),
+        source_id="source", page_size=1, work_registry=registry,
+        owner_instance_id="retirement-owner",
+    )
+
+
+def test_source_retirement_pages_are_bounded_and_source_isolated() -> None:
+    documents = FakeContainer("sourceRunId", {
+        ("source:run-a", "doc-1"): _ready_document("doc-1"),
+        ("source:run-a", "doc-2"): _ready_document("doc-2"),
+        ("other:run", "other"): _ready_document(
+            "other", sourceId="other", sourceRunId="other:run", documentKey="other:run:other",
+        ),
+    })
+    repo = DocumentLifecycleRepository(FakeContainer("sourceId"), documents, FakeContainer("documentKey"))
+    assert _delete_source_page(repo) == 1
+    assert documents.items[("source:run-a", "doc-2")]["status"] == "ready"
+    assert _delete_source_page(repo) == 1
+    assert _delete_source_page(repo) == 0
+    assert documents.items[("other:run", "other")]["status"] == "ready"
+
+
+def test_source_retirement_retries_interrupted_deletion_without_success_audit() -> None:
+    documents = FakeContainer("sourceRunId", {("source:run-a", "doc-1"): _ready_document()})
+    chunks = FakeContainer("documentKey", {
+        ("source:run-a:doc-1", "chunk-1"): {
+            "id": "chunk-1", "documentKey": "source:run-a:doc-1",
+            "isRetrievable": True, "lifecycleGeneration": 0,
+        },
+    })
+    repo = DocumentLifecycleRepository(FakeContainer("sourceId"), documents, chunks)
+    audit = MagicMock()
+    chunks.batch_error = FakeCosmosError(412)
+    with pytest.raises(LifecycleRepositoryError, match="chunk lifecycle batch"):
+        _delete_source_page(repo, audit)
+    assert documents.items[("source:run-a", "doc-1")]["status"] == "deleting"
+    audit.create_item.assert_not_called()
+    assert _delete_source_page(repo, audit) == 1
+    assert ("source:run-a", "doc-1") not in documents.items
+    assert ("source:run-a:doc-1", "chunk-1") not in chunks.items
+    audit.create_item.assert_called_once()
+
+
+def test_source_retirement_deletes_orphans_without_touching_other_sources() -> None:
+    chunks = FakeContainer("documentKey", {
+        ("orphan", "chunk-1"): {
+            "id": "chunk-1", "documentKey": "orphan", "sourceId": "source",
+            "isRetrievable": True, "lifecycleGeneration": 2, "_etag": "etag-1",
+        },
+        ("orphan", "chunk-disabled"): {
+            "id": "chunk-disabled", "documentKey": "orphan", "sourceId": "source",
+            "isRetrievable": False, "lifecycleGeneration": 0, "_etag": "etag-disabled",
+        },
+        ("other", "chunk-2"): {
+            "id": "chunk-2", "documentKey": "other", "sourceId": "other",
+            "isRetrievable": True, "lifecycleGeneration": 0, "_etag": "etag-2",
+        },
+    })
+    repo = DocumentLifecycleRepository(FakeContainer("sourceId"), FakeContainer("sourceRunId"), chunks)
+    assert repo.delete_source_chunks_page(source_id="source", page_size=1) == 1
+    assert ("orphan", "chunk-disabled") in chunks.items
+    assert repo.delete_source_chunks_page(source_id="source", page_size=1) == 1
+    assert repo.delete_source_chunks_page(source_id="source", page_size=1) == 0
+    assert ("orphan", "chunk-1") not in chunks.items
+    assert chunks.items[("other", "chunk-2")]["isRetrievable"] is True
+    assert chunks.delete_calls == [("chunk-1", "orphan"), ("chunk-disabled", "orphan")]
+
+
+def test_source_retirement_retries_partial_physical_delete_with_nonretrievable_tombstone() -> None:
+    documents = FakeContainer("sourceRunId", {("source:run-a", "doc-1"): _ready_document()})
+    chunks = FakeContainer("documentKey", {
+        ("source:run-a:doc-1", "chunk-1"): {
+            "id": "chunk-1", "documentKey": "source:run-a:doc-1",
+            "isRetrievable": True, "lifecycleGeneration": 0,
+        },
+    })
+    repo = DocumentLifecycleRepository(FakeContainer("sourceId"), documents, chunks)
+    audit = MagicMock()
+    original_delete = chunks.delete_item
+    chunks.delete_item = MagicMock(side_effect=FakeCosmosError(503))
+    with pytest.raises(LifecycleRepositoryError, match="Cosmos delete failed"):
+        _delete_source_page(repo, audit)
+    assert documents.items[("source:run-a", "doc-1")]["status"] == "deleting"
+    assert chunks.items[("source:run-a:doc-1", "chunk-1")]["isRetrievable"] is False
+    audit.create_item.assert_not_called()
+    chunks.delete_item = original_delete
+    assert _delete_source_page(repo, audit) == 1
+    assert documents.items == chunks.items == {}
+    audit.create_item.assert_called_once()
+
+
+def test_source_retirement_preserves_delta_best_effort_audit_failure_semantics(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    documents = FakeContainer("sourceRunId", {("source:run-a", "doc-1"): _ready_document()})
+    repo = DocumentLifecycleRepository(FakeContainer("sourceId"), documents, FakeContainer("documentKey"))
+    audit = MagicMock()
+    audit.create_item.side_effect = FakeCosmosError(503)
+    assert _delete_source_page(repo, audit) == 1
+    assert documents.items == {}
+    assert "audit_write_failed" in caplog.text
+
+
+def test_source_retirement_clears_matching_winner_and_retains_prior_audit_rows() -> None:
+    documents = FakeContainer("sourceRunId", {("source:run-a", "doc-1"): _ready_document()})
+    repo = DocumentLifecycleRepository(FakeContainer("sourceId"), documents, FakeContainer("documentKey"))
+    audit = FakeContainer("sourceId", {
+        ("source", "previous-audit"): {"id": "previous-audit", "sourceId": "source"},
+    })
+    registry = MagicMock()
+    registry.get_document_winner.return_value = {
+        "sourceRunId": "source:run-a", "documentKey": "source:run-a:doc-1",
+    }
+    assert run_source_retirement_page(
+        repo, audit, source_id="source", page_size=1,
+        work_registry=registry, owner_instance_id="retire-owner",
+    ) == 1
+    registry.clear_document_winner.assert_called_once_with(
+        "source", "retire-owner", document_id="doc-1",
+        expected_source_run_id="source:run-a",
+        expected_document_key="source:run-a:doc-1",
+    )
+    assert documents.items == {}
+    assert ("source", "previous-audit") in audit.items
+    assert len(audit.items) == 2
+    assert audit.delete_calls == []
+
+
 def test_retire_failure_leaves_manifest_non_ready() -> None:
     documents = FakeContainer("sourceRunId", {("source:run-a", "doc-1"): _ready_document()})
     chunks = FakeContainer(
@@ -970,6 +1036,20 @@ def test_delete_failure_leaves_tombstone_non_ready() -> None:
     stored = documents.items[("source:run-a", "doc-1")]
     assert stored["status"] == "deleting"
     assert stored["lifecycleGeneration"] == 1
+
+
+def test_delete_document_and_chunks_removes_failed_prior_version() -> None:
+    documents = FakeContainer(
+        "sourceRunId", {("source:run-a", "doc-1"): _ready_document(status="failed")}
+    )
+    chunks = FakeContainer("documentKey")
+    repo = DocumentLifecycleRepository(FakeContainer("sourceId"), documents, chunks)
+
+    repo.delete_document_and_chunks(
+        source_run_id="source:run-a", document_id="doc-1", document_key="source:run-a:doc-1", etag="etag-1"
+    )
+
+    assert ("source:run-a", "doc-1") not in documents.items
 
 
 def test_delete_document_and_chunks_is_idempotent_when_already_gone() -> None:
@@ -1030,19 +1110,95 @@ def test_list_ready_documents_page_and_find_by_document_id(record_type: str, sta
     documents.query_items = capture_query  # type: ignore[method-assign]
     repo = DocumentLifecycleRepository(FakeContainer("sourceId"), documents, FakeContainer("documentKey"))
 
-    page = repo.list_ready_documents_page(page_size=10)
+    page = repo.list_ready_documents_page(source_id="source", page_size=10)
     assert {ref.document_id for ref in page.items} == {"doc-1", "doc-2", "doc-4"}
 
-    found = repo.find_ready_document_by_document_id("doc-2")
+    found = repo.find_ready_document_by_document_id("source", "doc-2")
     assert found is not None
     assert found.source_run_id == "source:run-b"
 
-    assert repo.find_ready_document_by_document_id("doc-missing") is None
-    assert repo.find_ready_document_by_document_id("audio-operation:sentinel") is None
+    assert repo.find_ready_document_by_document_id("source", "doc-missing") is None
+    assert repo.find_ready_document_by_document_id("source", "audio-operation:sentinel") is None
     assert len(captured) == 4
     for query in captured:
-        assert "WHERE c.recordType = @recordType" in query["query"]
+        assert "WHERE c.sourceId = @sourceId AND c.recordType = @recordType" in query["query"]
+        assert {"name": "@sourceId", "value": "source"} in query["parameters"]
         assert {"name": "@recordType", "value": "source_document"} in query["parameters"]
+
+def test_list_ready_document_versions_page_forwards_continuation_token() -> None:
+    documents = FakeContainer("sourceRunId")
+    first = _ready_document(document_id="doc-1", sourceRunId="source:run-a")
+    second = _ready_document(
+        document_id="doc-1", sourceRunId="source:run-b",
+        status="failed", stage="terminal", failedAt="2026-08-05T12:00:00Z",
+    )
+    requested_tokens: list[str | None] = []
+
+    class TokenAwareIterator:
+        def by_page(self, continuation_token: str | None = None) -> FakePager:
+            requested_tokens.append(continuation_token)
+            if continuation_token is None:
+                return FakePager([first], "versions-next")
+            assert continuation_token == "versions-next"
+            return FakePager([second], None)
+
+    documents.query_items = lambda **_kwargs: TokenAwareIterator()  # type: ignore[method-assign]
+    repository = DocumentLifecycleRepository(FakeContainer("sourceId"), documents, FakeContainer("sourceId"))
+
+    first_page = repository.list_ready_document_versions_page(
+        source_id="source", document_id="doc-1", page_size=1,
+    )
+    second_page = repository.list_ready_document_versions_page(
+        source_id="source", document_id="doc-1", page_size=1,
+        continuation_token=first_page.continuation_token,
+    )
+
+    assert requested_tokens == [None, "versions-next"]
+    assert first_page.items[0].source_run_id == "source:run-a"
+    assert second_page.items[0].source_run_id == "source:run-b"
+    assert second_page.items[0].status is DocumentStatus.FAILED
+    assert second_page.continuation_token is None
+
+
+def test_list_transcribing_documents_page_includes_terminal_unsettled_audio_work() -> None:
+    documents = FakeContainer("sourceRunId", {
+        ("source:run-a", "processing"): _ready_document(
+            "processing", status="processing", stage="transcribing",
+            transcriptionWorkId="work-processing", transcriptionAttemptId="attempt-processing",
+        ),
+        ("source:run-a", "unowned-processing"): _ready_document(
+            "unowned-processing", status="processing", stage="transcribing",
+        ),
+        ("source:run-a", "ready"): _ready_document(
+            "ready", status="ready", stage="terminal",
+            transcriptionWorkId="work-ready", transcriptionAttemptId="attempt-ready",
+        ),
+        ("source:run-a", "failed"): _ready_document(
+            "failed", status="failed", stage="terminal",
+            transcriptionWorkId="work-failed", transcriptionAttemptId="attempt-failed",
+        ),
+        ("source:run-a", "unowned-ready"): _ready_document(
+            "unowned-ready", status="ready", stage="terminal",
+        ),
+    })
+    repository = DocumentLifecycleRepository(
+        FakeContainer("sourceId"), documents, FakeContainer("documentKey"),
+    )
+
+    page = repository.list_transcribing_documents_page(source_id="source", page_size=10)
+
+    assert {(item.document_id, item.status.value, item.transcription_work_id) for item in page.items} == {
+        ("processing", "processing", "work-processing"),
+        ("unowned-processing", "processing", None),
+        ("ready", "ready", "work-ready"),
+        ("failed", "failed", "work-failed"),
+    }
+    draining_page = repository.list_transcribing_documents_page(
+        source_id="source", page_size=10, settlement_only=True,
+    )
+    assert {item.document_id for item in draining_page.items} == {
+        "processing", "ready", "failed",
+    }
 
 
 def test_acl_revoked_lookup_and_authority_select_latest_matching_version() -> None:
@@ -1071,20 +1227,90 @@ def test_acl_revoked_lookup_and_authority_select_latest_matching_version() -> No
         FakeContainer("sourceId"), documents, FakeContainer("documentKey")
     )
 
-    selected = repo.find_acl_revoked_document_by_document_id("doc-1")
+    selected = repo.find_acl_revoked_document_by_document_id("source", "doc-1")
 
     assert selected is not None
     assert selected.source_run_id == "source:run-b"
     assert repo.is_authoritative_document_version(
+        source_id="source",
         document_id="doc-1",
         source_run_id="source:run-b",
         source_etag="source-etag",
     ) is True
     assert repo.is_authoritative_document_version(
+        source_id="source",
         document_id="doc-1",
         source_run_id="source:run-a",
         source_etag="source-etag",
     ) is False
+
+
+def test_lifecycle_ready_queries_are_isolated_by_source_id() -> None:
+    documents = FakeContainer(
+        "sourceRunId",
+        {
+            ("source-a:run", "doc-a"): _ready_document(
+                "doc-a", sourceId="source-a", sourceRunId="source-a:run",
+                documentKey="source-a:run:doc-a",
+            ),
+            ("source-b:run", "doc-b"): _ready_document(
+                "doc-b", sourceId="source-b", sourceRunId="source-b:run",
+                documentKey="source-b:run:doc-b",
+            ),
+        },
+    )
+    captured: list[dict[str, Any]] = []
+    query_items = documents.query_items
+
+    def capture_query(**kwargs: Any) -> FakeQueryIterator:
+        captured.append(kwargs)
+        return query_items(**kwargs)
+
+    documents.query_items = capture_query  # type: ignore[method-assign]
+    repository = DocumentLifecycleRepository(
+        FakeContainer("sourceId"), documents, FakeContainer("documentKey"),
+    )
+
+    page = repository.list_ready_documents_page(source_id="source-a", page_size=10)
+
+    assert [item.document_id for item in page.items] == ["doc-a"]
+    assert page.items[0].source_id == "source-a"
+    assert page.items[0].drive_id == "drive"
+    assert "c.sourceId = @sourceId" in captured[0]["query"]
+    assert {p["name"]: p["value"] for p in captured[0]["parameters"]}["@sourceId"] == "source-a"
+
+
+def test_pending_audio_lookup_is_scoped_to_source_and_document() -> None:
+    documents = FakeContainer(
+        "sourceRunId",
+        {
+            ("source-a:run", "audio-a"): _ready_document(
+                "audio-a", sourceId="source-a", sourceRunId="source-a:run",
+                status="processing", stage="transcribing", eTag="etag-a",
+            ),
+            ("source-b:run", "audio-b"): _ready_document(
+                "audio-b", sourceId="source-b", sourceRunId="source-b:run",
+                status="processing", stage="transcribing", eTag="etag-b",
+            ),
+        },
+    )
+    captured: list[dict[str, Any]] = []
+    query_items = documents.query_items
+
+    def capture_query(**kwargs: Any) -> FakeQueryIterator:
+        captured.append(kwargs)
+        return query_items(**kwargs)
+
+    documents.query_items = capture_query  # type: ignore[method-assign]
+    repository = DocumentLifecycleRepository(
+        FakeContainer("sourceId"), documents, FakeContainer("documentKey"),
+    )
+
+    found = repository.find_transcribing_document_by_document_id("source-a", "audio-a")
+
+    assert found is not None and found["eTag"] == "etag-a"
+    assert repository.find_transcribing_document_by_document_id("source-a", "audio-b") is None
+    assert "c.sourceId = @sourceId" in captured[0]["query"]
 
 
 def test_active_document_blocks_acl_revoked_version_restoration() -> None:
@@ -1112,6 +1338,7 @@ def test_active_document_blocks_acl_revoked_version_restoration() -> None:
     )
 
     assert repo.is_authoritative_document_version(
+        source_id="source",
         document_id="doc-1",
         source_run_id="source:run-a",
         source_etag="source-etag",
@@ -1126,6 +1353,22 @@ def test_delta_cursor_round_trip() -> None:
 
     repo.save_delta_cursor("source", "https://graph.microsoft.com/v1.0/drives/d/root/delta?token=abc")
     assert repo.get_delta_cursor("source") == "https://graph.microsoft.com/v1.0/drives/d/root/delta?token=abc"
+
+
+def test_clear_webhook_subscription_is_source_partitioned_and_conditional() -> None:
+    subscription = {
+        "id": "webhook-subscription", "sourceId": "source-a",
+        "subscriptionId": "sub-a", "_etag": "etag-sub-a",
+    }
+    runs = FakeContainer("sourceId", {("source-a", "webhook-subscription"): subscription})
+    repository = DocumentLifecycleRepository(
+        runs, FakeContainer("sourceRunId"), FakeContainer("documentKey"),
+    )
+
+    repository.clear_webhook_subscription_id("source-a")
+
+    assert ("source-a", "webhook-subscription") not in runs.items
+    assert runs.delete_calls == [("webhook-subscription", "source-a")]
 
 
 def test_save_delta_cursor_rejects_empty_link() -> None:

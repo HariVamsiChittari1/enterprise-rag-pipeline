@@ -50,7 +50,11 @@ def test_read_verified_acl_delegates_with_bound_drive_id() -> None:
                 },
             )
         if "/groups/" in str(request.url):
-            return httpx.Response(200, json={"id": "22222222-2222-2222-2222-222222222222", "securityEnabled": True})
+            return httpx.Response(200, json={
+                "id": "22222222-2222-2222-2222-222222222222",
+                "securityEnabled": True,
+                "groupTypes": [],
+            })
         raise AssertionError(f"unexpected request: {request.url}")
 
     client, connector = _connector(handler)
@@ -549,7 +553,12 @@ def test_read_verified_acl_delegates_site_group_context() -> None:
             )
         if "/groups/" in str(request.url):
             return httpx.Response(
-                200, json={"id": nested_group_id, "securityEnabled": True}
+                200,
+                json={
+                    "id": nested_group_id,
+                    "securityEnabled": True,
+                    "groupTypes": [],
+                },
             )
         raise AssertionError(f"unexpected Graph request: {request.url}")
 

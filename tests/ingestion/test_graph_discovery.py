@@ -17,6 +17,7 @@ from ingestion.graph import (
     canonical_source_mime,
     discover_next_page,
     read_verified_acl,
+    resolve_site_group_security_groups,
     resolve_source_format,
     validate_sharepoint_drive_site,
 )
@@ -122,6 +123,8 @@ def test_discovery_skips_source_mime_mismatch_and_keeps_valid_items() -> None:
 
     assert [pdf.name for pdf in step.pdfs] == ["report.pdf"]
     assert step.state.pdfs_discovered == 1
+    assert step.rejected_count == 1
+    assert step.state.rejected_files == 1
 
 
 def test_discovery_pages_root_then_nested_folders_and_preserves_next_link() -> None:
@@ -136,6 +139,7 @@ def test_discovery_pages_root_then_nested_folders_and_preserves_next_link() -> N
         if len(requested_urls) == 1:
             assert request.url.params["$select"] == CHILDREN_SELECT
             assert request.url.params["$orderby"] == "name asc"
+            assert request.url.params["$top"] == "50"
             return httpx.Response(
                 200,
                 json={
@@ -147,10 +151,10 @@ def test_discovery_pages_root_then_nested_folders_and_preserves_next_link() -> N
                     "@odata.nextLink": opaque_next,
                 },
             )
-        if len(requested_urls) == 2:
-            return httpx.Response(200, json={"value": [pdf_item("root-2")]})
-        assert request.url.path.endswith("/items/folder/children")
-        return httpx.Response(200, json={"value": [pdf_item("nested")]})
+        if request.url.path.endswith("/items/folder/children"):
+            return httpx.Response(200, json={"value": [pdf_item("nested")]})
+        assert str(request.url) == opaque_next
+        return httpx.Response(200, json={"value": [pdf_item("root-2")]})
 
     state = DiscoveryState.initial()
     discovered = []
@@ -160,11 +164,11 @@ def test_discovery_pages_root_then_nested_folders_and_preserves_next_link() -> N
             state = step.state
             discovered.extend(step.pdfs)
 
-    assert requested_urls[1] == opaque_next
-    assert [item.item_id for item in discovered] == ["root-1", "root-2", "nested"]
+    assert requested_urls[2] == opaque_next
+    assert [item.item_id for item in discovered] == ["root-1", "nested", "root-2"]
     assert [item.discovery_ordinal for item in discovered] == [0, 1, 2]
     assert discovered[0].source_path == "/drives/drive/root:/Docs/root-1.pdf"
-    assert state == DiscoveryState((), 5, 1, 3, 3)
+    assert state == DiscoveryState((), 5, 1, 3, 3, 1)
 
 
 def test_discovery_state_and_step_are_json_serializable() -> None:
@@ -192,6 +196,58 @@ def test_discovery_traverses_package_facets_as_containers() -> None:
         ScaleLimits(),
     )
     assert step.state.pending_folders == (FolderCursor("package", 1),)
+
+
+def test_discovery_state_uses_depth_first_folder_queue() -> None:
+    root_state = DiscoveryState.initial()
+    root_page = ChildrenPage((
+        {"id": "folder-a", "name": "A", "folder": {}},
+        {"id": "folder-b", "name": "B", "folder": {}},
+    ), None)
+    after_root = advance_discovery(root_state, root_page, ScaleLimits()).state
+    after_first_child = advance_discovery(
+        after_root,
+        ChildrenPage(({"id": "nested-a", "name": "Nested", "folder": {}},), None),
+        ScaleLimits(),
+    ).state
+
+    assert after_root.pending_folders == (
+        FolderCursor("folder-a", 1), FolderCursor("folder-b", 1),
+    )
+    assert after_first_child.pending_folders == (
+        FolderCursor("nested-a", 2), FolderCursor("folder-b", 1),
+    )
+
+
+def test_discovery_processes_bounded_child_cursors_before_parent_next_page() -> None:
+    next_link = "https://graph.microsoft.com/v1.0/drives/drive/root/children?$skiptoken=next"
+    folders = tuple(
+        {"id": f"folder-{index}", "name": f"Folder {index}", "folder": {}}
+        for index in range(50)
+    )
+
+    state = advance_discovery(
+        DiscoveryState.initial(),
+        ChildrenPage(folders, next_link),
+        ScaleLimits(max_folders=1_000),
+    ).state
+
+    assert len(state.pending_folders) == 51
+    assert state.pending_folders[:2] == (
+        FolderCursor("folder-0", 1),
+        FolderCursor("folder-1", 1),
+    )
+    assert state.pending_folders[-1] == FolderCursor("root", 0, next_link)
+
+    state = advance_discovery(
+        state,
+        ChildrenPage((), None),
+        ScaleLimits(max_folders=1_000),
+    ).state
+
+    assert len(state.pending_folders) == 50
+    assert state.pending_folders[0] == FolderCursor("folder-1", 1)
+    assert state.pending_folders[-1] == FolderCursor("root", 0, next_link)
 
 
 @pytest.mark.parametrize(
@@ -234,7 +290,10 @@ def test_read_verified_acl_returns_sorted_verified_security_groups() -> None:
         if request.url.path.endswith("/permissions"):
             return httpx.Response(200, json={"value": [{"roles": ["read"], "grantedToIdentitiesV2": [{"group": {"id": "group-b"}}, {"group": {"id": "group-a"}}]}]})
         group_id = request.url.path.rsplit("/", 1)[-1]
-        return httpx.Response(200, json={"id": group_id, "securityEnabled": True})
+        return httpx.Response(
+            200,
+            json={"id": group_id, "securityEnabled": True, "groupTypes": []},
+        )
 
     with httpx.Client(transport=httpx.MockTransport(handler)) as client:
         acl = read_verified_acl(client, "drive", "item", 2)
@@ -242,6 +301,27 @@ def test_read_verified_acl_returns_sorted_verified_security_groups() -> None:
     assert acl.acl_hash == "686e6912b96e03ca356929119443b69a2fafe8815791d169dd09cf7f82fd0835"
     assert requests[0].endswith("/permissions")
     assert all("/content" not in path for path in requests)
+
+
+def test_read_verified_acl_rejects_security_enabled_microsoft_365_group() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/permissions"):
+            return httpx.Response(200, json={"value": [{
+                "roles": ["read"],
+                "grantedToV2": {"group": {"id": "microsoft-365-group"}},
+            }]})
+        return httpx.Response(200, json={
+            "id": "microsoft-365-group",
+            "securityEnabled": True,
+            "groupTypes": ["Unified"],
+        })
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(
+            TerminalDocumentError,
+            match="unsafe_acl:no_verified_security_groups",
+        ):
+            read_verified_acl(client, "drive", "item", 2)
 
 
 @pytest.mark.parametrize("group_id", [" ", "x" * 501, "group\x1finvalid"])
@@ -253,7 +333,10 @@ def test_read_verified_acl_rejects_malformed_verified_ids_safely(group_id: str) 
             return httpx.Response(200, json={"value": [{
                 "roles": ["read"], "grantedToV2": {"group": {"id": group_id}},
             }]})
-        return httpx.Response(200, json={"id": group_id, "securityEnabled": True})
+        return httpx.Response(
+            200,
+            json={"id": group_id, "securityEnabled": True, "groupTypes": []},
+        )
 
     with httpx.Client(transport=httpx.MockTransport(handler)) as client:
         with pytest.raises(TerminalDocumentError, match="^unsafe_acl:invalid_verified_group_ids$"):
@@ -278,7 +361,8 @@ def test_read_verified_acl_combines_direct_and_site_group_security_groups() -> N
             ]})
         group_id = request.url.path.rsplit("/", 1)[-1]
         return httpx.Response(
-            200, json={"id": group_id, "securityEnabled": True}
+            200,
+            json={"id": group_id, "securityEnabled": True, "groupTypes": []},
         )
 
     def sharepoint_handler(request: httpx.Request) -> httpx.Response:
@@ -311,6 +395,102 @@ def test_read_verified_acl_combines_direct_and_site_group_security_groups() -> N
     assert len(acl.acl_hash) == 64
 
 
+SITE_URL = "https://contoso.sharepoint.com/sites/docs"
+NESTED_GROUP_ID = "22222222-2222-4222-8222-222222222222"
+
+
+def _site_group_users_response() -> httpx.Response:
+    return httpx.Response(200, json={"value": [
+        {"PrincipalType": 4, "LoginName": f"c:0t.c|tenant|{NESTED_GROUP_ID}"},
+    ]})
+
+
+@pytest.mark.parametrize("status_code", [429, 503])
+def test_site_group_resolution_retries_throttling_honoring_retry_after(
+    monkeypatch: pytest.MonkeyPatch,
+    status_code: int,
+) -> None:
+    attempts = 0
+    sleep_delays: list[float] = []
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return httpx.Response(status_code, headers={"Retry-After": "2"})
+        return _site_group_users_response()
+
+    monkeypatch.setattr("time.sleep", sleep_delays.append)
+    with httpx.Client(transport=httpx.MockTransport(handler)) as sp_client:
+        groups = resolve_site_group_security_groups(sp_client, SITE_URL, {"3"})
+
+    assert groups == {NESTED_GROUP_ID}
+    assert attempts == 2
+    assert sleep_delays == [2.0]
+
+
+def test_site_group_resolution_raises_after_capped_throttling_attempts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempts = 0
+    sleep_delays: list[float] = []
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        return httpx.Response(503)
+
+    monkeypatch.setattr("time.sleep", sleep_delays.append)
+    with (
+        httpx.Client(transport=httpx.MockTransport(handler)) as sp_client,
+        pytest.raises(httpx.HTTPStatusError),
+    ):
+        resolve_site_group_security_groups(sp_client, SITE_URL, {"3"})
+
+    assert attempts == 3
+    assert sleep_delays == [1.0, 2.0]
+
+
+def test_site_group_resolution_does_not_wait_beyond_retry_after_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sleep_delays: list[float] = []
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, headers={"Retry-After": "120"})
+
+    monkeypatch.setattr("time.sleep", sleep_delays.append)
+    with (
+        httpx.Client(transport=httpx.MockTransport(handler)) as sp_client,
+        pytest.raises(httpx.HTTPStatusError),
+    ):
+        resolve_site_group_security_groups(sp_client, SITE_URL, {"3"})
+
+    assert sleep_delays == []
+
+
+def test_site_group_resolution_does_not_retry_other_server_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempts = 0
+    sleep_delays: list[float] = []
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        return httpx.Response(500)
+
+    monkeypatch.setattr("time.sleep", sleep_delays.append)
+    with (
+        httpx.Client(transport=httpx.MockTransport(handler)) as sp_client,
+        pytest.raises(httpx.HTTPStatusError),
+    ):
+        resolve_site_group_security_groups(sp_client, SITE_URL, {"3"})
+
+    assert attempts == 1
+    assert sleep_delays == []
+
+
 def test_validate_sharepoint_drive_site_requires_drive_in_site_collection() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path.endswith("/drives"):
@@ -326,12 +506,14 @@ def test_validate_sharepoint_drive_site_requires_drive_in_site_collection() -> N
         raise AssertionError(f"unexpected request: {request.url}")
 
     with httpx.Client(transport=httpx.MockTransport(handler)) as client:
-        validate_sharepoint_drive_site(
+        site_id = validate_sharepoint_drive_site(
             client,
             "drive-id",
             "https://tenant.sharepoint.com/sites/site/",
             2,
         )
+
+    assert site_id == "tenant.sharepoint.com,site,web"
 
 
 def test_validate_sharepoint_drive_site_rejects_mismatched_site() -> None:
@@ -354,6 +536,30 @@ def test_validate_sharepoint_drive_site_rejects_mismatched_site() -> None:
                 "drive-id",
                 "https://tenant.sharepoint.com/sites/wrong",
                 2,
+            )
+
+
+def test_validate_sharepoint_drive_site_checks_registered_site_id() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/drives"):
+            return httpx.Response(200, json={"value": [{
+                "id": "drive-id",
+                "driveType": "documentLibrary",
+            }]})
+        if "/sites/" in request.url.path:
+            return httpx.Response(200, json={
+                "id": "tenant.sharepoint.com,actual-site,web",
+            })
+        raise AssertionError(f"unexpected request: {request.url}")
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(ValueError, match="registered site ID"):
+            validate_sharepoint_drive_site(
+                client,
+                "drive-id",
+                "https://tenant.sharepoint.com/sites/site",
+                2,
+                expected_site_id="tenant.sharepoint.com,other-site,web",
             )
 
 
@@ -391,7 +597,11 @@ def test_read_verified_acl_rejects_unverified_groups(security_enabled: bool) -> 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path.endswith("/permissions"):
             return httpx.Response(200, json={"value": [{"roles": ["read"], "grantedToV2": {"group": {"id": "group"}}}]})
-        return httpx.Response(200, json={"id": "group", "securityEnabled": security_enabled})
+        return httpx.Response(200, json={
+            "id": "group",
+            "securityEnabled": security_enabled,
+            "groupTypes": [],
+        })
 
     with httpx.Client(transport=httpx.MockTransport(handler)) as client:
         with pytest.raises(TerminalDocumentError, match="unsafe_acl:no_verified_security_groups"):
