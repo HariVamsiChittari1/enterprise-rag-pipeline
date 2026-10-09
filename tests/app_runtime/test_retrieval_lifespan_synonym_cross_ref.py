@@ -71,10 +71,10 @@ def _catalog() -> RuntimeCatalogSnapshot:
 
 
 def _patch_azure_sdks(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(retrieval_main, "ManagedIdentityCredential", lambda **_: MagicMock())
+    monkeypatch.setattr(retrieval_main, "DefaultAzureCredential", lambda **_: MagicMock())
     monkeypatch.setattr(retrieval_main, "load_cosmos_instance_configs", lambda **_: [])
     monkeypatch.setattr(retrieval_main, "build_cosmos_registry", lambda *_a, **_k: MagicMock())
-    monkeypatch.setattr(retrieval_main, "CosmosClient", lambda **_: MagicMock())
+    monkeypatch.setattr(retrieval_main, "create_cosmos_client", lambda *_a, **_k: MagicMock())
     monkeypatch.setattr(retrieval_main, "AzureOpenAI", lambda **_: MagicMock())
     monkeypatch.setattr(retrieval_main, "_configure_tracing", lambda _cfg, **_kwargs: None)
     monkeypatch.setattr(retrieval_main, "_AGENT_AVAILABLE", False)
@@ -133,10 +133,10 @@ def test_lifespan_catalog_failure_closes_acquired_resources(
     registry = MagicMock()
     cosmos = MagicMock()
     openai_client = MagicMock()
-    monkeypatch.setattr(retrieval_main, "ManagedIdentityCredential", lambda **_: credential)
+    monkeypatch.setattr(retrieval_main, "DefaultAzureCredential", lambda **_: credential)
     monkeypatch.setattr(retrieval_main, "load_cosmos_instance_configs", lambda **_: [])
     monkeypatch.setattr(retrieval_main, "build_cosmos_registry", lambda *_a, **_k: registry)
-    monkeypatch.setattr(retrieval_main, "CosmosClient", lambda **_: cosmos)
+    monkeypatch.setattr(retrieval_main, "create_cosmos_client", lambda *_a, **_k: cosmos)
     monkeypatch.setattr(retrieval_main, "AzureOpenAI", lambda **_: openai_client)
     monkeypatch.setattr(retrieval_main, "_configure_tracing", lambda _cfg, **_kwargs: None)
     monkeypatch.setattr(retrieval_main, "_AGENT_AVAILABLE", False)

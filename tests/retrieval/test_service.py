@@ -20,6 +20,7 @@ from retrieval.cosmos import (
 from retrieval.cosmos_registry import CosmosRegistry
 from retrieval.pipeline import RetrievalDependencyError
 from retrieval.service import ContentFilteredError, RagService, suppress_content_filter_retry
+from retrieval.source_policy import SourceEligibility, SourcePolicySnapshot
 
 
 def RetrievedChunk(
@@ -64,6 +65,135 @@ def completion(content: str) -> SimpleNamespace:
     return SimpleNamespace(
         choices=[SimpleNamespace(message=SimpleNamespace(content=content))]
     )
+
+
+class _SourcePolicy:
+    def __init__(self, validation_results: list[bool] | None = None) -> None:
+        self.snapshot = SourcePolicySnapshot((
+            SourceEligibility("source-a", "catalog-etag"),
+        ))
+        self.validation_results = validation_results or [True]
+        self.validated: list[set[str]] = []
+
+    def capture(self) -> SourcePolicySnapshot:
+        return self.snapshot
+
+    def validate_sources(self, snapshot: SourcePolicySnapshot, source_ids: set[str]) -> bool:
+        self.validated.append(source_ids)
+        configured_result = self.validation_results.pop(0) if self.validation_results else True
+        return configured_result and all(
+            snapshot.get(source_id) == self.snapshot.get(source_id)
+            for source_id in source_ids
+        )
+
+
+class _SourceRetriever:
+    def __init__(self) -> None:
+        self.source_ids: list[str] | None = None
+
+    def retrieve(self, *_args, eligible_source_ids=None, **_kwargs):
+        self.source_ids = eligible_source_ids
+        return [replace(
+            RetrievedChunk(
+                "chunk", "document", "Authorized source evidence", "policy.pdf",
+                "https://example.com/policy.pdf", 1,
+            ),
+            source_id="source-a",
+        )]
+
+    def to_chunks(self, rows):
+        return rows
+
+
+def _source_policy_service(retriever, policy, client=None) -> RagService:
+    return RagService(
+        client or Mock(), _registry(retriever), "embedding", "chat",
+        catalog_provider=_provider(), source_policy_reader=policy,
+    )
+
+
+def test_search_passes_eligible_sources_and_rechecks_before_return() -> None:
+    retriever = _SourceRetriever()
+    policy = _SourcePolicy()
+    service = _source_policy_service(retriever, policy)
+
+    result = service.search(
+        "policy", ["policy"], Principal("user", "tenant", frozenset({"group"})),
+        mode=RetrievalMode.FULL_TEXT,
+    )
+
+    assert [chunk.source_id for chunk in result.chunks] == ["source-a"]
+    assert retriever.source_ids == ["source-a"]
+    assert policy.validated == [{"source-a"}]
+
+
+def test_source_attributed_legacy_reader_fails_closed_without_source_policy() -> None:
+    service = RagService(
+        Mock(), _registry(_SourceRetriever()), "embedding", "chat",
+        catalog_provider=_provider(),
+    )
+
+    with pytest.raises(RetrievalDependencyError, match="source_policy_unavailable"):
+        service.search(
+            "policy", ["policy"], Principal("user", "tenant", frozenset({"group"})),
+            mode=RetrievalMode.FULL_TEXT,
+        )
+
+
+def test_search_withholds_chunks_when_source_policy_changes() -> None:
+    service = _source_policy_service(_SourceRetriever(), _SourcePolicy([False]))
+
+    with pytest.raises(RetrievalDependencyError, match="source_policy_changed"):
+        service.search(
+            "policy", ["policy"], Principal("user", "tenant", frozenset({"group"})),
+            mode=RetrievalMode.FULL_TEXT,
+        )
+
+
+def test_empty_eligible_source_set_does_not_query_content() -> None:
+    retriever = _SourceRetriever()
+    policy = _SourcePolicy()
+    policy.snapshot = SourcePolicySnapshot(())
+    service = _source_policy_service(retriever, policy)
+
+    result = service.search(
+        "policy", ["policy"], Principal("user", "tenant", frozenset({"group"})),
+        mode=RetrievalMode.FULL_TEXT,
+    )
+
+    assert result.chunks == ()
+    assert retriever.source_ids is None
+
+
+def test_answer_is_not_released_if_source_is_withheld_during_generation() -> None:
+    retriever = _SourceRetriever()
+    policy = _SourcePolicy([False])
+    client = Mock()
+    client.chat.completions.create.return_value = completion("Answer [S1].")
+    service = _source_policy_service(retriever, policy, client)
+
+    with pytest.raises(RetrievalDependencyError, match="source_policy_changed"):
+        service.answer_with_queries(
+            "policy", ["policy"], Principal("user", "tenant", frozenset({"group"})),
+            mode=RetrievalMode.FULL_TEXT,
+        )
+
+    client.chat.completions.create.assert_called_once()
+    assert policy.validated == [{"source-a"}]
+
+
+def test_final_check_compares_agent_evidence_to_the_policy_that_admitted_it() -> None:
+    retriever = _SourceRetriever()
+    policy = _SourcePolicy()
+    service = _source_policy_service(retriever, policy)
+    original = policy.snapshot.get("source-a")
+    chunks = retriever.retrieve(eligible_source_ids=["source-a"])
+    policy.snapshot = SourcePolicySnapshot((
+        SourceEligibility("source-a", "new-catalog-etag"),
+    ))
+
+    with pytest.raises(RetrievalDependencyError, match="source_policy_changed"):
+        service.validate_sources_current(chunks, {"source-a": original})
 
 
 @pytest.mark.parametrize(("status", "payload", "expected"), [
@@ -551,7 +681,6 @@ def test_plan_queries_uses_history_as_context() -> None:
     assert "history" in call_content
 
 
-from retrieval.cosmos import MAX_CANDIDATE_POOL_TOTAL
 from retrieval.scoring import (
     FreshnessParameters,
     ScoringFunction,
@@ -600,8 +729,6 @@ def test_service_omitting_scoring_profile_preserves_current_top_k_order() -> Non
 
 
 def test_service_with_scoring_profile_uses_over_fetch_and_reranks_by_freshness() -> None:
-    from datetime import datetime, timezone
-
     client = Mock()
     client.chat.completions.create.side_effect = [
         completion('{"queries":["q"]}'),
@@ -933,8 +1060,6 @@ def test_retrieve_evaluation_pool_requires_explicit_profile_name() -> None:
 
 def test_retrieve_evaluation_pool_fails_closed_when_all_retrievals_fail() -> None:
     """Evaluation must preserve production RetrievalDependencyError semantics."""
-    from datetime import datetime, timezone
-
     client = Mock()
     client.embeddings.create.return_value = SimpleNamespace(
         data=[SimpleNamespace(embedding=[0.0] * 3072)]

@@ -52,6 +52,9 @@ class _PolicyService:
         )
         return RequestPolicy.capture(snapshot, requested, expand_synonyms)
 
+    def capture_source_policy(self):
+        return None
+
 
 def _encoded_service_principal(*, idtyp: str = "app") -> str:
     claims = {
@@ -494,6 +497,7 @@ async def test_given_agent_outcome_when_accepting_then_preserves_existing_behavi
     policy = _PolicyService().capture_policy()
     principal = Principal("agent-outcome", "t", frozenset({"g"}))
     planning_usage = [{"operation": "query_planning"}]
+    final_checks = []
 
     class EvidenceService:
         def search(self, _question, _queries, caller, **kwargs):
@@ -502,6 +506,9 @@ async def test_given_agent_outcome_when_accepting_then_preserves_existing_behavi
             if outcome == "dependency":
                 raise RetrievalDependencyError("retrieval_dependency_unavailable")
             return SearchResult((chunk,), ())
+
+        def validate_sources_current(self, chunks, expected_sources=None):
+            final_checks.append(chunks)
 
     def agent_factory(_client, search_tool, **_kwargs):
         async def run(_question):
@@ -539,6 +546,7 @@ async def test_given_agent_outcome_when_accepting_then_preserves_existing_behavi
             assert [citation["chunk_id"] for citation in result["citations"]] == ["chunk"]
             assert result["policy"] == policy.metadata()
             assert result["usage"][0] == planning_usage[0]
+            assert final_checks == [[chunk]]
         else:
             assert result is None
 
@@ -596,6 +604,12 @@ def test_given_generated_citations_when_querying_then_validates_before_presentat
 
         def search(self, *_args, **_kwargs):
             return SearchResult(evidence, ())
+
+        def validate_sources_current(self, chunks, expected_sources=None):
+            assert chunks == list(evidence)
+
+        def _validate_source_policy(self, snapshot, chunks):
+            assert snapshot is None
 
     def agent_factory(_client, search_tool, **_kwargs):
         async def run(_question):
@@ -723,6 +737,12 @@ def test_given_safety_block_when_querying_then_returns_safe_error_without_contin
             searches.append("search")
             return SearchResult((chunk,), ())
 
+        def validate_sources_current(self, _chunks, _expected_sources=None):
+            return None
+
+        def _validate_source_policy(self, _snapshot, _chunks):
+            return None
+
     async_sdk = AsyncOpenAI(
         api_key="synthetic", base_url="https://sdk-test.invalid/v1", max_retries=2,
         http_client=httpx.AsyncClient(transport=httpx.MockTransport(respond),
@@ -779,8 +799,10 @@ async def test_given_safety_clients_when_lifespan_exits_then_preserves_settings_
     config = SimpleNamespace(
         managed_identity_client_id="synthetic", cosmos_endpoint="https://cosmos.invalid",
         cosmos_database="synthetic", cosmos_chunks_container="chunks", cosmos_manifests_container="manifests",
-        cosmos_audit_container="audit", acl_enabled=True, openai_endpoint="https://sdk-test.invalid",
-        audio_retrieval_enabled=False, audio_max_acl_age_seconds=None, audio_max_source_age_seconds=None,
+        cosmos_audit_container="audit", cosmos_ingestion_sources_container="ingestion-sources",
+        cosmos_ingestion_runs_container="ingestion-runs", acl_enabled=True,
+        tenant_id="synthetic-tenant",
+        openai_endpoint="https://sdk-test.invalid",
         openai_api_version="2024-10-21", agent_api_version="synthetic-api-version", chat_deployment="synthetic",
         catalog_container="catalog", deployment_instance_id="synthetic", catalog_poll_seconds=60,
         embedding_deployment="synthetic-embedding", retrieval_timeout_seconds=2, generation_timeout_seconds=2,
@@ -819,11 +841,11 @@ async def test_given_safety_clients_when_lifespan_exits_then_preserves_settings_
 
     monkeypatch.setattr(retrieval_main, "_state", retrieval_main._AppState())
     monkeypatch.setattr(retrieval_main, "load_retrieval_config", lambda: config)
-    monkeypatch.setattr(retrieval_main, "ManagedIdentityCredential", lambda **_kwargs: credential)
+    monkeypatch.setattr(retrieval_main, "DefaultAzureCredential", lambda **_kwargs: credential)
     monkeypatch.setattr(retrieval_main, "_configure_tracing", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(retrieval_main, "load_cosmos_instance_configs", lambda **_kwargs: [])
     monkeypatch.setattr(retrieval_main, "build_cosmos_registry", lambda *_args, **_kwargs: registry)
-    monkeypatch.setattr(retrieval_main, "CosmosClient", lambda **_kwargs: cosmos)
+    monkeypatch.setattr(retrieval_main, "create_cosmos_client", lambda *_a, **_k: cosmos)
     monkeypatch.setattr(retrieval_main, "RuntimeCatalogLoader", Mock())
     monkeypatch.setattr(retrieval_main, "RuntimeCatalogProvider", lambda *_args, **_kwargs: provider)
     monkeypatch.setattr(retrieval_main, "catalog_event_emitter", Mock())

@@ -4,7 +4,49 @@ from __future__ import annotations
 
 import pytest
 
-from retrieval.cosmos_registry import CosmosRegistry, load_cosmos_instance_configs
+from retrieval import cosmos_registry
+from retrieval.cosmos_registry import (
+    CosmosInstanceConfig,
+    CosmosRegistry,
+    build_cosmos_registry,
+    load_cosmos_instance_configs,
+)
+
+
+def test_build_uses_shared_cosmos_client_with_supplied_credential(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, object]] = []
+
+    class _Client:
+        def get_database_client(self, _name: str):
+            return self
+
+        def get_container_client(self, name: str) -> str:
+            return name
+
+    def _factory(endpoint: str, *, credential: object) -> _Client:
+        calls.append((endpoint, credential))
+        return _Client()
+
+    monkeypatch.setattr(cosmos_registry, "create_cosmos_client", _factory)
+    credential = object()
+
+    registry = build_cosmos_registry(
+        (
+            CosmosInstanceConfig(
+                "source-a",
+                "https://cosmos.example/",
+                "db",
+                "chunks",
+                "manifests",
+            ),
+        ),
+        credential,
+    )
+
+    assert calls == [("https://cosmos.example/", credential)]
+    assert [source_id for source_id, _ in registry.items()] == ["source-a"]
 
 
 def test_defaults_to_single_instance_from_current_settings_when_registry_json_unset(monkeypatch: pytest.MonkeyPatch) -> None:

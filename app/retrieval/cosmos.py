@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from enum import StrEnum
 from typing import Any, Iterable, Mapping
 
@@ -47,10 +46,11 @@ class RetrievedChunk:
     start_ms: int | None = None
     end_ms: int | None = None
     evidence_version: str | None = None
+    source_id: str | None = None
 
 
 _PROJECTION = (
-    "c.id, c.schemaVersion, c.documentId, c.sourceRunId, c.content, "
+    "c.id, c.schemaVersion, c.sourceId, c.documentId, c.sourceRunId, c.content, "
     "c.sourceName, c.sourceUrl, c.locatorKind, c.locatorLabel, "
     "c.locatorOrdinalStart, c.locatorOrdinalEnd, c.sourceModifiedAt, "
     "c.sectionPath, c.keyPhrases, c.createdAt, c.lifecycleGeneration, "
@@ -61,6 +61,7 @@ _ACL_FILTER = (
     "WHERE ARRAY_CONTAINS(@principalIds, gid))"
 )
 _RETRIEVABLE_FILTER = "c.isRetrievable = true"
+_SOURCE_FILTER = "ARRAY_CONTAINS(@eligibleSourceIds, c.sourceId)"
 _DOCUMENT_FILTER = (
     "(c.schemaVersion = 1 AND "
     "c.locatorKind IN ('page', 'section', 'slide', 'worksheet'))"
@@ -146,23 +147,12 @@ def _build_full_text_multi_term_clause(term_count: int) -> str:
 class SecureCosmosRetriever:
     def __init__(
         self, chunks: Any, manifests: Any, *, acl_enabled: bool = True,
-        audio_retrieval_enabled: bool = False,
-        audio_max_acl_age_seconds: int | None = None,
-        audio_max_source_age_seconds: int | None = None,
+        require_source_eligibility: bool = False,
     ) -> None:
-        if audio_retrieval_enabled and (
-            not acl_enabled
-            or any(type(value) is not int or value <= 0 for value in (
-                audio_max_acl_age_seconds, audio_max_source_age_seconds,
-            ))
-        ):
-            raise ValueError("audio_requires_acl_and_freshness_limits")
         self._chunks = chunks
         self._manifests = manifests
         self._acl_enabled = acl_enabled
-        self._audio_enabled = audio_retrieval_enabled
-        self._audio_max_acl_age_seconds = audio_max_acl_age_seconds
-        self._audio_max_source_age_seconds = audio_max_source_age_seconds
+        self._require_source_eligibility = require_source_eligibility
 
     def retrieve(
         self,
@@ -177,6 +167,7 @@ class SecureCosmosRetriever:
         full_text_score_scope: str | None = None,
         raw: bool = False,
         search_terms: list[str] | None = None,
+        eligible_source_ids: list[str] | tuple[str, ...] | None = None,
     ) -> list[RetrievedChunk] | list[dict[str, Any]]:
         if not query_text.strip():
             raise ValueError("query_text_required")
@@ -192,6 +183,16 @@ class SecureCosmosRetriever:
             raise ValueError("full_text_score_scope_invalid")
         if rrf_weights is not None and mode is not RetrievalMode.HYBRID:
             raise ValueError("rrf_weights_only_valid_for_hybrid")
+        if self._require_source_eligibility and eligible_source_ids is None:
+            raise ValueError("source_eligibility_required")
+        if eligible_source_ids is not None and (
+            not isinstance(eligible_source_ids, (list, tuple))
+            or any(not isinstance(source_id, str) or not source_id for source_id in eligible_source_ids)
+        ):
+            raise ValueError("eligible_source_ids_invalid")
+        normalized_source_ids = sorted(set(eligible_source_ids or ()))
+        if eligible_source_ids is not None and not normalized_source_ids:
+            return []
         effective_terms = _normalize_search_terms(search_terms, query_text)
 
         effective_top = min(top_k * over_fetch_factor, MAX_CANDIDATE_POOL_TOTAL)
@@ -199,11 +200,10 @@ class SecureCosmosRetriever:
         parameters: list[dict[str, Any]] = [
             {"name": "@topK", "value": effective_top},
         ]
-        media_filter = (
-            f"({_DOCUMENT_FILTER} OR {_AUDIO_FILTER})"
-            if self._audio_enabled else _DOCUMENT_FILTER
-        )
-        filters = [_RETRIEVABLE_FILTER, media_filter]
+        filters = [_RETRIEVABLE_FILTER, f"({_DOCUMENT_FILTER} OR {_AUDIO_FILTER})"]
+        if eligible_source_ids is not None:
+            filters.append(_SOURCE_FILTER)
+            parameters.append({"name": "@eligibleSourceIds", "value": normalized_source_ids})
         if self._acl_enabled:
             filters.append(_ACL_FILTER)
             parameters.append(
@@ -254,7 +254,14 @@ class SecureCosmosRetriever:
         candidates = self._chunks.query_items(**query_kwargs)
         materialized: list[dict[str, Any]] = []
         for candidate in candidates:
-            manifest = self._active_manifest(candidate, principal_ids)
+            if (
+                eligible_source_ids is not None
+                and candidate.get("sourceId") not in normalized_source_ids
+            ):
+                continue
+            manifest = self._active_manifest(
+                candidate, require_source_id=eligible_source_ids is not None,
+            )
             if manifest is None:
                 continue
             manifest_source_name = manifest.get("sourceName")
@@ -274,7 +281,10 @@ class SecureCosmosRetriever:
         return [_to_chunk(candidate) for candidate in candidates]
 
     def _active_manifest(
-        self, candidate: dict[str, Any], principal_ids: list[str],
+        self,
+        candidate: dict[str, Any],
+        *,
+        require_source_id: bool = False,
     ) -> dict[str, Any] | None:
         document_id = candidate.get("documentId")
         source_run_id = candidate.get("sourceRunId")
@@ -297,15 +307,18 @@ class SecureCosmosRetriever:
             or manifest.get("status") != "ready"
         ):
             return None
+        if require_source_id and (
+            not isinstance(candidate.get("sourceId"), str)
+            or not candidate["sourceId"]
+            or manifest.get("sourceId") != candidate["sourceId"]
+        ):
+            return None
         if candidate.get("locatorKind") != RetrievalLocatorKind.TIME:
             if manifest.get("audio") is not None or manifest.get("mimeType") in _AUDIO_MIME_TYPES:
                 return None
             return manifest
-        if not self._audio_enabled:
-            return None
         audio = candidate.get("audio")
         generation = candidate.get("lifecycleGeneration")
-        manifest_groups = manifest.get("allowedGroupIds")
         if (
             not isinstance(audio, dict)
             or manifest.get("mimeType") not in _AUDIO_MIME_TYPES
@@ -320,29 +333,9 @@ class SecureCosmosRetriever:
             or type(generation) is not int or generation < 0
             or type(manifest.get("lifecycleGeneration")) is not int
             or manifest.get("lifecycleGeneration") != generation
-            or not isinstance(manifest_groups, list)
-            or not all(isinstance(group, str) for group in manifest_groups)
-            or not set(principal_ids).intersection(manifest_groups)
         ):
             return None
-        now = datetime.now(timezone.utc)
-        if not _is_fresh(manifest.get("aclEvaluatedAt"), self._audio_max_acl_age_seconds, now):
-            return None
-        if not _is_fresh(manifest.get("sourceVerifiedAt"), self._audio_max_source_age_seconds, now):
-            return None
         return manifest
-
-
-def _is_fresh(value: Any, maximum_age: int | None, now: datetime) -> bool:
-    if not isinstance(value, str) or maximum_age is None:
-        return False
-    try:
-        verified = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        return False
-    if verified.tzinfo is None or verified.utcoffset() != timezone.utc.utcoffset(verified):
-        return False
-    return 0 <= (now - verified).total_seconds() <= maximum_age
 
 
 def _to_chunk(candidate: Mapping[str, Any]) -> RetrievedChunk:
@@ -407,6 +400,7 @@ def _to_chunk(candidate: Mapping[str, Any]) -> RetrievedChunk:
         source_modified_at = None
     return RetrievedChunk(
         locator_kind=locator_kind,
+        source_id=candidate.get("sourceId") if isinstance(candidate.get("sourceId"), str) else None,
         source_modified_at=source_modified_at,
         **temporal,
         **values,

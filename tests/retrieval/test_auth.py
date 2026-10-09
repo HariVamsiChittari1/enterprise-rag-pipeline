@@ -4,11 +4,13 @@ import base64
 import json
 from unittest.mock import Mock
 
+import httpx
 import pytest
 
 from retrieval.auth import (
     AuthorizationError,
     GatewayContext,
+    GraphGroupResolver,
     gateway_context_from_easy_auth_user,
     parse_gateway_context,
     principal_from_gateway,
@@ -22,6 +24,51 @@ GATEWAY_CLIENT_ID = "33333333-3333-3333-3333-333333333333"
 GATEWAY_PRINCIPAL_ID = "44444444-4444-4444-4444-444444444444"
 FUNCTION_AUDIENCE = "api://function-api"
 RETRIEVAL_AUDIENCE = "33333333-3333-4333-8333-333333333333"
+
+
+def test_graph_group_resolver_excludes_microsoft_365_groups() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.params["$select"] == "id,securityEnabled,groupTypes"
+        return httpx.Response(200, json={"value": [
+            {
+                "id": "static-security-group",
+                "securityEnabled": True,
+                "groupTypes": [],
+            },
+            {
+                "id": "dynamic-security-group",
+                "securityEnabled": True,
+                "groupTypes": ["DynamicMembership"],
+            },
+            {
+                "id": "microsoft-365-group",
+                "securityEnabled": True,
+                "groupTypes": ["Unified"],
+            },
+        ]})
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        groups = GraphGroupResolver(client).resolve_transitive_security_groups(USER_ID)
+
+    assert groups == {"static-security-group", "dynamic-security-group"}
+
+
+@pytest.mark.parametrize("group_types", [None, "Unified", [None]])
+def test_graph_group_resolver_rejects_invalid_group_types(
+    group_types: object,
+) -> None:
+    transport = httpx.MockTransport(lambda _request: httpx.Response(
+        200,
+        json={"value": [{
+            "id": "group",
+            "securityEnabled": True,
+            "groupTypes": group_types,
+        }]},
+    ))
+
+    with httpx.Client(transport=transport) as client:
+        with pytest.raises(AuthorizationError, match="invalid_group_response"):
+            GraphGroupResolver(client).resolve_transitive_security_groups(USER_ID)
 
 
 def encode(claims: list[dict[str, str]]) -> str:

@@ -12,9 +12,7 @@ import os
 from dataclasses import dataclass
 from typing import Any
 
-from azure.cosmos import CosmosClient
-from azure.identity import ManagedIdentityCredential
-
+from cosmos_connection import create_cosmos_client
 from retrieval.cosmos import SecureCosmosRetriever
 
 
@@ -101,26 +99,21 @@ def load_cosmos_instance_configs(
 
 def build_cosmos_registry(
     instance_configs: tuple[CosmosInstanceConfig, ...],
-    credential: ManagedIdentityCredential,
+    credential: Any,
     *,
     acl_enabled: bool = True,
-    audio_retrieval_enabled: bool = False,
-    audio_max_acl_age_seconds: int | None = None,
-    audio_max_source_age_seconds: int | None = None,
 ) -> CosmosRegistry:
     retrievers: dict[str, SecureCosmosRetriever] = {}
-    clients: list[CosmosClient] = []
+    clients: list[Any] = []
     for instance in instance_configs:
-        cosmos = CosmosClient(url=instance.endpoint, credential=credential)
+        cosmos = create_cosmos_client(instance.endpoint, credential=credential)
         clients.append(cosmos)
         db = cosmos.get_database_client(instance.database)
         retrievers[instance.source_id] = SecureCosmosRetriever(
             db.get_container_client(instance.chunks_container),
             db.get_container_client(instance.manifests_container),
             acl_enabled=acl_enabled,
-            audio_retrieval_enabled=audio_retrieval_enabled,
-            audio_max_acl_age_seconds=audio_max_acl_age_seconds,
-            audio_max_source_age_seconds=audio_max_source_age_seconds,
+            require_source_eligibility=True,
         )
     return CosmosRegistry(retrievers, clients=tuple(clients))
 

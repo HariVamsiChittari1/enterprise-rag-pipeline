@@ -50,7 +50,7 @@ class GraphGroupResolver:
         url: str | None = (
             "https://graph.microsoft.com/v1.0/users/"
             f"{quote(user_id, safe='')}/transitiveMemberOf/microsoft.graph.group"
-            "?$select=id,securityEnabled"
+            "?$select=id,securityEnabled,groupTypes"
         )
         group_ids: set[str] = set()
         pages = 0
@@ -69,9 +69,17 @@ class GraphGroupResolver:
             for item in values:
                 group_id = item.get("id")
                 security_enabled = item.get("securityEnabled")
-                if not isinstance(group_id, str) or not isinstance(security_enabled, bool):
+                group_types = item.get("groupTypes")
+                if (
+                    not isinstance(group_id, str)
+                    or not isinstance(security_enabled, bool)
+                    or not isinstance(group_types, list)
+                    or not all(
+                        isinstance(group_type, str) for group_type in group_types
+                    )
+                ):
                     raise AuthorizationError("invalid_group_response")
-                if security_enabled:
+                if security_enabled and "Unified" not in group_types:
                     group_ids.add(group_id)
             next_link = payload.get("@odata.nextLink")
             if next_link is not None and not isinstance(next_link, str):
@@ -236,6 +244,14 @@ def require_easy_auth_role(
         raise AuthorizationError("unexpected_tenant")
     if required_role not in claims.get("roles", []):
         raise AuthorizationError("required_role_missing")
+
+
+def easy_auth_object_id(encoded_principal: str | None) -> str | None:
+    """Return the caller's immutable Entra ``oid`` for auditing, or ``None`` if absent or invalid."""
+    try:
+        return _canonical_guid(_single_claim(_claims_by_type(encoded_principal), "oid"), "oid")
+    except AuthorizationError:
+        return None
 
 
 def _claims_by_type(encoded_principal: str | None) -> dict[str, list[str]]:

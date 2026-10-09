@@ -16,14 +16,14 @@ from typing import Any, Mapping
 
 import httpx
 import structlog
-from azure.cosmos import CosmosClient
-from azure.identity import ManagedIdentityCredential
+from azure.identity import DefaultAzureCredential
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from openai import AzureOpenAI, DefaultAsyncHttpxClient, DefaultHttpxClient
 from pydantic import BaseModel, Field
 
+from cosmos_connection import create_cosmos_client
 from retrieval.auth import (
     AuthorizationError,
     GATEWAY_CONTEXT_HEADER,
@@ -48,6 +48,7 @@ from retrieval.service import (
     accept_answer, suppress_content_filter_retry, suppress_content_filter_retry_async,
 )
 from retrieval.runtime_catalog import RuntimeCatalogProvider
+from retrieval.source_policy import SourcePolicyReader
 from retrieval.telemetry import CATALOG_LOGGER_NAME, catalog_event_emitter, write_audit_records
 
 try:
@@ -63,7 +64,7 @@ logger = structlog.get_logger()
 class _TokenRefreshAuth(httpx.Auth):
     """httpx auth handler that refreshes MI tokens before expiry."""
 
-    def __init__(self, credential: ManagedIdentityCredential) -> None:
+    def __init__(self, credential: DefaultAzureCredential) -> None:
         self._credential = credential
         self._scope = "https://graph.microsoft.com/.default"
 
@@ -76,19 +77,20 @@ class _TokenRefreshAuth(httpx.Auth):
 class _AppState:
     config: RetrievalConfig
     registry: CosmosRegistry
-    credential: ManagedIdentityCredential
+    credential: DefaultAzureCredential
     openai_client: AzureOpenAI
     rag_service: RagService
     group_resolver: GraphGroupResolver
     audit_container: Any
     agent_chat_client: Any
     catalog_provider: RuntimeCatalogProvider
+    source_policy_reader: SourcePolicyReader
 
 
 _state = _AppState()
 
 
-def _configure_tracing(config: RetrievalConfig, *, credential: ManagedIdentityCredential | None = None) -> None:
+def _configure_tracing(config: RetrievalConfig, *, credential: DefaultAzureCredential | None = None) -> None:
     """Disable GenAI capture and configure optional Azure Monitor telemetry."""
     if _AGENT_AVAILABLE:
         from agent_framework.observability import disable_instrumentation
@@ -117,7 +119,7 @@ async def _lifespan(app: FastAPI):
     provider: RuntimeCatalogProvider | None = None
     try:
         config = load_retrieval_config()
-        credential = ManagedIdentityCredential(client_id=config.managed_identity_client_id)
+        credential = DefaultAzureCredential(managed_identity_client_id=config.managed_identity_client_id)
         resources.callback(_close_resource, credential)
         _configure_tracing(config, credential=credential)
 
@@ -130,20 +132,23 @@ async def _lifespan(app: FastAPI):
         )
         registry = build_cosmos_registry(
             instance_configs, credential, acl_enabled=config.acl_enabled,
-            audio_retrieval_enabled=config.audio_retrieval_enabled,
-            audio_max_acl_age_seconds=config.audio_max_acl_age_seconds,
-            audio_max_source_age_seconds=config.audio_max_source_age_seconds,
         )
         resources.callback(_close_resource, registry)
 
-        cosmos = CosmosClient(url=config.cosmos_endpoint, credential=credential)
+        cosmos = create_cosmos_client(config.cosmos_endpoint, credential=credential)
         resources.callback(_close_resource, cosmos)
         db = cosmos.get_database_client(config.cosmos_database)
         audit_container = db.get_container_client(config.cosmos_audit_container)
+        source_policy_reader = SourcePolicyReader(
+            db.get_container_client(config.cosmos_ingestion_sources_container),
+            db.get_container_client(config.cosmos_ingestion_runs_container),
+            config.tenant_id,
+        )
 
         _state.credential = credential
         _state.registry = registry
         _state.audit_container = audit_container
+        _state.source_policy_reader = source_policy_reader
 
         def _openai_token_provider() -> str:
             return credential.get_token("https://cognitiveservices.azure.com/.default").token
@@ -211,6 +216,7 @@ async def _lifespan(app: FastAPI):
             max_planned_queries=config.max_planned_queries,
             acl_enabled=config.acl_enabled,
             catalog_provider=provider,
+            source_policy_reader=source_policy_reader,
         )
         resources.callback(_close_resource, _state.rag_service)
         graph_client = httpx.Client(
@@ -584,6 +590,7 @@ async def _run_agentic_path(
     try:
         agent_deadline = time.monotonic() + _state.config.agent_timeout_seconds
         retrieved_chunks: list[RetrievedChunk] = []
+        source_policy_versions: dict[str, Any] = {}
         agentic_usage: list[dict[str, Any]] = []
         search_tool = make_search_tool(
             rag_service=_state.rag_service,
@@ -596,6 +603,7 @@ async def _run_agentic_path(
             forced_mode=mode,
             deadline_monotonic=agent_deadline,
             policy=policy,
+            source_policy_versions=source_policy_versions,
         )
         agent = create_rag_agent(
             _state.agent_chat_client, search_tool, model=_state.config.chat_deployment,
@@ -612,6 +620,11 @@ async def _run_agentic_path(
             return None
 
         answer_text, retrieved_chunks = accept_answer(answer_text, retrieved_chunks)
+        if retrieved_chunks:
+            _state.rag_service.validate_sources_current(
+                retrieved_chunks,
+                source_policy_versions or None,
+            )
 
         # Opportunistically capture agent LLM token usage
         agent_usage = getattr(response, "usage", None)
