@@ -4,13 +4,14 @@ This is the single, current document for the multi-SharePoint ingestion feature.
 It replaces the earlier multi-source design and plan documents, which described
 an expanded scope that is **not** required.
 
-Updated: 2026-10-08. Update the status columns as each task completes.
+Updated: 2026-10-09. Update the status columns as each task completes.
 
-**Current milestone status (2026-10-08):** Local implementation and validation
-are complete (T1-T14, T16 and T17; 2,430 tests passed and 8 live-Cosmos integration
-tests skipped). T11a retirement is intentionally deferred because it is
-irreversible. T15 Azure verification remains pending explicit deployment
-approval; no deployment has been performed.
+**Current milestone status (2026-10-09):** Local implementation and validation
+are complete. The Azure dev deployment, two source-specific full syncs, parent
+multi-source dispatch, source isolation, lifecycle exclusion, retrieval modes,
+and audio transcript retrieval passed. T15 remains partial because the Azure
+four-principal ACL allow/deny matrix, controlled delta change, and irreversible
+retirement test were not run. T11a retirement remains intentionally deferred.
 
 **T17 (revised 2026-10-08):** After a retired source's writer has settled,
 delete its document manifests, their visual manifest pages, and search chunks.
@@ -43,15 +44,15 @@ Status values: `Gap` (not built), `Built` (code and simulated tests exist),
 
 | ID | Requirement | Status | Evidence / remaining work |
 |---|---|---|---|
-| R1 | Configure multiple SharePoint sources and selected drives | Built | Operator routes register, list, and change state (T2-T4). Verified live by T6. |
-| R2 | Give each source a stable `sourceId` | Built | `SharePointSource` record; immutable site/drive binding. Verified by T6. |
-| R3 | Run full and delta ingestion independently per source/drive | Built | Per-source child runs and timers. One source verified live (full sync, failed=0). T6, T8. |
-| R4 | Preserve the existing document schema and identity behavior | Built | Schema-v1 identity tests. Document IDs unchanged across runs 11–13 (T6). T16 fixed repeated full-sync skip stability without schema or identity changes. |
-| R5 | Apply the correct source ACLs | Built | Site-group resolution with SharePoint throttling retry. One source verified live. T10. |
-| R6 | Prevent one source from affecting another | Built, defect | A duplicate `driveId` now fails only that source (T1 done). Full-sync children now run in a bounded parallel window, so a stuck source no longer delays the rest (T1b done). |
-| R7 | Support active/paused/retired lifecycle | Built | State is enforced everywhere and changed through `PATCH` (T4). Verified live by T9. |
-| R8 | Retrieval returns only eligible content | Built | Simulated retrieval tests only. T10. |
-| R9 | Verify with the agreed multi-site and document-format tests | Gap | Simulated matrix only. T6-T11a locally; T15 in Azure. |
+| R1 | Configure multiple SharePoint sources and selected drives | Verified | Azure listed three stable sources; two active sources and one paused source were dispatched correctly. |
+| R2 | Give each source a stable `sourceId` | Verified | Azure ingestion, manifests, chunks, and citations retained `sharepoint-drive` and `poc-pg` isolation. |
+| R3 | Run full and delta ingestion independently per source/drive | Locally verified | Azure source-specific and parent full syncs passed with zero failed documents; a controlled Azure delta change remains pending. |
+| R4 | Preserve the existing document schema and identity behavior | Verified | Repeated source-specific and parent Azure runs produced schema-v1 manifests and exact source-scoped chunk partitions. |
+| R5 | Apply the correct source ACLs | Locally verified | Azure delegated retrieval succeeded for the signed-in allowed user; the four-principal Azure allow/deny matrix remains pending. |
+| R6 | Prevent one source from affecting another | Verified | Source A completed before source B started; parent run created eight ready documents and eight chunks with zero cross-source rows. |
+| R7 | Support active/paused/retired lifecycle | Locally verified | Azure pause excluded all `poc-pg` citations and returned grounded no-evidence; active state was restored. Retirement remains deferred. |
+| R8 | Retrieval returns only eligible content | Locally verified | Azure gateway passed all six standard/agentic mode cases and lifecycle exclusion; the multi-principal ACL matrix remains pending. |
+| R9 | Verify with the agreed multi-site and document-format tests | Locally verified | Azure PDF and audio transcript retrieval passed, including a temporal citation; the full Azure format/ACL matrix remains pending. |
 
 ## Decisions
 
@@ -210,7 +211,38 @@ write failures are logged, and guaranteed audit delivery is not implemented.
 
 | ID | Task | Depends on | Acceptance | Status |
 |---|---|---|---|---|
-| T15 | Repeat T6-T11a in the Azure dev environment (same order as Phase 2). Local runs from T10a on share the Azure dev `rag-db`, so a local retirement in T11a is final there too; T15 needs a different source to retire, or your decision. | T14, your deployment approval | Same acceptance as locally. Only then are requirements marked `Verified`. | Not started |
+| T15 | Repeat T6-T11a in the Azure dev environment (same order as Phase 2). Local runs from T10a on share the Azure dev `rag-db`, so a local retirement in T11a is final there too; T15 needs a different source to retire, or your decision. | T14, your deployment approval | Same acceptance as locally. Only then are requirements marked `Verified`. | Partial (2026-10-09): full sync, parent dispatch, lifecycle, retrieval modes, citations, and audio passed; delta, four-principal ACL matrix, and retirement remain pending. |
+
+#### Azure validation evidence (2026-10-09)
+
+- Source-scoped cleanup deleted 57 manifests and 130 chunks with zero failures;
+  four purge audit receipts were verified. Registration, run authority, and audit
+  containers were preserved.
+- `sharepoint-drive` source sync `c7b9efad8caf45589fadc59fab22f2ae`
+  finalized 36/36 documents ready with zero failures. `poc-pg` source sync
+  `fa5bac065cb345e5a8bace015be7446c` finalized 11/11 ready with zero failures.
+- Parent sync `62810ce032814341b928041dd2d0ab06` enumerated three sources,
+  dispatched both active sources, skipped paused `poc-auth`, and produced eight
+  ready parent-run documents with chunks and zero cross-source rows.
+- The Function API app registration was missing the code-required
+  `Ingestion.Operator` role. The role was added and assigned to the signed-in
+  `System Administrator` identity. Legacy `Rag.Reconcile` remains assigned to
+  two users; remove it only after its external consumer is disproven.
+- The Function gateway rejected an unauthenticated query with HTTP 401. The
+  signed-in delegated user retrieved cited evidence from both active sources.
+  The six standard/agentic by hybrid/vector/full-text scenarios passed with no
+  degradation and the expected catalog digest and ETag.
+- Audio retrieval cited `T11-Sample-Audio.flac` with a `40–5960 ms` time range.
+  Pausing `poc-pg` returned grounded no-evidence and zero `poc-pg` citations;
+  the source was restored active.
+- Remaining evidence gaps: repeat ACL allow/deny with four real delegated users,
+  run one controlled Azure delta change, and explicitly decide whether to test
+  irreversible retirement.
+- Operational debt observed: asynchronous audio can leave a terminal full-sync
+  owner draining with zero work until the explicit settle path runs, and an
+  audio-poll race can fail with `drive_writer_already_active`. Retrieval answers
+  also rendered the spoken opening quote as a replacement character. These are
+  tracked for focused refactoring; no coordination or validation was bypassed.
 
 ### Removed documents (T12)
 

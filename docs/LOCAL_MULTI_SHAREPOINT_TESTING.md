@@ -762,17 +762,20 @@ was recorded.
 
 ## Completion checklist
 
-- [ ] Focused automated gate passed.
-- [ ] Azure context, settings, Azurite, network, and RBAC passed.
-- [ ] Missing sources registered as paused.
-- [ ] Both sources activated with current ETags.
-- [ ] Source A full sync completed with source B unchanged.
-- [ ] Source B full sync completed with source A unchanged.
-- [ ] Parent sync reported one successful outcome per active source.
-- [ ] Negative authorization, validation, state, and busy cases passed.
-- [ ] Run IDs and sanitized evidence were recorded in the tracker.
-- [ ] Retrieval unit/integration gate passed.
+- [x] Focused automated gate passed.
+- [x] Azure context, settings, network, identity, and RBAC passed.
+- [x] Source registry inventory and intended lifecycle states verified.
+- [x] Both active sources validated with current ETags.
+- [x] Source A full sync completed with source B unchanged.
+- [x] Source B full sync completed with source A unchanged.
+- [x] Parent sync dispatched both active sources; child content finalized successfully.
+- [x] Negative authorization, lifecycle, and busy cases passed.
+- [x] Run IDs and sanitized evidence were recorded in the tracker.
+- [x] Retrieval unit/integration gate passed.
 - [x] Local Azure-backed retrieval and ACL-on/ACL-off matrix passed.
+- [x] Azure delegated retrieval, modes, citations, audio time range, and pause exclusion passed.
+- [ ] Azure four-principal ACL allow/deny matrix repeated with real delegated identities.
+- [ ] Controlled Azure delta change and irreversible retirement decision completed.
 
 ## References
 

@@ -2,6 +2,41 @@
 
 This runbook validates the deployed Function gateway, ACA retrieval service, ingestion lifecycle, ACL trimming, scoring profiles, freshness, synonyms, telemetry, and cleanup. Use only an approved non-production test site and disposable fixtures.
 
+## Current validated development demo (2026-10-09)
+
+| Binding | Value |
+|---|---|
+| Function App | `rag-aca-e2e-20260827-func-jztu542h` |
+| Function API client ID | `f6a39f07-5d1d-4e83-936c-28d0fed0e3fe` |
+| Retrieval image | `ragacae2e20260827acrjztu542h.azurecr.io/rag-retrieval@sha256:b4af0745fae5f7a5434893951ae9bcdd5611fa9911b6d507f6313fa4cdb541fe` |
+| Catalog digest | `sha256:fa3dbe6736debdba0bfc14743e9cea63da5b41cab691795e7acf111d82b6b303` |
+| Catalog ETag | `"12012308-0000-0200-0000-6aa28be50000"` |
+| Active sources | `sharepoint-drive`, `poc-pg` |
+| Paused source | `poc-auth` |
+
+Validated evidence:
+
+- source-specific ingestion finalized 36/36 and 11/11 ready documents with zero failures;
+- parent dispatch processed both active sources, skipped `poc-auth`, and produced zero cross-source chunk rows;
+- all six standard/agentic by hybrid/vector/full-text scenarios passed with five citations and no degradation;
+- source A, source B, and audio transcript questions returned grounded citations;
+- audio citation included the `40–5960 ms` time range; and
+- pausing `poc-pg` produced grounded no-evidence with zero `poc-pg` citations, then active state was restored.
+
+Remaining limits: the Azure four-principal ACL allow/deny matrix and a controlled delta change are not yet demonstrated. Do not claim those as completed in the demo.
+
+### Ten-minute rehearsal
+
+1. Show the three-source inventory and identify the two active sources and paused source.
+2. State the clean-ingestion results above; do not rerun audio ingestion during a short demo.
+3. Query the Password and Authentication Policy to show source-A citations.
+4. Query the Dummy Loan Policy to show source-B citations.
+5. Ask `What message is spoken in the T11 sample audio?` and show the temporal citation.
+6. Show the saved six-scenario matrix summary and exact catalog binding.
+7. Explain lifecycle isolation using the recorded pause test; mutate source state live only when explicitly approved and always restore it.
+
+Store generated rehearsal reports under `C:\DevEnvs\enterprise-rag-pipeline\reports`, not in the OneDrive working copy.
+
 ## Preconditions
 
 - The deployed Function, ACA revision, image digest, and current catalog ETag/digest are known.
@@ -13,7 +48,7 @@ This runbook validates the deployed Function gateway, ACA retrieval service, ing
 $funcApp = '<function-app-name>'
 $clientId = '<function-api-client-id>'
 $baseUrl = "https://$funcApp.azurewebsites.net"
-$token = az account get-access-token --resource "api://$clientId" --query accessToken -o tsv
+$token = az account get-access-token --scope "api://$clientId/.default" --query accessToken -o tsv
 $headers = @{ Authorization = "Bearer $token"; 'Content-Type' = 'application/json' }
 ```
 
@@ -72,7 +107,7 @@ python tools/script_query_retrieval.py `
   --scenario-matrix `
   --expected-catalog-sha 'sha256:<catalog-digest>' `
   --expected-catalog-etag '<exact-cosmos-etag>' `
-  --report demo-output/retrieval-scenario-matrix.json
+  --report C:\DevEnvs\enterprise-rag-pipeline\reports\retrieval-scenario-matrix.json
 ```
 
 Required coverage:
