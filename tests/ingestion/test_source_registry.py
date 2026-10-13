@@ -403,10 +403,20 @@ def test_delta_page_capture_persists_reset_anchor_for_replay() -> None:
     claim = capture.begin_page(request_url, 0, None)
     capture.record_reset(request_url, 0, reset_location)
     replay = capture.begin_page(request_url, 0, None)
+    capture.begin_page(reset_location, 0, None)
+    capture.seal_page(
+        reset_location,
+        0,
+        None,
+        [{"id": "item-1"}],
+        None,
+        "https://graph.microsoft.com/v1.0/drives/drive-a/root/delta?token=fresh",
+    )
 
     assert claim["state"] == "capture"
     assert replay["state"] == "reset"
     assert replay["location"] == reset_location
+    assert capture.count_observed_entries() == 1
 
 
 def test_delta_page_reduction_uses_last_page_and_entry_occurrence() -> None:

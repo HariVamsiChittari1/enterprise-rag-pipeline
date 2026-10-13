@@ -54,6 +54,35 @@ You need:
 - two SharePoint site URLs and document-library drive IDs; and
 - permission to read the SharePoint drives and required Azure resources.
 
+## Inspect one file's Graph and SharePoint ACL
+
+For a single file, use the standalone diagnostic instead of manually
+requesting separate Graph and SharePoint tokens. It reads the certificate from
+the ignored local settings and Key Vault, then prints direct Entra groups,
+SharePoint site groups, their members, and nested security-group IDs. It never
+prints tokens, the PFX, or private-key material. The output also lists every
+read-only API call, HTTP status, and URL; JSON output stores these under
+`requests`.
+
+Use the project virtual environment and replace only the three SharePoint
+inputs:
+
+```powershell
+$siteUrl = 'https://<tenant>.sharepoint.com/sites/<site-name>'
+$driveId = '<drive-id>'
+$itemId = '<drive-item-id>'
+
+& $python .\tools\inspect_sharepoint_acl.py `
+  --site-url $siteUrl `
+  --drive-id $driveId `
+  --item-id $itemId
+```
+
+For machine-readable output, use `--format json`; to save it outside the
+repository, use `--output 'C:\DevEnvs\enterprise-rag-pipeline\acl.json'`.
+The command uses `app\local.settings.json` by default. Override it with
+`--settings-path` only when testing a separate approved settings file.
+
 ## Test evidence
 
 Record evidence in the workspace tracker:
@@ -740,6 +769,14 @@ Repeat with:
 
 Verify citation source, URL, lifecycle exclusion, ACL exclusion, and the
 grounded no-evidence response.
+
+The Azure development validation on 2026-10-09 used one real delegated identity
+sequentially because the tenant did not have four safe ordinary test users.
+After each Reader/Editor membership change, verify the live transitive
+membership before querying. The observed Neither state failed closed with
+gateway HTTP 502 (`retrieval_auth_failed`) because the user had no eligible
+security groups; it did not return a grounded answer. Restore the original
+memberships and repeat both allowed-source queries before closing the test.
 
 ## Stop and recovery
 

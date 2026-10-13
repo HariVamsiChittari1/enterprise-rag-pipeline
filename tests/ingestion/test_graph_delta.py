@@ -81,6 +81,54 @@ def test_read_drive_delta_handles_410_reset_with_a_full_rebaseline() -> None:
     assert {item["id"] for item in delta.items} == {"item-1", "item-2"}
 
 
+def test_read_drive_delta_restarts_when_410_repeats_expired_location() -> None:
+    expired = "https://graph.microsoft.com/v1.0/drives/drive-1/root/delta?token=expired"
+    baseline = "https://graph.microsoft.com/v1.0/drives/drive-1/root/delta"
+    final_link = f"{baseline}?token=fresh"
+    calls: list[str] = []
+
+    class Capture:
+        def __init__(self) -> None:
+            self.resets: dict[str, str] = {}
+
+        def begin_page(self, request_url, _page_ordinal, _predecessor_receipt_id):
+            location = self.resets.get(request_url)
+            if location is not None:
+                return {"state": "reset", "location": location}
+            return {"state": "capture", "receiptId": "receipt"}
+
+        def record_reset(self, request_url, _page_ordinal, location):
+            self.resets[request_url] = location
+
+        def seal_page(self, *_args):
+            return "receipt"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(str(request.url))
+        if str(request.url) == expired:
+            return httpx.Response(410, headers={"location": expired})
+        assert str(request.url) == baseline
+        return httpx.Response(
+            200,
+            json={"value": [{"id": "item-1"}], "@odata.deltaLink": final_link},
+        )
+
+    capture = Capture()
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        delta = read_drive_delta(
+            client,
+            "drive-1",
+            max_pages=10,
+            delta_link=expired,
+            page_capture=capture,
+        )
+
+    assert calls == [expired, baseline]
+    assert capture.resets == {expired: baseline}
+    assert delta.is_full_baseline is True
+    assert delta.delta_link == final_link
+
+
 def test_read_drive_delta_deduplicates_repeated_item_ids_keeping_latest_state() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(

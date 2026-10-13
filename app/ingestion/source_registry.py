@@ -1942,12 +1942,13 @@ class SourceRegistryRepository:
         try:
             iterator = self._ingestion_runs.query_items(
                 query=(
-                    "SELECT c.itemCount FROM c WHERE c.recordType = @recordType "
-                    "AND c.roundId = @roundId"
+                    "SELECT c.state, c.itemCount FROM c WHERE c.recordType = @recordType "
+                    "AND c.roundId = @roundId AND c.state = @state"
                 ),
                 parameters=[
                     {"name": "@recordType", "value": DELTA_PAGE_RECORD_TYPE},
                     {"name": "@roundId", "value": round_id},
+                    {"name": "@state", "value": "sealed"},
                 ],
                 partition_key=source_id,
                 max_item_count=100,
@@ -1955,6 +1956,8 @@ class SourceRegistryRepository:
             total = 0
             for page in iterator.by_page():
                 for row in page:
+                    if row.get("state") != "sealed":
+                        continue
                     count = row.get("itemCount")
                     if isinstance(count, bool) or not isinstance(count, int) or count < 0:
                         raise SourceRegistryError("delta_page_entry_count_invalid")

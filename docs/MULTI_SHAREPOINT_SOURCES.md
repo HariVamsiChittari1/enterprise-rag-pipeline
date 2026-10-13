@@ -4,14 +4,17 @@ This is the single, current document for the multi-SharePoint ingestion feature.
 It replaces the earlier multi-source design and plan documents, which described
 an expanded scope that is **not** required.
 
-Updated: 2026-10-09. Update the status columns as each task completes.
+Reviewed against the current implementation and validation evidence:
+2026-10-09. Update the status columns as each task completes.
 
 **Current milestone status (2026-10-09):** Local implementation and validation
 are complete. The Azure dev deployment, two source-specific full syncs, parent
 multi-source dispatch, source isolation, lifecycle exclusion, retrieval modes,
-and audio transcript retrieval passed. T15 remains partial because the Azure
-four-principal ACL allow/deny matrix, controlled delta change, and irreversible
-retirement test were not run. T11a retirement remains intentionally deferred.
+audio transcript retrieval, controlled delta, four-state delegated ACL matrix,
+and irreversible retirement passed. T15 is complete. The ACL matrix used one
+real delegated identity with its Reader and Editor memberships changed
+sequentially because the tenant had only two ordinary users; the break-glass
+identity was not used.
 
 **T17 (revised 2026-10-08):** After a retired source's writer has settled,
 delete its document manifests, their visual manifest pages, and search chunks.
@@ -20,7 +23,7 @@ Clear matching document winners; keep registration, bindings, and retirement
 latch so the source cannot reactivate. Validate retries and source isolation
 locally without retiring either real dev source. This supersedes content retention.
 
-**T18 (2026-10-08):** Keep ordinary retirement terminal, but add a separate
+**T20 (2026-10-08):** Keep ordinary retirement terminal, but add a separate
 operator-only reprovision operation for exceptional rebuilds of the same source
 and immutable drive binding. Require ETag concurrency,
 completed retirement, Graph revalidation, bounded operational-state cleanup,
@@ -32,9 +35,9 @@ Ingest and retrieve content from several SharePoint document libraries
 (drives). Each drive is an isolated source with a stable `sourceId` and an
 active, paused, or retired lifecycle.
 
-**Done when** every requirement below is marked `Verified`: automated tests, a local
-run against two real dev drives, and the Azure check (T15) after an approved deployment.
-This plan stops before deployment, so its local target is `Locally verified`.
+**Done when** every requirement below is marked `Verified`: automated tests, a
+local run against two real development drives, and the approved Azure
+verification in T15.
 
 ## Requirements and status
 
@@ -46,13 +49,13 @@ Status values: `Gap` (not built), `Built` (code and simulated tests exist),
 |---|---|---|---|
 | R1 | Configure multiple SharePoint sources and selected drives | Verified | Azure listed three stable sources; two active sources and one paused source were dispatched correctly. |
 | R2 | Give each source a stable `sourceId` | Verified | Azure ingestion, manifests, chunks, and citations retained `sharepoint-drive` and `poc-pg` isolation. |
-| R3 | Run full and delta ingestion independently per source/drive | Locally verified | Azure source-specific and parent full syncs passed with zero failed documents; a controlled Azure delta change remains pending. |
+| R3 | Run full and delta ingestion independently per source/drive | Verified | Azure source-specific and parent full syncs passed with zero failed documents. A controlled `poc-pg` delta rebaseline, no-change round, one-item incremental change, audio settlement, and fixture deletion passed without changing `sharepoint-drive`. |
 | R4 | Preserve the existing document schema and identity behavior | Verified | Repeated source-specific and parent Azure runs produced schema-v1 manifests and exact source-scoped chunk partitions. |
-| R5 | Apply the correct source ACLs | Locally verified | Azure delegated retrieval succeeded for the signed-in allowed user; the four-principal Azure allow/deny matrix remains pending. |
+| R5 | Apply the correct source ACLs | Verified | One real delegated identity exercised Both, Reader-only, Editor-only, and Neither sequentially. Allowed sources returned citations; denied sources returned no evidence or failed closed. Both memberships were restored. |
 | R6 | Prevent one source from affecting another | Verified | Source A completed before source B started; parent run created eight ready documents and eight chunks with zero cross-source rows. |
-| R7 | Support active/paused/retired lifecycle | Locally verified | Azure pause excluded all `poc-pg` citations and returned grounded no-evidence; active state was restored. Retirement remains deferred. |
-| R8 | Retrieval returns only eligible content | Locally verified | Azure gateway passed all six standard/agentic mode cases and lifecycle exclusion; the multi-principal ACL matrix remains pending. |
-| R9 | Verify with the agreed multi-site and document-format tests | Locally verified | Azure PDF and audio transcript retrieval passed, including a temporal citation; the full Azure format/ACL matrix remains pending. |
+| R7 | Support active/paused/retired lifecycle | Verified | Azure pause excluded `poc-pg` citations and was reversed. The approved paused `poc-auth` source was then retired; cleanup completed, its terminal latch blocked reactivation with 409, and both active sources remained unchanged. |
+| R8 | Retrieval returns only eligible content | Verified | Azure gateway passed all six standard/agentic mode cases, lifecycle exclusion, and the four-state delegated ACL matrix. |
+| R9 | Verify with the agreed multi-site and document-format tests | Verified | Azure PDF and audio transcript retrieval passed, including a temporal citation, followed by the four-state ACL and controlled-delta checks. |
 
 ## Decisions
 
@@ -82,13 +85,13 @@ Every trigger worked on that one drive:
 
 ```mermaid
 flowchart LR
-  OP[Operator] -->|"register (T2), list (T3), change state (T4)"| API[Source API<br/>Function routes]
+  OP[Operator] -->|"register, list, change state"| API[Source API<br/>Function routes]
   API -->|"validate site owns drive (once, at registration)"| G[Microsoft Graph]
   API --> SRC[(ingestion-sources<br/>desiredState per sourceId)]
   API --> RUNS[(ingestion-runs per sourceId:<br/>binding, drive reservation,<br/>retired latch)]
-  TRG[Timers, webhooks,<br/>full-sync route] -->|"read each accepted source<br/>(no Graph call, T5)"| SRC
+  TRG[Timers, webhooks,<br/>full-sync route] -->|"read each accepted source<br/>(no Graph call)"| SRC
   TRG --> MSO[multi_source_full_sync_orchestrator]
-  MSO -->|"one child per source<br/>(bounded parallel window, T1b)"| FSO["full_sync_orchestrator (sourceId)"]
+  MSO -->|"one child per source<br/>(bounded parallel window)"| FSO["full_sync_orchestrator (sourceId)"]
   TRG -->|per source| DLT["delta / ACL / lifecycle runs (sourceId)"]
   FSO --> DOC[process_document]
   DLT --> DOC
@@ -100,24 +103,24 @@ flowchart LR
   Q -->|"ACL: user groups match allowedGroupIds"| CH
 ```
 
-Planned work is labelled in the diagram. Retrieval reads `desiredState` only; it does
-not read the `source-serving` retirement latch. Retrieval runs locally against the Azure dev `rag-db`,
-because the emulator cannot run its vector or full-text queries (T10a).
+Retrieval reads `desiredState` only; it does not read the `source-serving`
+retirement latch. Azure development Cosmos DB is the supported local retrieval
+data plane.
 
-### What was added compared with `HEAD`
+### Implemented components
 
-| Area | Added | Requirement |
+| Area | Implementation | Requirement |
 |---|---|---|
 | Configuration | `ingestion-sources` Cosmos container (partition `/sourceId`) and the `COSMOS_INGESTION_SOURCES_CONTAINER_NAME` setting. The single-source settings are now optional. | R1, R2 |
 | Source schema | `app/source_registry.py`: `SharePointSource` (`id == sourceId`, `desiredState`, `config` = `siteId`, `siteUrl`, `driveId`). | R2, R7 |
 | Source repository | `app/ingestion/source_registry.py`: catalog paging, acceptance, and per-source records in `ingestion-runs`. | R1, R6 |
 | Acceptance records (per `sourceId` in `ingestion-runs`) | `source-binding` (site/drive cannot change), `drive-binding` (one source per drive), `source-serving` (retirement latch; its `retired` flag makes retirement final). | R2, R6, R7 |
-| Run coordination records | `drive-coordinator`, `source-dispatch-manifest` / `source-dispatch-item`, `document-operation`, `document-winner`, delta page and round records. | R3, R6. Provisional: each one is reviewed in T13. |
-| Orchestration | `multi_source_full_sync_orchestrator` starts the existing `full_sync_orchestrator` once per `sourceId`, in a bounded parallel window of `SOURCE_DISPATCH_PAGE_SIZE` children (`task_any`; `app/function_app.py` ~1252). Dispatch history is not compacted while children run, because continue-as-new would drop in-flight tasks; history grows with the number of sources in one dispatch. New activities for source inventory, dispatch outcomes, document claiming, absence reconcile, delta-cursor commit, and coordinator drain and settle. | R3, R6 |
+| Run coordination records | `drive-coordinator`, `source-dispatch-manifest` / `source-dispatch-item`, `document-operation`, `document-winner`, delta page and round records. | R3, R6 |
+| Orchestration | `multi_source_full_sync_orchestrator` starts the existing `full_sync_orchestrator` once per `sourceId`, in a bounded parallel window of `SOURCE_DISPATCH_PAGE_SIZE` children using `task_any`. Dispatch history is not compacted while children run, because continue-as-new would drop in-flight tasks; history grows with the number of sources in one dispatch. Activities cover source inventory, dispatch outcomes, document claiming, absence reconcile, delta-cursor commit, and coordinator drain and settle. | R3, R6 |
 | Triggers | Timers and webhooks loop over registered sources instead of one configured drive. The loader (`_load_validated_source_plans`) and dispatch preflight read each source with `read_source_plan` (acceptance check, no Graph call); a source that fails the check is skipped alone, and an unknown webhook subscription is ignored instead of rejecting the batch (T5). | R3, R6 |
 | Retrieval | `app/retrieval/source_policy.py`: serves only sources whose `desiredState` is `active`, and rechecks the source ETag for cited sources. The ACL check is unchanged. | R7, R8 |
 | Shared | `app/cosmos_connection.py`: Entra-authenticated Cosmos client factory used by the Function App and retrieval (`main.py`, `cosmos_registry.py`); retrieval passes its own `DefaultAzureCredential`. | Local and Azure runs |
-| Built (T2-T4) | Source routes. State change (T4: `PATCH /api/ingestion/sources/{sourceId}`, `change_source_state` in `app/function_app.py` and `SourceRegistryRepository.change_source_state`). Registration (T2: `POST /api/ingestion/sources`, `register_source`, `SourceRegistryRepository.register_sharepoint_source`) and list (T3: `GET /api/ingestion/sources`, `list_sources` in `app/function_app.py`, reusing `list_source_inventory_page`). The one-time seed tool and `seed_existing_sharepoint_source` were removed in T5. | R1, R7 |
+| Source API | State change (`PATCH /api/ingestion/sources/{sourceId}`), registration (`POST /api/ingestion/sources`), and bounded listing (`GET /api/ingestion/sources`). The one-time seed path is not part of the current implementation. | R1, R7 |
 
 The document schema, document identity, chunk format, and ACL model are unchanged (R4).
 
@@ -128,7 +131,7 @@ The document schema, document identity, chunk format, and ACL model are unchange
 | Source catalog + ETag | Keep | R1 source configuration and R7 concurrent lifecycle changes. |
 | Source binding | Keep | R2 immutable source/site/drive identity. |
 | Drive binding | Keep | R6 rejects duplicate-drive ownership without affecting other sources. |
-| `source-serving.retired` | Keep | R7 blocks ordinary reactivation even if the catalog is edited directly; T18 can clear it only after an explicit, validated reprovision cleanup. |
+| `source-serving.retired` | Keep | R7 blocks ordinary reactivation even if the catalog is edited directly; T20 can clear it only after an explicit, validated reprovision cleanup. |
 | `source-serving` readiness/progress | Remove | Retrieval and triggers use catalog `desiredState`; no consumer read these fields. |
 | Drive coordinator | Keep | R3 serializes one source's writers; R6 scopes failure and recovery per source. |
 | Trigger instance controls | Keep | R3 prevents duplicate Durable runs for the same source trigger. |
@@ -143,8 +146,8 @@ The document schema, document identity, chunk format, and ACL model are unchange
 | 1. Source management (T1-T5) | Dispatch isolation; parallel child dispatch; source API routes; trigger loader. | Operator role. Codes 201, 400, 403, 404, 409, 412, 428, 422, 503. The source record schema does not change. | `desiredState` in `ingestion-sources` is the lifecycle authority. The drive reservation owns drive uniqueness. The retired flag in `source-serving` makes retirement final. | A duplicate, unaccepted, slow, or stuck source affects only itself (T1, T1b, T5). Triggers make no Graph validation call; registration validates once. | Done |
 | 2. Local verification (T5a-T11a) | Local operator header; retrieval startup against Azure dev `rag-db` (T10a); fixes only for proven defects. | Same as Phase 1. | Same. | Delta, lifecycle, and ACL changes in one source leave the other unchanged (T8-T10). | Done through T11; irreversible T11a deferred by user decision |
 | 3. Cleanup and docs (T12-T14) | Remove unneeded coordination code, one approved item at a time; update docs. | No change. | No change. | T6-T11a must still pass after each removal. | Done |
-| 4. Azure verification (T15) | None. Runs after a deployment you approve; deployment itself is outside this plan. | Same. | Same. | Same checks as Phase 2. | Not started |
-| 5. Retired-source recovery (T18) | Operator-only reprovision route, bounded Durable cleanup, durable intent/receipt, and completion audit. | Same immutable source/site/drive identity; confirmation, ETag, immutable operator object ID, and Graph validation required. Result is paused; activation is blocked until an explicit bootstrap full sync succeeds. | Catalog remains lifecycle authority; source binding and drive reservation remain immutable. The source-scoped reprovision receipt owns recovery progress and attribution. | Retired latch remains fail closed through cleanup; allowlisted deletion stops on unknown records; transactional progress survives activity redelivery and ambiguous responses. | Locally automated-verified; live Azure validation pending |
+| 4. Azure verification (T15) | Exercise the deployed development environment after approval. | Same. | Same. | Same checks as Phase 2. | Done: full sync, dispatch, lifecycle exclusion, retrieval modes, citations, audio, controlled delta, four-state delegated ACL matrix, and retirement passed. |
+| 5. Retired-source recovery (T20) | Operator-only reprovision route, bounded Durable cleanup, durable intent/receipt, and completion audit. | Same immutable source/site/drive identity; confirmation, ETag, immutable operator object ID, and Graph validation required. Result is paused; activation is blocked until an explicit bootstrap full sync succeeds. | Catalog remains lifecycle authority; source binding and drive reservation remain immutable. The source-scoped reprovision receipt owns recovery progress and attribution. | Retired latch remains fail closed through cleanup; allowlisted deletion stops on unknown records; transactional progress survives activity redelivery and ambiguous responses. | Verified locally and in live Azure; the later approved T15 test retired `poc-auth` again. |
 
 ## Plan
 
@@ -192,9 +195,10 @@ Run in this order. POC-PG stays active until T11a, because retirement is final.
 | T13 | Code audit: list each coordination mechanism and the requirement it serves, including whether `source-serving` is still needed beyond the retired flag. Remove mechanisms with no requirement, one at a time, only with your approval per item. Confirmed by you on 2026-10-07; runs only after Phase 2 passes locally. | Phase 2 | Approved list; suites green after each removal; T6-T11a still pass. | Done: readiness/progress fields and publication activity removed with approval on 2026-10-08; retirement latch retained for R7. Focused 155-test suite and full suite (2,391 passed, 8 skipped) passed. |
 | T14 | Update the API reference, configuration, and local setup docs; code review. | T13 | Docs match code; review findings resolved. | Done: source APIs/status/configuration/local setup aligned with code; two review defects fixed; 2,396 passed, 8 skipped. |
 | T16 | Fix the T7 skip/reprocess alternation, test-first. Requested by you on 2026-10-07, to be done after the full implementation. | T14 | A failing test first: a second full sync after a skip-all run still skips unchanged files. Then the minimal fix; document IDs and schema unchanged (R4); full suite green. | Done (2026-10-08): failing regression proved the latest completed skip-only run had no manifest. Discovery now uses the existing per-document winner's ready manifest as the coordinated baseline, retaining `lastCompletedRunId` for the legacy path. No schema or ID change; 159 focused and 2,397 full tests passed, 8 skipped. |
-| T17 | Retired-source content deletion (revised 2026-10-08): after writer quiescence, delete source documents, visual pages and chunks; preserve audit like SharePoint delta deletion. | T14, user approval | No retrievable/retained source content after completion; other sources unaffected; retries safe; registry/latch and prior audit retained. | Locally validated: 512 focused and 2,430 full tests passed; 8 live-Cosmos tests skipped. Compilation and diff checks passed. Live retirement remains deferred. |
-| T18 | Source-specific full sync (requested by you): `POST /api/ingestion/sources/{sourceId}/full-sync` starts `full_sync_orchestrator` for one active source, so adding a source does not rescan the others. Mirrors Azure AI Search's per-indexer [Run Indexer](https://learn.microsoft.com/rest/api/searchservice/indexers/run) (`202`, single instance per indexer). | T14 | Operator role required; invalid/missing/inactive/busy sources rejected without starting; only the target plan is dispatched; all-source route unchanged. | Locally validated: 125 focused and 2,456 full tests passed; 8 skipped. Not run against the local Functions host. |
+| T17 | Retired-source content deletion (revised 2026-10-08): after writer quiescence, delete source documents, visual pages and chunks; preserve audit like SharePoint delta deletion. | T14, user approval | No retrievable/retained source content after completion; other sources unaffected; retries safe; registry/latch and prior audit retained. | Verified locally and in Azure: the earlier live `poc-auth` retirement removed 57 manifests and 130 chunks with zero failures; the later T15 retirement verified the already-empty cleanup path and terminal latch. |
+| T18 | Source-specific full sync (requested by you): `POST /api/ingestion/sources/{sourceId}/full-sync` starts `full_sync_orchestrator` for one active source, so adding a source does not rescan the others. Mirrors Azure AI Search's per-indexer [Run Indexer](https://learn.microsoft.com/rest/api/searchservice/indexers/run) (`202`, single instance per indexer). | T14 | Operator role required; invalid/missing/inactive/busy sources rejected without starting; only the target plan is dispatched; all-source route unchanged. | Verified in Azure development: both active sources completed independent source-specific full syncs with zero failed documents; automated route and orchestration suites passed. |
 | T19 | Measure the default safe source count (requested by you). Code and Microsoft docs set no source limit; the shared [SharePoint per-app budget](https://learn.microsoft.com/sharepoint/dev/general-development/how-to-avoid-getting-throttled-or-blocked-in-sharepoint-online) and the [Graph webhook 3-second reply](https://learn.microsoft.com/graph/change-notifications-delivery-webhooks) are the limits. | T18 | Measured with increasing active sources: webhook reply time (must stay under 3 s), delta/ACL timer duration (under the 30-minute `functionTimeout`), and SharePoint 429s. Record the highest count that passes all three; confirm the tenant license tier. No code change without approval. | Not started |
+| T20 | Reprovision an exceptionally retired source while preserving its immutable source/site/drive binding and audit history. | T17, T18 | Operator confirmation, ETag, immutable operator object ID, Graph revalidation, bounded cleanup, paused result, and mandatory bootstrap full sync before activation. | Verified locally and in live Azure; the later approved T15 test retired `poc-auth` again. |
 T17 reuses the source coordinator's exclusive maintenance state. The lifecycle
 timer marks an existing writer draining and waits for settlement; registered
 unresolved work is never released merely because time elapsed. Recovery of an
@@ -207,11 +211,11 @@ removed after document cleanup. No extraction, embedding, or SharePoint deletion
 is performed. Audit persistence remains best-effort, exactly as in delta sync;
 write failures are logged, and guaranteed audit delivery is not implemented.
 
-### Phase 4: Azure verification (after an approved deployment; outside this plan's execution)
+### Phase 4: Azure verification
 
 | ID | Task | Depends on | Acceptance | Status |
 |---|---|---|---|---|
-| T15 | Repeat T6-T11a in the Azure dev environment (same order as Phase 2). Local runs from T10a on share the Azure dev `rag-db`, so a local retirement in T11a is final there too; T15 needs a different source to retire, or your decision. | T14, your deployment approval | Same acceptance as locally. Only then are requirements marked `Verified`. | Partial (2026-10-09): full sync, parent dispatch, lifecycle, retrieval modes, citations, and audio passed; delta, four-principal ACL matrix, and retirement remain pending. |
+| T15 | Repeat T6-T11a in the Azure dev environment (same order as Phase 2). Local runs from T10a on share the Azure dev `rag-db`, so a local retirement in T11a is final there too; T15 needs a different source to retire, or your decision. | T14, your deployment approval | Same acceptance as locally. Only then are requirements marked `Verified`. | Done (2026-10-09): full sync, parent dispatch, lifecycle, retrieval modes, citations, audio, controlled delta, sequential four-state delegated ACL matrix, and approved `poc-auth` retirement passed. |
 
 #### Azure validation evidence (2026-10-09)
 
@@ -235,9 +239,37 @@ write failures are logged, and guaranteed audit delivery is not implemented.
 - Audio retrieval cited `T11-Sample-Audio.flac` with a `40–5960 ms` time range.
   Pausing `poc-pg` returned grounded no-evidence and zero `poc-pg` citations;
   the source was restored active.
-- Remaining evidence gaps: repeat ACL allow/deny with four real delegated users,
-  run one controlled Azure delta change, and explicitly decide whether to test
-  irreversible retirement.
+- Controlled `poc-pg` delta rebaseline saw 15 items, updated seven, failed zero,
+  and left three audio items pending. Audio settlement succeeded for all three.
+  A no-change round then saw zero items. A later one-item Markdown change was
+  consumed by audio-poll delta catch-up, reached `ready`, and was deleted with
+  its temporary predecessor. Both manifests were removed; `sharepoint-drive`
+  stayed at 42 manifests with an unchanged metadata hash.
+- Live delta exposed two reset defects. Graph HTTP 410 can repeat the expired
+  cursor in `Location`, so the connector now restarts without the stale token.
+  Reset-marker receipts are also excluded from sealed-page entry counts. The
+  focused regression set passed 94 tests.
+- The tenant had only two ordinary users and the break-glass identity was
+  excluded. With approval, the current real delegated identity exercised the
+  ACL matrix sequentially: Both allowed both sources; Reader-only allowed
+  `sharepoint-drive` and denied `poc-pg`; Editor-only allowed both; Neither
+  failed closed at the gateway. Reader and Editor memberships were restored,
+  and both source probes again returned five citations.
+- The approved paused `poc-auth` source was already empty after reprovision.
+  Retirement orchestration
+  `lifecycle-reconcile-trigger-98e21620b19544fca31a1b76a3420dfe`
+  completed with zero documents and zero orphan chunks to delete. The terminal
+  serving latch is set, reactivation returns 409
+  `retired_source_cannot_be_reactivated`, and pre/post counts and hashes for
+  `sharepoint-drive` and `poc-pg` are identical. This proves terminal
+  retirement and no-op cleanup isolation; earlier live retirement evidence
+  covers cleanup with source content present.
+- All temporary validation exceptions were removed: Cosmos DB, Storage,
+  Document Intelligence, and Speech again have public access disabled, no IP
+  rules, and no `SecurityControl` tag. The temporary Groups Administrator PIM
+  activation was deactivated or expired. A post-cleanup private-path smoke
+  listed `poc-auth` as retired and returned five citations from each active
+  source.
 - Operational debt observed: asynchronous audio can leave a terminal full-sync
   owner draining with zero work until the explicit settle path runs, and an
   audio-poll race can fail with `drive_writer_already_active`. Retrieval answers
@@ -262,15 +294,16 @@ an expanded scope that is not required.
 ## Scope
 
 - **Included:** R1-R9 for SharePoint drives only.
-- **Excluded:** Blob sources, deployment, production readiness, and new features beyond R1-R9.
-  T15 runs only after a deployment you approve.
+- **Included:** approved Azure development verification recorded in T15.
+- **Excluded:** Blob sources, production deployment/readiness, and new features
+  beyond R1-R9.
 
 ## Risks, unknowns, and inputs needed
 
 | Item | Type | Status |
 |---|---|---|
 | Audio (WAV, MP3, FLAC) in the live format matrix | Decided | In scope, locally and in Azure (T11). |
-| Test users or groups with expected access per site, for T10 | Input | Users exist. Provide their object IDs and the expected allow/deny matrix at T10. ACL on and off are both tested. |
+| Azure delegated ACL matrix | Resolved | One real delegated identity exercised Both, Reader-only, Editor-only, and Neither sequentially because four safe ordinary users were unavailable. Memberships were restored to Both. |
 | Local retrieval data plane | Required | Resolved (T10a): local retrieval uses Azure dev `rag-db` to exercise required vector and full-text queries. |
 | Local audio ingestion (T11) | Decided | `speech_batch` only, matching Azure (`infra/modules/functions.bicep`; [ADR 0001](adr/0001-audio-batch-transcription.md): the synchronous `speech_fast` call blocked the worker and was replaced). Uses the dev Azure Speech resource. Batch cannot use Azurite: Speech reads audio from Azure Blob storage by managed identity or SAS ([Batch transcription audio data](https://learn.microsoft.com/azure/ai-services/speech-service/batch-transcription-audio-data)), and `app/config.py` requires an HTTPS `AUDIO_STAGING_BLOB_ENDPOINT`. Batch uses a dev Azure Blob staging container. |
 | Ingestion routes without an operator role check | Mitigated (T1a done) | See "Route authorization" below. |
@@ -290,6 +323,4 @@ an expanded scope that is not required.
 
 **Mitigation (T1a, done):** add the existing `_require_ingestion_operator` check to these four routes. One line per route, test first, no new component.
 
-**Local:** App Service authentication does not run under Core Tools. Microsoft documents testing it locally by sending a hand-built, Base64-encoded `X-MS-CLIENT-PRINCIPAL` header ([Data API builder: test locally with X-MS-CLIENT-PRINCIPAL](https://learn.microsoft.com/azure/data-api-builder/concept/security/authenticate-easy-auth)).
-- Recommended: build that header with the `Ingestion.Operator` role and the tenant ID, and add no auth bypass flag to the code. This keeps the same code path as Azure.
-- Unknown: the local host address was not checked. Keep the host local-only.
+**Local:** App Service authentication does not run under Core Tools. Microsoft documents testing it locally by sending a hand-built, Base64-encoded `X-MS-CLIENT-PRINCIPAL` header ([Data API builder: test locally with X-MS-CLIENT-PRINCIPAL](https://learn.microsoft.com/azure/data-api-builder/concept/security/authenticate-easy-auth)). The maintained local runbook binds the host to localhost, builds the header with the `Ingestion.Operator` role and tenant ID, and adds no authentication bypass to application code.

@@ -6,7 +6,7 @@ import asyncio
 import time
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import quote, unquote, unquote_to_bytes, urlparse, urlsplit
+from urllib.parse import quote, unquote, unquote_to_bytes, urlparse, urlsplit, urlunsplit
 
 import httpx
 
@@ -583,6 +583,11 @@ def read_json_pages(
                 if not location:
                     raise ValueError("Graph delta reset omitted its location")
                 reset_location = validate_graph_paging_url(location)
+                if reset_location == request_url:
+                    parsed = urlsplit(reset_location)
+                    reset_location = urlunsplit(
+                        (parsed.scheme, parsed.netloc, parsed.path, "", "")
+                    )
                 if page_capture is not None:
                     page_capture.record_reset(request_url, page_count, reset_location)
                 raise DeltaResetRequired(reset_location)

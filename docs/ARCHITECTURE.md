@@ -5,31 +5,31 @@ description: System boundaries, flows, data contracts, security, and limitations
 
 For environment-variable ownership, defaults, accepted values, and runtime effects, see [CONFIGURATION.md](CONFIGURATION.md).
 
-The current implementation routes ingestion through the common Cosmos source registry and
-creates per-drive full-sync children. Requirements, decisions, and completion status for
-multi-SharePoint ingestion are in
-[MULTI_SHAREPOINT_SOURCES.md](MULTI_SHAREPOINT_SOURCES.md).
-
 ## System Overview
 
 ```mermaid
 flowchart LR
     subgraph Ingestion
-        Operator[Operator] -->|POST full-sync| Functions[Azure Functions<br/>Flex Consumption<br/>Durable Orchestrator]
-        Functions --> Graph[Microsoft Graph v1.0<br/>discovery + ACL + download]
-        Functions --> DI[Document Intelligence<br/>layout + figure crops]
-        Functions --> CU[Content Understanding<br/>document search]
-        Functions --> Language[Azure AI Language<br/>key phrases + entities]
-        Functions --> OpenAI[Azure OpenAI<br/>vision descriptions + embeddings]
-        Functions -->|stage audio| AudioStg[(Audio-staging<br/>Storage account)]
-        Functions -->|submit + poll batch| Speech[Azure AI Speech<br/>batch transcription]
+        Operator[Operator] -->|register / lifecycle / sync| Functions[Azure Functions<br/>Flex Consumption]
+        Functions --> Registry[(ingestion-sources<br/>source registry + lifecycle)]
+        Functions -->|parent full sync| Dispatcher[Multi-source Durable dispatcher]
+        Registry -->|accepted active sources| Dispatcher
+        Dispatcher -->|bounded per-source children| Child[Per-source orchestration]
+        Child --> Graph[Microsoft Graph v1.0<br/>discovery + ACL + download]
+        Child --> DI[Document Intelligence<br/>layout + figure crops]
+        Child --> CU[Content Understanding<br/>document search]
+        Child --> Language[Azure AI Language<br/>key phrases + entities]
+        Child --> OpenAI[Azure OpenAI<br/>vision descriptions + embeddings]
+        Child -->|stage audio| AudioStg[(Audio-staging<br/>Storage account)]
+        Child -->|submit + poll batch| Speech[Azure AI Speech<br/>batch transcription]
         Speech -->|reads staged audio| AudioStg
-        Functions --> Cosmos[(Cosmos DB NoSQL<br/>Strong consistency<br/>vectors + metadata)]
+        Child --> Cosmos[(Cosmos DB NoSQL<br/>Strong consistency<br/>vectors + metadata)]
     end
 
     subgraph Retrieval
         User[User] -->|query| FuncProxy[Function App<br/>query proxy]
         FuncProxy -->|service token + gateway context| RAG[Azure Container Apps<br/>Hybrid RAG Router]
+        RAG -->|capture + revalidate active sources| Registry
         RAG -->|plan_queries| OpenAIChat[Azure OpenAI<br/>Chat]
         RAG -->|simple: 1 query| Standard[Standard RAG<br/>embed → retrieve → generate]
         RAG -->|complex: 2+ queries| Agentic[Agentic RAG<br/>Agent Framework agent]
@@ -48,15 +48,20 @@ flowchart LR
 
 | Method | Route | Purpose |
 | --- | --- | --- |
-| POST | `/api/ingestion/full-sync` | Start durable full-sync orchestrator (fresh instance ID per run, returns 202) |
-| GET | `/api/ingestion/status` | Query orchestration instance status and output |
-| POST | `/api/ingestion/terminate` | Drain document work; finalize as TERMINATED only when registered permits settle, otherwise return 202 |
-| POST | `/api/ingestion/retry-failed` | Retry only the failed documents from the current run |
-| DELETE | `/api/ingestion/purge` | Delete items from a Cosmos container (targeted IDs or purge-all with confirmation) |
-| GET | `/api/ingestion/inspect` | Read up to 200 rows from allowlisted containers with Cosmos `_` system properties removed |
+| POST | `/api/ingestion/full-sync` | Start the parent multi-source dispatcher; it pages accepted registrations and runs active sources in a bounded child window |
+| GET | `/api/ingestion/status` | Query orchestration status; parent requests can page persisted per-source outcomes |
+| POST | `/api/ingestion/terminate` | Drain and recover one explicit `sourceId` and owner instance; finalize only when registered permits settle |
+| POST | `/api/ingestion/retry-failed` | Retry failed documents from one explicit active `sourceId` and its current run |
+| POST | `/api/ingestion/sources` | Validate and register one immutable SharePoint site/drive binding in `paused` state |
+| GET | `/api/ingestion/sources` | Page registered sources and their lifecycle state |
+| PATCH | `/api/ingestion/sources/{sourceId}` | Change `active`, `paused`, or final `retired` state under `If-Match` |
+| POST | `/api/ingestion/sources/{sourceId}/full-sync` | Start one source-specific full sync without rescanning other sources |
+| POST | `/api/ingestion/sources/{sourceId}/reprovision` | Rebuild an eligible retired source identity through the guarded reprovision contract |
+| DELETE | `/api/ingestion/purge` | Delete approved source-scoped manifests/chunks under coordinator maintenance, or exact catalog items; control and audit data are refused |
+| GET | `/api/ingestion/inspect` | Read a bounded diagnostic sample or an exact supported partition/recovery filter from allowlisted containers |
 | POST | `/api/query` | Proxy RAG queries to the retrieval service via `RETRIEVAL_SERVICE_URL` |
 | POST | `/api/webhook/sharepoint` | Receive Microsoft Graph change notifications (primary delta-sync trigger) |
-| POST | `/api/webhook/lifecycle` | Log Graph `reauthorizationRequired` lifecycle notifications for the subscribed drive |
+| POST | `/api/webhook/lifecycle` | Match Graph lifecycle notifications and renew, recreate, ignore, or delete the subscription according to source state |
 
 ### Retrieval (Azure Container Apps)
 
@@ -70,13 +75,62 @@ flowchart LR
 
 | Timer | Schedule | Purpose |
 | --- | --- | --- |
-| `reconciliation_timer` | Configurable (default daily 04:00 UTC) | Safety-net delta query — catches changes missed by webhooks |
-| `acl_resync_timer` | Configurable (default weekly Sunday 03:00 UTC) | Re-verify ACLs on already-ingested documents |
-| `lifecycle_reconcile_timer` | Configurable (default every 10 minutes) | Repair interrupted transitions and orphan chunks; remove older duplicate ready versions only when the current full-sync run supplies the ready winner |
-| `subscription_renew_timer` | Configurable (default daily 02:00 UTC) | Create or renew Microsoft Graph webhook subscription |
-| `audio_transcription_poll_timer` | Configurable (default every 5 minutes, `AUDIO_POLL_SCHEDULE`) | Finalize completed Speech batch transcriptions: build transcript, chunk, embed, publish, then delete the job and staged blob |
+| `reconciliation_timer` | Configurable (default daily 04:00 UTC) | For each accepted active source, run the safety-net delta query |
+| `acl_resync_timer` | Configurable (default weekly Sunday 03:00 UTC) | For each accepted active source, re-verify ACLs on ingested documents |
+| `lifecycle_reconcile_timer` | Configurable (default every 10 minutes) | Per source, repair interrupted transitions and orphan chunks; retired sources use the retirement reconciliation path |
+| `subscription_renew_timer` | Configurable (default daily 02:00 UTC) | Per accepted source, create, renew, ignore, or delete the Graph subscription according to lifecycle |
+| `audio_transcription_poll_timer` | Configurable (default every 5 minutes, `AUDIO_POLL_SCHEDULE`) | Per active source, release eligible ended owners, then finalize completed Speech jobs and clean remote artifacts |
 
-The Function App proxies `/api/query` to Azure Container Apps. Function routes use `AuthLevel.ANONYMOUS`, while App Service Authentication requires an Entra token for every path except `/api/webhook/*`. The SharePoint notification endpoint validates `clientState`; the lifecycle endpoint accepts and logs Graph lifecycle events. The query route additionally validates delegated user claims before creating the service-authenticated ACA request.
+The Function App proxies `/api/query` to Azure Container Apps. Function routes use `AuthLevel.ANONYMOUS`, while App Service Authentication requires an Entra token for every path except `/api/webhook/*`. The SharePoint notification endpoint validates `clientState`; the lifecycle endpoint matches the persisted subscription and applies the source-state action, but does not currently validate `clientState`. The query route additionally validates delegated user claims before creating the service-authenticated ACA request.
+
+## Multi-Source Ingestion Architecture
+
+The runtime has two levels: multi-source control and isolated per-source execution. The parent dispatcher limits concurrent child orchestrations; each child uses source-scoped coordinator ownership so conflicting operations cannot process the same drive at the same time.
+
+There are two supported full-sync entry points, and both share the same per-source child orchestration pattern:
+
+- `POST /api/ingestion/full-sync`: parent orchestration that scans accepted sources and starts a bounded child for each active source.
+- `POST /api/ingestion/sources/{sourceId}/full-sync`: direct single-source trigger used when an operator wants to run one site/drive without rescanning the rest of the registry.
+
+```mermaid
+flowchart TB
+    subgraph Control["Level 1 - Multi-source control"]
+        Operator[Operator] --> API[Ingestion API]
+        API --> Registry[(Source registry)]
+        Registry -->|accepted active sources| Dispatcher[Parent dispatcher<br/>bounded concurrency]
+        Dispatcher --> Aggregate[Aggregate status]
+        Aggregate --> API
+    end
+
+    subgraph Source["Level 2 - Per-source execution, repeated for each source"]
+        Child[Per-source orchestration]
+        Coordinator[(Drive coordinator<br/>exclusive operation owner)]
+        Graph[Microsoft Graph<br/>content, ACL, and delta]
+        Pipeline[Extract, enrich,<br/>chunk, and embed]
+        Store[(Cosmos DB<br/>documents and vectors)]
+        SourceStatus[Per-source status]
+
+        Child <-->|acquire and release ownership| Coordinator
+        Child --> Graph
+        Graph --> Pipeline
+        Pipeline --> Store
+        Child --> SourceStatus
+    end
+
+    Dispatcher -->|one isolated child per source| Child
+    API -->|single source| Single[Single-source full sync]
+    Single --> Child
+    Sites[SharePoint sites<br/>A ... N] --> Graph
+    SourceStatus --> Aggregate
+```
+
+### Why this boundary exists
+
+- One registry gives a single source of truth for accepted sources, lifecycle state, immutable drive bindings, and active/paused/retired transitions.
+- The parent dispatcher bounds concurrent child orchestrations. It is a control mechanism, not a separate ingestion service.
+- The drive coordinator is a source-scoped ownership guard. It prevents full sync, delta, ACL resync, lifecycle maintenance, and other conflicting operations from mutating the same drive concurrently.
+- Each child is source-isolated: it owns its run, document graph, ACL verification, and delta cursor. A failure in one source does not stop unrelated children.
+- The status model stays simple: the parent exposes overall orchestration state, while each child reports source-specific outcomes and counts.
 
 ## Ingestion Flow
 
@@ -84,7 +138,9 @@ The Function App proxies `/api/query` to Azure Container Apps. Function routes u
 sequenceDiagram
     actor Operator
     participant Starter as HTTP Starter
-    participant Orch as Durable Orchestrator
+    participant Registry as Source Registry
+    participant Parent as Multi-source Dispatcher
+    participant Orch as Per-source Child
     participant Graph as Microsoft Graph
     participant DI as Document Intelligence
     participant CU as Content Understanding
@@ -95,7 +151,15 @@ sequenceDiagram
     participant Cosmos as Cosmos DB
 
     Operator->>Starter: POST /api/ingestion/full-sync
-    Starter->>Orch: Start (fresh random instance ID, returns 202)
+    Starter->>Parent: Start parent (fresh instance ID, returns 202)
+    Parent->>Registry: Page accepted source registrations
+    loop Bounded window of active sources
+        Parent->>Orch: Start child with immutable source payload
+        Orch-->>Parent: Persist isolated source outcome
+    end
+    Note over Parent,Orch: Paused and retired sources are skipped, and one source failure does not stop unrelated children
+    Operator->>Starter: POST /api/ingestion/sources/{sourceId}/full-sync
+    Starter->>Orch: Or start one child directly
     Orch->>Cosmos: Activate run, update source-control.currentRunId
     Orch->>Graph: Discover files (BFS /children, paginated FolderCursor stack)
     Note over Orch: Skip if prior READY eTag and available sourceModifiedAt match
@@ -147,7 +211,8 @@ sequenceDiagram
         Orch->>Cosmos: Verify chunks and visual manifest, then mark document READY
     end
 
-    Orch->>Cosmos: Finalize run: recount from source-documents, set terminal status
+    Orch->>Cosmos: Finalize child: recount exact source/run partition
+    Parent->>Registry: Complete dispatch counts and paged outcomes
 ```
 
 ### Extraction by File Type
@@ -179,7 +244,9 @@ sequenceDiagram
     participant OAI as Azure OpenAI
     participant Cosmos as Cosmos DB
 
-    Timer->>Orch: Start (skip if a prior poll pass is running)
+    Timer->>Cosmos: Read active source and coordinator state
+    Timer->>Timer: Release eligible terminal zero-work owner after quiet period
+    Timer->>Orch: Start per-source poll (skip if a prior pass or writer is active)
     loop Pages of AUDIO_POLL_PAGE_SIZE transcribing documents
         Orch->>Act: call_activity
         Act->>Cosmos: List documents at stage TRANSCRIBING (page)
@@ -207,18 +274,23 @@ sequenceDiagram
 
 ## Delta Sync Flow
 
-Incremental sync via Microsoft Graph delta query. Triggered primarily by SharePoint webhooks (near-real-time); a daily reconciliation timer (default 04:00 UTC) runs the same delta query as a safety net. Each run processes only changed files since the last saved cursor.
+Incremental sync runs independently per accepted active source through its
+Microsoft Graph delta cursor. It is triggered primarily by a source-matched
+SharePoint webhook; the daily reconciliation timer enumerates all active
+sources and starts the same source-scoped flow as a safety net.
 
 ```mermaid
 sequenceDiagram
     participant Timer as Delta Sync Timer
+    participant Registry as Source Registry
     participant Orch as Durable Orchestrator
     participant Act as delta_sync_activity
     participant Graph as Microsoft Graph
     participant Pipeline as Process Pipeline
     participant Cosmos as Cosmos DB
 
-    Timer->>Orch: Start (skip if full-sync or prev tick running)
+    Timer->>Registry: Page accepted active sources
+    Timer->>Orch: Start per source (skip if its writer or previous tick is active)
     Orch->>Act: call_activity
     Act->>Cosmos: Read delta-control cursor
     alt No cursor exists (first run)
@@ -239,7 +311,7 @@ sequenceDiagram
                 Act->>Cosmos: Update allowedGroupIds on doc + chunks, or retire (acl_revoked)
             else Item added or updated
                 Act->>Pipeline: Full pipeline (ACL → extract → chunk → enrich → embed)
-                Note over Pipeline: Audio instead stages + submits a Speech batch job and parks at TRANSCRIBING; the audio poll timer finalizes it to READY later
+                Note over Pipeline: Audio instead stages + submits a Speech batch job and parks at TRANSCRIBING, and the audio poll timer finalizes it to READY later
                 Pipeline->>Cosmos: Write ineligible chunks, admit generation, then mark READY
                 Act->>Cosmos: Write document_ingested audit
                 Act->>Cosmos: Delete previous version + chunks (reason=superseded), write document_deleted audit
@@ -264,17 +336,22 @@ sequenceDiagram
 
 ## ACL Resync Flow
 
-Periodic re-verification of document permissions. Runs on a timer (default weekly Sunday at 03:00 UTC) and pages through ready, `acl_refreshing`, and `retired/acl_revoked` documents.
+Periodic source-scoped re-verification of document permissions. The timer
+enumerates accepted active sources (default weekly Sunday at 03:00 UTC), then
+each source pass pages through its ready, `acl_refreshing`, and
+`retired/acl_revoked` documents.
 
 ```mermaid
 sequenceDiagram
     participant Timer as ACL Resync Timer
+    participant Registry as Source Registry
     participant Orch as Durable Orchestrator
     participant Act as acl_resync_page_activity
     participant Graph as Microsoft Graph
     participant Cosmos as Cosmos DB
 
-    Timer->>Orch: Start (skip if full-sync or prev pass running)
+    Timer->>Registry: Page accepted active sources
+    Timer->>Orch: Start per source (skip if its writer or previous pass is active)
     loop Pages of ACL_RESYNC_PAGE_SIZE documents
         Orch->>Act: call_activity
         Act->>Cosmos: List ready, acl_refreshing, and acl_revoked documents (page)
@@ -308,13 +385,18 @@ sequenceDiagram
 
 ## Webhook-Driven Sync
 
-The primary change-detection mechanism is a Microsoft Graph webhook subscription on the SharePoint drive. The timer-based reconciliation (`reconciliation_timer`) runs daily as a safety net.
+The primary change-detection mechanism is one persisted Microsoft Graph
+webhook subscription per accepted source drive. Notifications are matched by
+subscription ID to the registered source, and only active matched sources can
+trigger delta processing. The timer-based reconciliation runs daily as a
+safety net.
 
 ```mermaid
 sequenceDiagram
     participant SP as SharePoint
     participant Graph as Microsoft Graph
     participant Webhook as POST /api/webhook/sharepoint
+    participant Registry as Source Registry
     participant Orch as delta_sync_orchestrator
     participant Act as delta_sync_activity
     participant Cosmos as Cosmos DB
@@ -322,11 +404,12 @@ sequenceDiagram
     Note over SP,Graph: User edits/adds/deletes a file
     SP->>Graph: Change event
     Graph->>Webhook: POST notification
-    Webhook->>Webhook: Validate clientState, check concurrency
+    Webhook->>Webhook: Validate clientState
+    Webhook->>Registry: Match subscription ID to accepted active source
     alt Full-sync or delta-sync already running
         Webhook-->>Graph: 200 OK within 3 seconds (skip)
     else No conflict
-        Webhook->>Orch: Start delta_sync_orchestrator
+        Webhook->>Orch: Start source-scoped delta_sync_orchestrator
         Webhook-->>Graph: 200 OK within 3 seconds after dispatch
         Orch->>Act: call_activity
         Act->>Graph: GET /root/delta (stored cursor)
@@ -346,28 +429,42 @@ sequenceDiagram
 ```mermaid
 sequenceDiagram
     participant Timer as subscription_renew_timer
+    participant Registry as Source Registry
     participant Graph as Microsoft Graph
     participant Hook as POST /api/webhook/lifecycle
     participant Cosmos as ingestion-runs
 
-    Timer->>Cosmos: Read persisted subscription ID
+    Timer->>Registry: Page accepted sources and lifecycle state
+    Timer->>Cosmos: Read each source's persisted subscription ID
     alt Subscription exists
         Timer->>Graph: PATCH expiration to now + 41,000 minutes
-    else Missing or renewal returns 404
+    else Active source missing subscription or renewal returns 404
         Timer->>Graph: POST drive root subscription
         Timer->>Cosmos: Persist replacement subscription ID
+    else Paused source
+        Note over Timer: Leave subscription unchanged and ignore notifications
+    else Retired source
+        Timer->>Graph: Delete persisted subscription
     end
     opt Graph requests reauthorization
         Graph->>Hook: reauthorizationRequired notification
+        Hook->>Registry: Match persisted subscription to accepted source
+        alt Active source
+            Hook->>Graph: Renew and recreate on 404
+        else Paused source
+            Note over Hook: Ignore
+        else Retired source
+            Hook->>Graph: Delete subscription
+        end
         Hook-->>Graph: 200 OK within 3 seconds
-        Note over Hook: Log only, with no immediate repair or clientState validation
+        Note over Hook: No clientState validation on lifecycle notifications
     end
 ```
 
 - **Subscription creation**: `subscription_renew_timer` creates a Graph subscription on `/drives/{driveId}/root` with `changeType: updated` and `Prefer: includesecuritywebhooks`. Graph validates each public HTTPS notification URL by requiring the decoded plain-text token and HTTP 200 response within 10 seconds. The subscription ID is stored in `ingestion-runs` (Cosmos).
 - **Renewal**: Graph permits a `driveItem` subscription lifetime of at most 42,300 minutes. The application requests 41,000 minutes and renews daily. An expired or deleted subscription cannot be renewed; a 404 causes creation of a replacement subscription, followed by the ordinary delta safety net.
-- **Lifecycle events**: For `driveItem`, Microsoft Graph supports only `reauthorizationRequired`; it does not send `missed` or `subscriptionRemoved`. The endpoint logs notifications without immediate repair. The next renewal timer recreates the subscription only when renewal reports it missing.
-- **Security**: Webhook endpoints are excluded from EasyAuth. SharePoint change notifications are validated by matching `clientState` (shared secret set via `WEBHOOK_CLIENT_STATE`). The lifecycle endpoint currently logs lifecycle events without validating `clientState`; subscription repair occurs on the next renewal timer.
+- **Lifecycle events**: For `driveItem`, Microsoft Graph supports only `reauthorizationRequired`; it does not send `missed` or `subscriptionRemoved`. The endpoint matches the persisted subscription, renews an active source immediately, recreates it on 404, ignores a paused source, and deletes a retired source subscription.
+- **Security**: Webhook endpoints are excluded from EasyAuth. SharePoint change notifications are validated by matching `clientState` (shared secret set via `WEBHOOK_CLIENT_STATE`). The lifecycle endpoint requires a known persisted subscription ID but currently does not validate `clientState`.
 - **Auto ACL resync on zero-delta**: When the delta feed returns zero content changes (`itemsSeen == 0`), the orchestrator automatically runs one page of ACL resync. This catches permission-only changes that Graph's `@microsoft.graph.sharedChanged` does not surface for library-level inheritance.
 
 ## Authentication Model
@@ -378,7 +475,7 @@ sequenceDiagram
 | SharePoint REST API | Certificate-based `CertificateCredential` | Same PFX, `https://{tenant}.sharepoint.com/.default` scope |
 | Cosmos DB, Doc Intelligence, Language AI | Managed Identity (`DefaultAzureCredential`) | User-assigned MI |
 | Azure OpenAI | MI token provider (`get_bearer_token_provider`) | `cognitiveservices.azure.com` scope |
-| Operator endpoints | App Service EasyAuth | Entra ID app registration |
+| Operator endpoints | App Service EasyAuth plus application role | Expected tenant and `Ingestion.Operator` role; the deployed API app registration and caller assignment must supply the role |
 | Function query gateway | Delegated user claims from EasyAuth | Requires expected tenant, exact audience, object ID, and `user_impersonation`; an `idtyp` claim, when present, must be `user` |
 | Function → retrieval | Function UAMI service token + bounded gateway context | ACA Authentication and application code validate audience, tenant, app/client ID, principal ID, and `Retrieval.Gateway` role |
 | Retrieval ACL resolution | Microsoft Graph `/transitiveMemberOf` | Retrieval UAMI resolves the gateway-supplied user object ID to security groups |
@@ -387,40 +484,59 @@ External app-registration prerequisites are Graph `Files.ReadWrite.All` for sour
 
 ## Security Model
 
-1. `SHAREPOINT_SITE_URL` is required. At client initialization, the ingestion service resolves that HTTPS site through Graph and verifies that its `/drives` relationship contains `SHAREPOINT_ASSIGNED_DRIVE_ID` as a `documentLibrary`. This binds site-local SharePoint group IDs to the configured drive before SharePoint REST expansion is enabled.
-2. Discovery finds all files matching configured extensions (BFS traversal)
-3. ACL verification reads `/permissions` for each file, extracts `grantedToV2`/`grantedToIdentitiesV2` group IDs and `siteGroup` IDs
-4. Site group IDs are resolved to their nested Entra security groups via SharePoint REST API (`/_api/web/sitegroups({id})/users`, filter `PrincipalType=4`)
-5. Each Entra group is verified via `GET /groups/{id}?$select=securityEnabled,groupTypes` — accepted only if `securityEnabled=true` and `groupTypes` does not contain `Unified`. Microsoft 365 groups are rejected even when security-enabled. A 404 means the group was deleted from Entra and is **skipped** (fail-safe)
-6. Sharing links → FAILED (rejected). No verified security groups found → FAILED (never retrievable)
-7. Retrieval requires: caller's transitive security groups ∩ document's `allowedGroupIds` ≠ ∅
-8. A candidate is searchable only when its chunk has `isRetrievable=true` and its point-read source manifest still has `status=ready`; retrieval does not rely on the full-sync current-run pointer.
+1. Source registration accepts one `sourceId`, HTTPS site URL, and drive ID. It resolves the site through Graph, proves the drive belongs to that site as a `documentLibrary`, rejects duplicate drive ownership, and persists the immutable binding in `ingestion-sources` as `paused`.
+2. Every timer, webhook, source-specific run, and parent child reconstructs its runtime configuration from an accepted registry record. Deployment bootstrap settings do not override a registered source binding.
+3. Only `active` sources are dispatched for ingestion and admitted by retrieval. `paused` and `retired` sources fail closed; retrieval captures one source-policy snapshot and revalidates cited sources before releasing generated context.
+4. Discovery finds all files matching configured extensions within the bound drive (BFS traversal).
+5. ACL verification reads `/permissions` for each file, extracts `grantedToV2`/`grantedToIdentitiesV2` group IDs and `siteGroup` IDs.
+6. Site group IDs are resolved to their nested Entra security groups via SharePoint REST API (`/_api/web/sitegroups({id})/users`, filter `PrincipalType=4`).
+7. Each Entra group is verified via `GET /groups/{id}?$select=securityEnabled,groupTypes` — accepted only if `securityEnabled=true` and `groupTypes` does not contain `Unified`. Microsoft 365 groups are rejected even when security-enabled. A 404 means the group was deleted from Entra and is **skipped** (fail-safe).
+8. Sharing links → FAILED (rejected). No verified security groups found → FAILED (never retrievable).
+9. With ACL enforcement enabled, retrieval additionally requires caller transitive groups ∩ document `allowedGroupIds` ≠ ∅. Disabling ACL does not disable source lifecycle policy.
+10. A candidate is searchable only when its chunk has `isRetrievable=true` and its point-read source manifest still has `status=ready`; retrieval does not rely on the full-sync current-run pointer.
 
 ## Data Model (Cosmos DB) Schema v1
 
 ```mermaid
 flowchart LR
     subgraph rag-db
+        C0[ingestion-sources<br/>partition: /sourceId<br/>immutable binding + lifecycle]
         C1[ingestion-runs<br/>partition: /sourceId]
         C2[source-documents<br/>partition: /sourceRunId]
         C3[search-chunks<br/>partition: /documentKey<br/>DiskANN + full-text indexes<br/>retrieval eligibility]
         C4[service-audit<br/>partition: /id<br/>best-effort audit, 90-day TTL]
         C5[retrieval-config<br/>partition: /deploymentInstanceId<br/>Mutable runtime catalog]
+        R[Retrieval source-policy gate]
     end
+    C0 -->|accepted source context| C1
+    C0 -->|active source policy| R
+    R -->|eligible source IDs| C3
     C1 -->|source-control.currentRunId| C2
     C2 -->|documentKey| C3
 ```
 
+### ingestion-sources (partition: /sourceId)
+
+- One schema-v1 registration per stable source ID, with source kind,
+  immutable site/drive binding, and `active`, `paused`, or `retired` desired
+  state.
+- State changes use Cosmos ETags; retirement is final unless the guarded
+  reprovision contract establishes a new lifecycle generation.
+- Source registration and lifecycle are the authority for parent dispatch,
+  timers, webhook routing, per-source coordinators, and retrieval eligibility.
+
 ### ingestion-runs (partition: /sourceId)
 
 - **source-control**: singleton pointer to `currentRunId`, `lastCompletedRunId`, and the current
-  full-sync orchestration instance ID (randomly generated per run, never reused \u2014 Durable
-  instance-ID reuse is best-effort/racy at the storage layer,
-  [Azure/azure-functions-durable-python#410](https://github.com/Azure/azure-functions-durable-python/issues/410))
+  full-sync orchestration instance ID, which is randomly generated per run and never reused
 - **delta-control**: singleton storing the Graph delta cursor for incremental sync
 - **delta-sync-trigger / acl-resync-trigger**: singleton pointers to the current delta-sync/ACL-resync
   orchestration instance ID, for the same reason as source-control above
 - **lifecycle-reconcile-trigger**: singleton pointer to the current lifecycle-reconciliation orchestration
+- **drive-coordinator and document-operation records**: per-source writer
+  ownership, active work accounting, and exact recovery identities
+- **source-dispatch records**: parent inventory staging, per-source outcomes,
+  and bounded outcome pagination
 - **webhook-subscription**: persisted Microsoft Graph subscription ID used by the renewal timer
 - **run records**: `ingestionMode`, status, stage, counters, `ProfileSnapshot` (extraction/chunking/enrichment/embedding config), timestamps
 
@@ -520,6 +636,8 @@ flowchart TD
     User -->|delegated query token| FuncProxy[Function App<br/>query gateway]
     FuncProxy -->|UAMI service token + gateway context| RAG[FastAPI on Azure Container Apps]
     RAG -->|resolve groups| Graph[Graph /transitiveMemberOf]
+    Sources[(Cosmos ingestion-sources<br/>active lifecycle policy)] --> Policy[Capture request source-policy snapshot]
+    RAG --> Policy
     RAG -->|plan_queries| OpenAI1[Azure OpenAI Chat]
     OpenAI1 -->|1..3 queries| RAG
     OpenAI1 -.->|LLM error| Fallback[Fallback: use original question]
@@ -534,16 +652,18 @@ flowchart TD
     SynonymGate -->|yes| Synonyms[Solr synonym expansion<br/>parameterized terms, max 8]
     SynonymGate -->|no| Retrieve[Embed query + ACL-filtered<br/>candidate retrieval]
     Synonyms --> Retrieve
-    Retrieve -->|hybrid / vector / full-text| Cosmos[(Cosmos search-chunks)]
+    Policy -->|eligible source IDs| Retrieve
+    Retrieve -->|hybrid / vector / full-text| Cosmos[(Cosmos search-chunks<br/>shared deployment or configured instances)]
     Cosmos -->|over-fetched pool, max 50| Rerank[ScoringProfileReranker<br/>text weights + sourceModifiedAt freshness<br/>sum / average / minimum / maximum]
     Rerank -->|Top-K standard evidence| OpenAI2[Azure OpenAI Chat<br/>answer generation]
-    OpenAI2 -->|answer + citations| RAG
+    OpenAI2 -->|answer + citations| Revalidate[Re-read cited source lifecycle + ETags]
+    Revalidate -->|unchanged and active| RAG
 
     Agentic -->|Agent Framework agent| AgentLoop[Reasoning Loop]
     AgentLoop -->|search_knowledge_base tool| Profile
     Rerank -->|Top-K tool evidence| AgentLoop
     AgentLoop -->|iterate until sufficient| AgentLoop
-    AgentLoop -->|final answer + citations| RAG
+    AgentLoop -->|final answer + citations| Revalidate
     RAG -->|validated response| FuncProxy
     FuncProxy -->|answer + citations| User
     Agentic -.->|timeout or error| Standard
@@ -558,6 +678,7 @@ sequenceDiagram
     participant RAG as FastAPI<br/>Azure Container Apps
     participant Graph as Microsoft Graph
     participant OAI as Azure OpenAI
+    participant Sources as ingestion-sources
     participant Cosmos as Cosmos DB
 
     User->>Proxy: POST /api/query with delegated Entra token
@@ -565,6 +686,7 @@ sequenceDiagram
     Proxy->>RAG: Function UAMI bearer token + gateway context + request ID
     RAG->>RAG: Validate service app identity, role, audience, tenant, and context
     RAG->>Graph: GET /users/{oid}/transitiveMemberOf/microsoft.graph.group (resolve ACL groups)
+    RAG->>Sources: Capture complete active-source policy snapshot
     RAG->>OAI: plan_queries (decompose question into 1..3 sub-queries)
     alt 1 query → Standard Path
         RAG->>RAG: Resolve scoring profile and optional synonym map
@@ -590,8 +712,9 @@ sequenceDiagram
         Note over RAG: Agent produces final answer
         RAG-->>RAG: Timeout/error → fallback to standard path
     end
+    RAG->>Sources: Revalidate every cited source lifecycle and registration ETag
     RAG->>Cosmos: Best-effort audit writes (planning, retrieval, generation, summary)
-    RAG-->>Proxy: {answer, citations[ref, source_name, url#page=N], request_id}
+    RAG-->>Proxy: {answer, citations[ref, source_name, location, url, temporal fields?], request_id}
     Proxy-->>User: 200 OK
 ```
 
@@ -608,7 +731,11 @@ If the agentic path times out (`AGENT_TIMEOUT_SECONDS`, deployed Bicep default 2
 
 - **ACL enforcement**: Both paths filter via caller's transitive security groups ∩ document's `allowedGroupIds`
 - **Retrieval modes**: `HYBRID` (default, RRF of vector + full-text), `VECTOR` only, `FULL_TEXT` only
-- **Multi-instance fan-out**: Both paths search all registered Cosmos instances via `CosmosRegistry`
+- **Source and instance fan-out**: Both paths search the configured
+  `CosmosRegistry`. The deployed topology uses one shared database whose chunks
+  carry `sourceId`; optional registry entries support additional Cosmos
+  instances. Source lifecycle eligibility is independent of physical instance
+  count.
 - **Agent guardrails**: the agent path and each search tool call share the configured agent deadline; `AGENT_MAX_ITERATIONS` is currently loaded but not wired into agent construction
 - **Query planning fallback**: If the LLM planner fails, the original question is used as a single query (standard path)
 - **Dependency failure**: zero results from successful searches means no authorized evidence; if every search fails or times out, the API returns HTTP 503. Partial success continues with `retrieval_degraded=true` telemetry.
@@ -628,8 +755,10 @@ Cosmos DB NoSQL's [`FULLTEXTSCORE`](https://learn.microsoft.com/en-us/azure/cosm
 ```mermaid
 flowchart LR
     Q["/api/query + optional scoring_profile and expand_synonyms"] --> RS[RagService.plan_queries]
+    SP[(ingestion-sources)] --> ELIG[Capture active source IDs]
     RS --> SYN[Resolve profile + optional SynonymExpander]
     SYN -->|parameterized terms, max 8| RET[SecureCosmosRetriever]
+    ELIG --> RET
     RET -->|"ORDER BY RANK RRF weighted, TOP N via global cap"| COS[(Cosmos search-chunks)]
     COS --> RET
     RET --> RR[ScoringProfileReranker<br/>text weights + sourceModifiedAt freshness<br/>sum / average / minimum / maximum]
@@ -675,14 +804,17 @@ is separate from ordinary direct editing; see [Azure setup](AZURE_SETUP.md#catal
 
 The query API accepts `{question, mode, history, top_k, scoring_profile, expand_synonyms}`. `question` is 1–4,000 characters, `mode` defaults to `hybrid`, and optional `top_k` is 1–20 with `MAX_EVIDENCE_CHUNKS` (default 5) used when omitted. `scoring_profile` selects a catalog profile; `expand_synonyms=false` disables expansion for that request.
 
-Each citation maps an in-answer `[S#]` marker to its source URL with a `#page=N` fragment (following the Azure RAG sample convention):
+Each citation maps an in-answer `[S#]` marker to a typed source location.
+Only PDF page citations append `#page=N` to the URL. Office and Markdown use
+section, slide, worksheet, or document labels; audio uses `start_ms` and
+`end_ms` temporal evidence.
 
 ```json
 {
   "answer": "The policy requires MFA [S1] and periodic reviews [S2]...",
   "citations": [
-    { "ref": "[S1]", "source_name": "Policy.pdf", "url": "https://...sharepoint.com/.../Policy.pdf#page=3" },
-    { "ref": "[S2]", "source_name": "Policy.pdf", "url": "https://...sharepoint.com/.../Policy.pdf#page=8" }
+    { "ref": "[S1]", "source_name": "Policy.pdf", "location": "Page 3", "url": "https://...sharepoint.com/.../Policy.pdf#page=3" },
+    { "ref": "[S2]", "source_name": "Meeting.flac", "location": "40-5960 ms", "url": "https://...sharepoint.com/.../Meeting.flac", "start_ms": 40, "end_ms": 5960 }
   ],
   "request_id": "uuid"
 }
@@ -730,8 +862,11 @@ Delta processing calls `process_document` once per changed item. Any failed item
 | Subscription Renew Schedule | `SUBSCRIPTION_RENEW_SCHEDULE` | `0 0 2 * * *` | NCRONTAB schedule for webhook subscription renewal |
 | ACL Resync Page Size | `ACL_RESYNC_PAGE_SIZE` | `50` | Documents per ACL resync activity call |
 | Lifecycle Reconcile Page Size | `LIFECYCLE_RECONCILE_PAGE_SIZE` | `50` | Items per lifecycle reconciliation activity call |
+| Audio Poll Page Size | `AUDIO_POLL_PAGE_SIZE` | `20` | Maximum `transcribing` documents processed in one source poll page |
+| Source Dispatch Page Size | `SOURCE_DISPATCH_PAGE_SIZE` | `10` | Registry page size and maximum concurrent parent full-sync child window |
 | Webhook Client State | `WEBHOOK_CLIENT_STATE` | (none) | Shared secret for Graph webhook notification validation |
-| SharePoint Site URL | `SHAREPOINT_SITE_URL` | Required | HTTPS site URL used for Graph site/drive ownership validation and SharePoint REST site-group resolution |
+| Ingestion Operator Role | `INGESTION_ADMIN_ROLE` | `Ingestion.Operator` | Required EasyAuth application role for ingestion management and diagnostic routes |
+| SharePoint Site URL | `SHAREPOINT_SITE_URL` | Required bootstrap value | Deployment bootstrap/default source value; accepted registry records provide the immutable per-source site binding at runtime |
 | Max Evidence Chunks | `MAX_EVIDENCE_CHUNKS` | `5` | Default top-K chunks retrieved per query (caller can override via `top_k` 1–20) |
 | Retrieval Timeout | `RETRIEVAL_TIMEOUT_SECONDS` | `5.0` | Wait bound for a retrieval fan-out; also passed to query embedding calls, but not configured as a Cosmos SDK query timeout |
 | Generation Timeout | `GENERATION_TIMEOUT_SECONDS` | `15.0` | Answer generation LLM call timeout |
@@ -791,7 +926,7 @@ Full sync re-discovers the drive. Before creating a new document record, discove
 
 - **Ingestion runtime**: Azure Functions Flex Consumption, Python 3.12
 - **Retrieval runtime**: Azure Container Apps, FastAPI + Uvicorn, Python 3.12
-- **Orchestration**: Durable Task Scheduler (MI-based auth), task hub name derived from `INGESTION_SOURCE_ID` (`${sourceId}-sync`, truncated to 45 chars)
+- **Orchestration**: Durable Task Scheduler (MI-based auth). One deployment task hub is named from the bootstrap `INGESTION_SOURCE_ID` (`${sourceId}-sync`, truncated to 45 chars); registered sources share that hub and remain isolated by source-scoped instance IDs, controls, coordinators, and partitions.
 - **Orchestration retention**: no explicit scheduler retention is deployed, so terminal instances use the 30-day default; status history is not permanent release evidence
 - **Termination boundary**: termination is queued and does not cancel already-running activities or suborchestrations; repository reconciliation remains required after operator termination
 - **Function timeout**: 30 minutes (`host.json`)
@@ -805,7 +940,8 @@ Full sync re-discovers the drive. Before creating a new document record, discove
 flowchart LR
     Ingestion[Ingestion Service] -->|write_audit_record| Audit[(service-audit<br/>Cosmos container)]
     Retrieval[Retrieval Service] -->|write_audit_records| Audit
-    Retrieval -->|optional Azure Monitor telemetry| AppInsights[Application Insights]
+    Ingestion -->|Azure Functions telemetry| AppInsights[Application Insights]
+    Retrieval -->|optional Azure Monitor telemetry| AppInsights
 ```
 
 - **Service audit** (Cosmos `service-audit`): Best-effort records for explicitly instrumented LLM calls, retrieval batches, extractions, enrichments, query summaries, and lifecycle events; items have a 90-day TTL
@@ -841,7 +977,7 @@ flowchart TB
 - **Private data services** — this deployment disables public access for Cosmos, Storage, Document Intelligence, and Language AI and connects through private endpoints. The certificate Key Vault is externally supplied; this template adds a private endpoint and RBAC but does not change the vault's existing public-access policy.
 - **Audio writer network posture** — when the audio writer is enabled, the dedicated Speech resource is private-only (private endpoint, MI auth) with an optional temporary allowed IP for a guarded transcription spike, and the audio-staging Storage account is reached over a private endpoint for Function writes while its public endpoint denies all traffic except the Speech resource instance that reads staged audio for batch transcription.
 - **Credential handling** — service access uses managed identities; the SharePoint application certificate is loaded from Key Vault. `WEBHOOK_CLIENT_STATE` remains a secure deployment parameter and Function app setting rather than a client secret embedded in source.
-- **Public surface** — the Function App is internet-facing. EasyAuth protects all paths except `/api/webhook/*`; the SharePoint webhook validates `clientState`, while the lifecycle webhook currently only parses and logs events. The ACA managed environment is configured as internal and receives query traffic through its private DNS name.
+- **Public surface** — the Function App is internet-facing. EasyAuth protects all paths except `/api/webhook/*`; the SharePoint webhook validates `clientState`, while the lifecycle webhook matches a persisted subscription and applies lifecycle actions without currently validating `clientState`. The ACA managed environment is configured as internal and receives query traffic through its private DNS name.
 - **Retrieval service network** — ACA connects to Cosmos DB via MI, Azure OpenAI via MI RBAC, and Microsoft Graph via MI token for ACL group resolution at query time
 - **Cross-RG access** — Azure OpenAI in a separate resource group, accessed via MI RBAC role (`Cognitive Services OpenAI User`) by both the Function App and the retrieval service
 - **Microsoft Graph dependency** — both runtimes call HTTPS endpoints at `graph.microsoft.com`. This repository does not configure a NAT gateway, route table, Function route-all setting, or outbound TLS policy, so the exact egress route and negotiated TLS version are environment behavior rather than an IaC guarantee.
@@ -857,6 +993,7 @@ The Function App uses one environment-neutral App Service Authentication contrac
 | `allowedApplications` | Required nonempty `FUNCTION_ALLOWED_CALLER_CLIENT_ID` list supplied through Bicep |
 | unauthenticated requests | Return HTTP 401 |
 | excluded paths | `/api/webhook/*` only |
+| ingestion management authorization | Application code requires `INGESTION_ADMIN_ROLE` (`Ingestion.Operator` by default); missing role returns HTTP 403 |
 
 The query gateway validates the EasyAuth user principal's tenant, exact audience, object ID, and `user_impersonation` scope. If the optional `idtyp` claim is present it must be `user`; existing registrations that omit `idtyp` are accepted. ACA Authentication independently accepts only the configured Function UAMI application and principal; retrieval application code repeats those checks and requires the `Retrieval.Gateway` app role.
 
@@ -887,7 +1024,7 @@ AKS manifests remain under `app/retrieval/kubernetes/`, but `infra/main.bicep` h
 
 | # | Use Case | Description |
 | --- | --- | --- |
-| UC-1 | Full-sync ingestion | BFS discovery of all files in a SharePoint drive with parallel fan-out processing in configurable waves |
+| UC-1 | Multi-source full-sync ingestion | Parent dispatch pages accepted registrations and runs active sources in a bounded child window; each child performs BFS discovery and document-wave fan-out within its bound drive |
 | UC-2 | Incremental delta-sync | Process only added, modified, or deleted files since the last cursor via Microsoft Graph Delta API |
 | UC-3 | Webhook-driven real-time sync | Graph change notifications trigger delta-sync immediately; daily reconciliation timer as safety net |
 | UC-4 | Five-format semantic and visual extraction | Direct Markdown plus one selected provider: Content Understanding takes precedence when enabled; otherwise Document Intelligence handles PDF and native Office semantics with rendered Office visual augmentation |
@@ -917,7 +1054,7 @@ AKS manifests remain under `app/retrieval/kubernetes/`, but `infra/main.bicep` h
 | UC-23 | Agentic fallback | Timeout or error on the agentic path falls back to the standard path using already-planned queries |
 | UC-24 | ACL-filtered search | Require retrievable chunks, ready manifests, and an intersection between caller security groups and `allowedGroupIds` |
 | UC-25 | Three retrieval modes | Hybrid (RRF of vector + full-text), vector-only (DiskANN), full-text-only (BM25) |
-| UC-26 | Multi-instance Cosmos fan-out | Query multiple Cosmos instances (one per source) in parallel via `CosmosRegistry` |
+| UC-26 | Source-aware Cosmos fan-out | Query the deployed shared source-tagged database and any additionally configured Cosmos instances in parallel through `CosmosRegistry`, constrained by the captured active-source policy |
 | UC-27 | Scoring profiles and freshness | Rerank one ACL-trimmed candidate pool with configured text weights and `sourceModifiedAt` freshness using sum, average, minimum, or maximum aggregation |
 | UC-28 | Synonym expansion | Apply the profile's Solr synonym map when deployment, profile, and request controls enable it |
 | UC-29 | Prompt injection defense | Hardened system prompt + regex chunk sanitization + `[S#]` input segmentation |
@@ -933,14 +1070,14 @@ AKS manifests remain under `app/retrieval/kubernetes/`, but `infra/main.bicep` h
 | UC-34 | Service audit trail | Best-effort Cosmos records for explicitly instrumented service calls and lifecycle events, retained for 90 days by default |
 | UC-35 | Azure Monitor telemetry | Retain optional Monitor setup with GenAI instrumentation disabled; see [Observability](#observability) |
 | UC-36 | Health probes | Liveness (`/health/live`) and readiness (`/health/ready` with Cosmos connectivity check) endpoints |
-| UC-37 | Inspect endpoint | Read up to 200 rows from `ingestion-runs`, `source-documents`, `search-chunks`, `service-audit`, or `retrieval-config` with Cosmos `_` system properties removed; `runId` filtering is valid only for the `source-documents` `/sourceRunId` partition, and `retrieval-config` requires an explicit `deploymentInstanceId` partition |
+| UC-37 | Inspect endpoint | Read up to 200 rows from allowlisted containers; exact filters support `sourceId` + `runId` source-document partitions, `documentKey` chunk partitions, and source/owner unresolved-work recovery queries; `retrieval-config` requires `deploymentInstanceId` |
 
 ## Known Limitations and Future Work
 
 | # | Limitation | Impact | Future Direction |
 | --- | --- | --- | --- |
 | L1 | **Office extraction limits**: Document Intelligence native Office analysis does not extract embedded images and does not analyze XLSX tables. Speaker notes, comments, tracked changes, external images, OLE objects, macros, animations, audio/video, and password-protected packages are outside the extraction contract. Hidden slides and worksheets are excluded. Required OOXML visuals are paired to rendered-PDF figures by count and order because the services provide no shared object identity; any mismatch fails extraction. | Detected omissions are audited but are not searchable; password-protected or invalid packages and visual-pairing mismatches fail extraction | Validate count/order pairing against the release corpus, and add support only with an approved extraction and coverage contract for each object type |
-| L2 | **Single SharePoint drive** — One `SHAREPOINT_ASSIGNED_DRIVE_ID` per deployment. Multiple document libraries or sites need separate deployments. | Limits multi-library organizations to N deployments | Complete the source-registry, source-context propagation, webhook routing, lifecycle isolation, migration, and load design described in `MULTI_LIBRARY_DESIGN.md` |
+| L2 | **Multi-source capacity beyond the validated scope is unproven** — The deployed registry and dispatcher have no configured 20-source business limit, but Azure E2E has proven only two concurrent active sources plus one paused source. | Do not infer production capacity, latency, or RU requirements for 20+ sites from the two-source result | Run a measured capacity test with representative document counts, change rates, audio mix, Graph throttling, Cosmos RU, Function concurrency, and recovery objectives before setting an organizational source limit |
 | L3 | **Single tenant** — Both ingestion and retrieval are locked to one Entra tenant. Cross-tenant and B2B guest scenarios are not supported. | Cannot serve users from partner tenants | Requires multi-tenant EasyAuth config and cross-tenant Graph consent |
 | L4 | **English-only full-text search** — Cosmos full-text index is hardcoded to `en-US`. Non-English documents have degraded BM25 relevance. | Multilingual corpora rank poorly on full-text queries | Make `defaultLanguage` a Bicep parameter; consider per-document language detection |
 | L5 | **No streaming response** — Query API returns the complete answer as a single JSON payload. No SSE or chunked transfer for progressive token delivery. | Higher perceived latency for long answers | Switch to `stream=True` on the OpenAI call and yield SSE events from FastAPI |
@@ -953,5 +1090,5 @@ AKS manifests remain under `app/retrieval/kubernetes/`, but `infra/main.bicep` h
 | L12 | **No image-vector retrieval or query-time image input**: visuals are represented by bounded factual text descriptions and use the existing text embedding path. | Pure visual-similarity searches and image queries are unsupported | Add a separate multimodal retrieval design only when requirements and evaluation evidence justify it |
 | L13 | **No individual user ACL** — Only Entra security groups are accepted. Files shared directly with a single user (not via group) are rejected. | Direct-share-only files are not retrievable | Extract `user` identities from `grantedToV2` and match against caller's `oid` |
 | L14 | **No cumulative cap across operator retries** — each `POST /api/ingestion/retry-failed` request resets `attemptCount` to zero before the bounded activity retry loop. The endpoint can be invoked repeatedly for a chronically failing document. | Repeated operator retries can incur extraction/embedding cost without a persisted cumulative limit | Persist and enforce an operator retry policy before resetting failed documents |
-| L15 | **Function App admin endpoints lack per-user role enforcement** — EasyAuth `requireAuthentication` + `allowedApplications` restrict which client apps can call the API, but no endpoint checks the caller's Entra role. `require_easy_auth_role()` exists in code but is unused in `function_app.py`. | Any user of an allowed client application can call destructive endpoints (`purge`, `terminate`) | Call `require_easy_auth_role()` with an `Ingestion.Admin` app role check at the top of each admin/destructive endpoint |
-| L16 | **Inspect endpoint is a bounded diagnostic sample, not a bulk export API** — Responses are capped at 200 rows. `retrieval-config` is allowlisted read-only and requires an explicit `deploymentInstanceId` partition. | Large containers cannot be downloaded completely through the Function endpoint, and a 200-row response does not prove the container has only 200 rows. | Use an approved private-network export mechanism when complete container snapshots are required; keep the public diagnostic endpoint bounded. |
+| L15 | **Lifecycle webhook has weaker request validation** — EasyAuth excludes webhook paths; change notifications validate `clientState`, but lifecycle notifications rely on matching a persisted subscription ID and do not validate `clientState`. | A caller that knows a valid subscription ID can trigger bounded renew/recreate/ignore/delete handling according to the already-authoritative source state | Validate the lifecycle notification's client state or equivalent Graph-origin contract before processing |
+| L16 | **Inspect endpoint is bounded and filter-specific, not a bulk export API** — Responses are capped at 200 rows. Exact partition and recovery filters prove only the requested partition/owner scope; unfiltered samples do not prove total container counts. | Large containers cannot be downloaded completely through the Function endpoint, and a 200-row cross-partition response does not prove absence or completeness | Use exact supported filters for operational assertions and an approved private-network export when a complete snapshot is required |

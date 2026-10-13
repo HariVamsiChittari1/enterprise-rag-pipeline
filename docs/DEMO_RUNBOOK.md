@@ -12,7 +12,7 @@ This runbook validates the deployed Function gateway, ACA retrieval service, ing
 | Catalog digest | `sha256:fa3dbe6736debdba0bfc14743e9cea63da5b41cab691795e7acf111d82b6b303` |
 | Catalog ETag | `"12012308-0000-0200-0000-6aa28be50000"` |
 | Active sources | `sharepoint-drive`, `poc-pg` |
-| Paused source | `poc-auth` |
+| Retired source | `poc-auth` |
 
 Validated evidence:
 
@@ -21,13 +21,17 @@ Validated evidence:
 - all six standard/agentic by hybrid/vector/full-text scenarios passed with five citations and no degradation;
 - source A, source B, and audio transcript questions returned grounded citations;
 - audio citation included the `40–5960 ms` time range; and
-- pausing `poc-pg` produced grounded no-evidence with zero `poc-pg` citations, then active state was restored.
+- pausing `poc-pg` produced grounded no-evidence with zero `poc-pg` citations, then active state was restored;
+- a controlled delta rebaseline, no-change round, incremental item, audio settlement, and fixture cleanup passed without changing `sharepoint-drive`;
+- the four ACL states passed sequentially with one real delegated identity, and its original Both membership was restored; and
+- `poc-auth` retirement completed, reactivation was blocked, and both active sources remained unchanged and retrievable.
 
-Remaining limits: the Azure four-principal ACL allow/deny matrix and a controlled delta change are not yet demonstrated. Do not claim those as completed in the demo.
+The ACL evidence covers four membership states, not four distinct users. Do not
+claim that four separate delegated identities were tested.
 
 ### Ten-minute rehearsal
 
-1. Show the three-source inventory and identify the two active sources and paused source.
+1. Show the three-source inventory and identify the two active sources and retired source.
 2. State the clean-ingestion results above; do not rerun audio ingestion during a short demo.
 3. Query the Password and Authentication Policy to show source-A citations.
 4. Query the Dummy Loan Policy to show source-B citations.
