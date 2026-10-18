@@ -15,42 +15,83 @@ Do not mutate resources until the target and artifact identity are unambiguous.
 
 ## Authentication Failures
 
+### Local Azure SDK authentication fails
+
+The local application accepts only `AZURE_AUTH_MODE=service_principal`. In the
+same PowerShell process that starts Python or Functions, confirm the tenant and
+client IDs and whether a secret exists without printing its value:
+
+```powershell
+[pscustomobject]@{
+  mode = $env:AZURE_AUTH_MODE
+  tenant = $env:AZURE_TENANT_ID
+  client = $env:AZURE_CLIENT_ID
+  secretPresent = -not [string]::IsNullOrWhiteSpace($env:AZURE_CLIENT_SECRET)
+}
+```
+
+- `AzureCredentialConfigurationError` means the mode is missing/unknown or a
+  required variable is empty. Reload all four values using the
+  [secret-safe procedure](LOCAL_DEVELOPMENT.md#stage-5-load-the-approved-local-application-identity).
+- An Entra authentication failure with complete variables usually means the
+  secret expired/was revoked, the value is wrong, or the tenant/client pair
+  does not identify the same app. Check the owner's non-secret credential ID
+  and expiry record; re-enter the secret rather than printing it.
+- HTTP 403 after token acquisition means authentication succeeded but the
+  service principal lacks the required data-plane role at the exact
+  development resource/container scope. Do not add Contributor, Owner, account
+  keys, or production access.
+- DNS, timeout, firewall, or private-endpoint failures are network failures;
+  changing credentials cannot bypass them.
+
+Azure CLI, VS Code, Azure PowerShell, cached user tokens, and broker identities
+are intentionally ignored. Do not use them as a workaround. When finished,
+stop child processes and clear the four variables using
+[Stage 10](LOCAL_DEVELOPMENT.md#stage-10-stop-the-local-environment).
+
+### Deployed Function or ACA managed identity fails
+
+Deployed workloads must have `AZURE_AUTH_MODE=managed_identity`, their existing
+user-assigned managed-identity client ID, and no `AZURE_CLIENT_SECRET`. Verify
+the identity remains assigned to the workload and retains the resource-scoped
+RBAC/Graph roles before changing code. A local client secret is never a
+deployment recovery mechanism.
+
 ### Function returns 401
 
 Check that the token:
 
 - Uses exactly `FUNCTION_API_AUDIENCE`.
 - Comes from an application in `FUNCTION_ALLOWED_CALLER_CLIENT_ID`.
-- Represents a user and includes `user_impersonation` for `/api/query`.
 - Uses the expected tenant.
 
 A Function master key does not bypass EasyAuth.
 
-### Function query returns `retrieval_auth_failed`
+### ACA query returns 401
 
 Verify:
 
-- `RETRIEVAL_SERVICE_URL` is the expected ACA private FQDN.
-- `RETRIEVAL_SERVICE_SCOPE` targets the retrieval API.
-- ACA Authentication allows the Function UAMI client and principal.
-- The Function UAMI has `Retrieval.Gateway` on the retrieval API application.
-- Retrieval settings contain the matching gateway client/principal IDs and audience.
-
-Do not forward or synthesize a user `X-MS-CLIENT-PRINCIPAL` to ACA. The Function creates `X-RAG-GATEWAY-CONTEXT` and `X-RAG-REQUEST-ID` after validating the delegated user.
+- The delegated token uses the retrieval API audience and expected tenant.
+- The token contains `user_impersonation` and represents a user.
+- ACA built-in authentication is enabled and unauthenticated requests return 401.
+- The client does not synthesize `X-MS-CLIENT-PRINCIPAL`; ACA injects it.
 
 ## Full Sync Has Failed or Stuck Documents
 
 Inspect the current run and source documents:
 
 ```powershell
+$sourceId = '<registered-source-id>'
 $rows = (Invoke-RestMethod `
-  -Uri "$baseUrl/api/ingestion/inspect?container=source-documents&limit=200" `
+  -Uri "$baseUrl/api/ingestion/inspect?container=source-documents&sourceId=$sourceId&limit=200" `
   -Headers $headers).rows
 $rows | Where-Object status -ne 'ready' |
   Select-Object sourceName, status, stage, attemptCount, error
 ```
 
-The inspect endpoint is capped at 200 rows. `runId` partition filtering applies only to `source-documents`; omit it for other containers.
+The inspect endpoint is capped at 200 rows. Registered document/chunk container
+inspection requires `sourceId`. `runId` partition filtering applies only to
+`source-documents`; omit it for other containers.
 
 If the orchestration must be terminated:
 
@@ -98,8 +139,27 @@ Verify:
 - `SHAREPOINT_SITE_URL` is present, HTTPS, and resolves to the configured drive.
 - The ingestion app has the required Graph and SharePoint application permissions and site grant.
 - The certificate secret is readable by the Function UAMI.
-- SharePoint site groups contain Entra security groups, not only direct users or sharing links.
+- At least one direct Entra group or SharePoint site-group member resolves to a
+  verified Entra security group.
 - Entra groups return `securityEnabled=true` and `groupTypes` does not contain `Unified`.
+
+Interpret the outcome before changing permissions:
+
+- `aclStatus=Verified` with nonempty `allowedGroupIds` means admission succeeded.
+  `aclFeedback` values such as `SharedLink`, `DirectUser`, `SiteGroup`,
+  `InvalidGroup`, `InvalidIdentity`, `UnifiedGroup`, or `UnsupportedRole` are
+  observations only and do not grant access.
+- `unsafe_acl:no_verified_security_groups` means complete evaluation found no
+  authorizing group. Link-only, user-only, disabled-group, deleted-group, and
+  `Unified`-only files are intentionally rejected or ACL-retired.
+- Paging limits, invalid top-level Graph responses, throttling, timeouts, and
+  permission-service failures are dependency failures. They must retry or fail
+  closed; do not misclassify them as a no-group business outcome.
+- When `allowedGroupIds` are unchanged, ACL resync can update only document
+  feedback. Chunks deliberately omit `aclStatus` and `aclFeedback`.
+
+Never grant a broader Graph or SharePoint permission merely to suppress
+`aclFeedback`, and never copy a sharing URL or token into logs or diagnostics.
 
 An ACL-revoked document can be restored only when its current source eTag matches, no active version exists, and it is the authoritative matching historical version.
 
@@ -107,7 +167,11 @@ An ACL-revoked document can be restored only when its current source eTag matche
 
 - Resolve the random instance ID from the `delta-sync-trigger` control record.
 - Inspect the exact orchestration output.
-- Any failed delta item retains the previous cursor; a later tick replays the round.
+- Retryable, internal, and unclassified delta failures retain the previous cursor;
+  a later tick replays the round.
+- A terminal source-version failure is quarantined. Matching prior ready versions
+  are retired before that item settles; retirement or identity conflicts retain
+  the previous cursor.
 - A `410 Gone` cursor causes reset and re-bootstrap handling. The replacement cursor is persisted only after the reset round succeeds; a failed round intentionally replays from the prior durable state.
 - A full sync or prior delta run can intentionally suppress a new trigger.
 
@@ -187,17 +251,19 @@ Do not enable public access, add account keys, or replace managed identity with 
 
 ## Query Failures
 
-| Function error code | Meaning |
+| ACA/retrieval outcome | Meaning |
 | --- | --- |
-| `unauthorized` | Delegated user claims failed validation |
-| `gateway_not_configured` | Retrieval URL or service scope is missing/invalid |
-| `retrieval_auth_failed` | ACA/retrieval rejected Function service authentication |
-| `retrieval_unavailable` | Retrieval returned a server error |
-| `invalid_retrieval_response` | Retrieval returned malformed, oversized, or incompatible JSON |
-| `retrieval_request_failed` | Retrieval returned another 4xx response |
-| `retrieval_timeout` | Function proxy deadline expired |
+| Platform 401/403 | Token, tenant, audience, client application, or ACA policy rejected the request before application code |
+| `invalid_authenticated_principal_header` | ACA principal header is missing or ambiguous; callers must not synthesize it |
+| `security_groups_unresolved` | Graph group resolution failed or returned an invalid contract; this is not the valid zero-membership case |
+| HTTP 200 with no citations | Authenticated caller has no authorized evidence, the selected source is paused/ineligible, or the question has no grounded evidence |
+| `retrieval_dependency_unavailable` | Every submitted retrieval task failed or timed out |
+| `answer_citation_invalid` | Generated references failed the application integrity check |
+| `operation_timeout` | Retrieval exceeded the ACA operation deadline |
 
-Use `request_id` to correlate Function logs, ACA logs, and `service-audit`. The audit container is best-effort and has a 90-day TTL.
+Use `request_id` to correlate ACA logs and `service-audit`. The audit container
+is best-effort and has a 90-day TTL. Do not treat the canonical HTTP 200
+no-evidence response as an authentication or Graph dependency failure.
 
 ## Cosmos Vector Results or Throttling
 

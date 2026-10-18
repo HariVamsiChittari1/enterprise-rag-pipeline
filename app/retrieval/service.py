@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import json
 import re
-import time
 import threading
+import time
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from copy import deepcopy
 from dataclasses import asdict, dataclass
@@ -17,20 +17,29 @@ import structlog
 from openai import BadRequestError
 
 from retrieval.auth import Principal
-from retrieval.catalog import RequestPolicy, RuntimeCatalogSnapshot, UnknownScoringProfileError
-from retrieval.cosmos import MAX_CANDIDATE_POOL_TOTAL, RetrievalMode, RetrievedChunk, SecureCosmosRetriever
+from retrieval.catalog import (
+    RequestPolicy,
+    RuntimeCatalogSnapshot,
+    UnknownScoringProfileError,
+)
+from retrieval.cosmos import (
+    MAX_CANDIDATE_POOL_TOTAL,
+    RetrievalMode,
+    RetrievedChunk,
+    SecureCosmosRetriever,
+)
 from retrieval.cosmos_registry import CosmosRegistry
 from retrieval.pipeline import (
-    citation_source,
-    RetrievalDependencyError,
     RetrievalBatchStatus,
+    RetrievalDependencyError,
     allocate_candidate_budget,
     citation_label,
+    citation_source,
     evidence_identity,
     merge_ranked_results,
 )
-from retrieval.scoring import ScoringProfile, ScoringProfileReranker
 from retrieval.runtime_catalog import RuntimeCatalogProvider
+from retrieval.scoring import ScoringProfile, ScoringProfileReranker
 from retrieval.source_policy import SourcePolicyReader, SourcePolicySnapshot
 from retrieval.synonyms import SynonymExpander
 
@@ -134,7 +143,6 @@ class RagService:
         max_planned_queries: int = 3,
         *,
         catalog_provider: RuntimeCatalogProvider,
-        acl_enabled: bool = True,
         source_policy_reader: SourcePolicyReader | None = None,
     ) -> None:
         self._openai = openai_client
@@ -145,7 +153,6 @@ class RagService:
         self._generation_timeout_seconds = generation_timeout_seconds
         self._max_evidence = max_evidence
         self._max_planned_queries = max_planned_queries
-        self._acl_enabled = acl_enabled
         self._source_policy_reader = source_policy_reader
         self._catalog_provider = catalog_provider
         max_workers = _CONCURRENT_REQUESTS_FACTOR * max_planned_queries * max(1, len(registry))
@@ -186,7 +193,9 @@ class RagService:
         scoring_profile: str | None = None,
         expand_synonyms: bool | None = None,
         *,
+        source_id: str | None = None,
         policy: RequestPolicy | None = None,
+        source_policy_snapshot: SourcePolicySnapshot | None = None,
     ) -> dict[str, Any]:
         policy = policy or self.capture_policy(scoring_profile, expand_synonyms)
         queries, usage = self.plan_queries(question, history)
@@ -194,6 +203,8 @@ class RagService:
             question, queries, principal, mode=mode, usage=usage,
             scoring_profile=scoring_profile,
             expand_synonyms=expand_synonyms, policy=policy,
+            source_id=source_id,
+            source_policy_snapshot=source_policy_snapshot,
         )
 
     def answer_with_queries(
@@ -207,7 +218,9 @@ class RagService:
         scoring_profile: str | None = None,
         expand_synonyms: bool | None = None,
         *,
+        source_id: str | None = None,
         policy: RequestPolicy | None = None,
+        source_policy_snapshot: SourcePolicySnapshot | None = None,
     ) -> dict[str, Any]:
         """Generate an answer using pre-planned queries (skips re-planning)."""
         policy = policy or self.capture_policy(scoring_profile, expand_synonyms)
@@ -216,7 +229,8 @@ class RagService:
             raise ValueError("question_length_invalid")
         if usage is None:
             usage = []
-        source_policy_snapshot = self.capture_source_policy()
+        if source_policy_snapshot is None:
+            source_policy_snapshot = self.capture_source_policy(source_id)
         search_result = self.search(
             normalized_question,
             queries,
@@ -288,6 +302,7 @@ class RagService:
         now: datetime | None = None,
         policy: RequestPolicy | None = None,
         source_policy_snapshot: SourcePolicySnapshot | None = None,
+        source_id: str | None = None,
         validate_source_policy: bool = True,
     ) -> SearchResult:
         """Execute the shared standard/agent retrieval policy without generation."""
@@ -299,7 +314,7 @@ class RagService:
             expander.expand(normalized) if expander is not None else [normalized]
         )
         if self._source_policy_reader is not None and source_policy_snapshot is None:
-            source_policy_snapshot = self.capture_source_policy()
+            source_policy_snapshot = self.capture_source_policy(source_id)
         usage: list[dict[str, Any]] = []
         chunks = self._retrieve_evidence(
             queries,
@@ -321,6 +336,8 @@ class RagService:
         self,
         chunks: list[RetrievedChunk],
         expected_sources: Mapping[str, Any] | None = None,
+        *,
+        source_id: str | None = None,
     ) -> None:
         """Re-read source policy immediately before releasing generated context."""
         if not chunks:
@@ -328,7 +345,7 @@ class RagService:
         snapshot = (
             SourcePolicySnapshot(tuple(expected_sources.values()))
             if expected_sources is not None
-            else self.capture_source_policy()
+            else self.capture_source_policy(source_id)
         )
         self._validate_source_policy(snapshot, chunks)
 
@@ -368,17 +385,35 @@ class RagService:
         effective_max = max_k or self._max_evidence
         planned = queries[:self._max_planned_queries]
         if self._source_policy_reader is not None:
-            source_policy_snapshot = source_policy_snapshot or self.capture_source_policy()
+            if source_policy_snapshot is None:
+                raise RetrievalDependencyError("source_policy_unavailable")
+            if len(source_policy_snapshot.sources) != 1:
+                return []
+            source_policy = source_policy_snapshot.sources[0]
+            acl_enabled = source_policy.retrieval_acl_enabled
             eligible_source_ids = source_policy_snapshot.eligible_source_ids
             if not eligible_source_ids:
                 return []
+            try:
+                instances = [(
+                    source_policy.source_id,
+                    self._registry.resolve(source_policy),
+                )]
+            except Exception as error:
+                raise RetrievalDependencyError(
+                    "retrieval_dependency_unavailable",
+                ) from error
         else:
             eligible_source_ids = None
+            instances = None
+            acl_enabled = True
         over_fetch = None if profile is None else policy.snapshot.over_fetch_factor
         successful_results, candidate_budget, instances = self._run_retrieval_batch(
             planned, principal, mode, usage, effective_max, expander,
             raw=profile is not None, over_fetch_factor=over_fetch, policy=policy,
             eligible_source_ids=eligible_source_ids,
+            instances=instances,
+            acl_enabled=acl_enabled,
         )
 
         if profile is None:
@@ -410,6 +445,8 @@ class RagService:
         raw: bool,
         over_fetch_factor: int | None,
         eligible_source_ids: list[str] | None = None,
+        instances: list[tuple[str, SecureCosmosRetriever]] | None = None,
+        acl_enabled: bool | None = None,
     ) -> tuple[list[Any], int, list[tuple[str, SecureCosmosRetriever]]]:
         """Shared fail-closed retrieval fan-out for production and evaluation.
 
@@ -418,7 +455,7 @@ class RagService:
         ``RetrievalBatchStatus.ensure_available()``. Callers decide whether to
         merge typed chunks or rerank a raw pool with a profile.
         """
-        instances = self._registry.items()
+        instances = self._registry.items() if instances is None else instances
         task_specs = [
             (query, retriever)
             for query in planned
@@ -440,7 +477,7 @@ class RagService:
                 self._retrieve_for_query,
                 query, retriever, principal, mode, usage, usage_lock,
                 allocation, 1, raw, expander, policy,
-                eligible_source_ids,
+                eligible_source_ids, acl_enabled,
             )
             for (query, retriever), allocation in zip(task_specs, allocations)
             if allocation > 0
@@ -615,13 +652,16 @@ class RagService:
         expander: SynonymExpander | None,
         policy: RequestPolicy,
         eligible_source_ids: list[str] | None,
+        acl_enabled: bool | None,
     ) -> list[RetrievedChunk] | list[dict[str, Any]]:
+        if acl_enabled is not False and not principal.acl_ids:
+            return []
         embedding = [] if mode is RetrievalMode.FULL_TEXT else self._embed(query, usage, usage_lock)
         search_terms = expander.expand(query) if expander is not None else None
         return retriever.retrieve(
             query,
             embedding,
-            principal.acl_ids if self._acl_enabled else [],
+            principal.acl_ids if acl_enabled is not False else [],
             mode=mode,
             top_k=top_k,
             over_fetch_factor=over_fetch_factor,
@@ -630,14 +670,17 @@ class RagService:
             raw=raw,
             search_terms=search_terms,
             eligible_source_ids=eligible_source_ids,
+            acl_enabled=acl_enabled,
         )
 
-    def capture_source_policy(self) -> SourcePolicySnapshot | None:
+    def capture_source_policy(self, source_id: str | None) -> SourcePolicySnapshot | None:
         """Capture active source policy once for a retrieval request."""
         if self._source_policy_reader is None:
             return None
+        if not isinstance(source_id, str) or not source_id:
+            raise RetrievalDependencyError("source_id_required")
         try:
-            return self._source_policy_reader.capture()
+            return self._source_policy_reader.capture(source_id)
         except Exception as error:
             raise RetrievalDependencyError("source_policy_unavailable") from error
 
@@ -653,8 +696,19 @@ class RagService:
                 raise RetrievalDependencyError("source_policy_unavailable")
             return
         source_ids = {chunk.source_id for chunk in chunks}
-        if None in source_ids or not self._source_policy_reader.validate_sources(
-            snapshot, {source_id for source_id in source_ids if source_id is not None},
+        attributed_source_ids = {
+            source_id for source_id in source_ids if source_id is not None
+        }
+        if (
+            None in source_ids
+            or any(
+                snapshot.get(source_id) is None
+                for source_id in attributed_source_ids
+            )
+            or not self._source_policy_reader.validate_sources(
+                snapshot,
+                attributed_source_ids,
+            )
         ):
             raise RetrievalDependencyError("source_policy_changed")
 

@@ -20,7 +20,7 @@ from ingestion.graph import (
     DiscoveryStep,
     DriveDelta,
     ResolvedMarkdownImage,
-    ScaleLimits,
+    SourceAdmissionConfig,
     VerifiedAcl,
     bootstrap_delta_cursor,
     discover_next_page,
@@ -40,7 +40,7 @@ class SourceConnector(Protocol):
     def discover_next_page(
         self,
         state: DiscoveryState,
-        limits: ScaleLimits,
+        limits: SourceAdmissionConfig,
         allowed_extensions: tuple[str, ...] = (".pdf",),
     ) -> DiscoveryStep: ...
 
@@ -88,7 +88,7 @@ class SharePointConnector:
     def discover_next_page(
         self,
         state: DiscoveryState,
-        limits: ScaleLimits,
+        limits: SourceAdmissionConfig,
         allowed_extensions: tuple[str, ...] = (".pdf",),
     ) -> DiscoveryStep:
         return discover_next_page(self.client, self.drive_id, state, limits, allowed_extensions)

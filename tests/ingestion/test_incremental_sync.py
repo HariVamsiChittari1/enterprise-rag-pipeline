@@ -16,9 +16,15 @@ from unittest.mock import MagicMock
 import httpx
 import pytest
 
-from config import IngestionConfig
+from config import ExecutionBatchConfig, IngestionConfig
 from ingestion.errors import TerminalDocumentError
-from ingestion.graph import DeltaResetRequired, DriveDelta, VerifiedAcl
+from ingestion.graph import (
+    DeltaResetRequired,
+    DiscoveredPdf,
+    DriveDelta,
+    GraphPageLimitExceeded,
+    VerifiedAcl,
+)
 from ingestion.lifecycle_repository import (
     ChunkManifestPage,
     ChunkManifestRef,
@@ -30,9 +36,12 @@ from ingestion.lifecycle_repository import (
     ReadyDocumentRef,
 )
 from ingestion.models import (
+    AclFeedback,
+    AclStatus,
     ActivityOutcome,
     ActivityStatus,
     DocumentStatus,
+    SourceAdmissionConfig,
     SourceDocumentRecord,
     create_document_id,
     create_document_key,
@@ -67,19 +76,14 @@ def build_config(**overrides: Any) -> IngestionConfig:
         content_understanding_analyzer_id="rag-document-search-v1",
         language_endpoint="https://lang.example",
         openai_endpoint="https://openai.example",
+        embedding_deployment="test-embedding",
         vision_deployment="gpt-5.4",
         managed_identity_client_id="mi",
+        admission=SourceAdmissionConfig(),
+        execution=ExecutionBatchConfig(),
         chunk_max_tokens=800,
         chunk_overlap_tokens=100,
-        acl_max_pages=10,
-        download_timeout_seconds=120.0,
-        delta_max_pages=200,
-        embedding_batch_size=100,
-        max_pdf_pages=500,
         vision_max_output_tokens=400,
-        vision_max_image_bytes=2 * 1024 * 1024,
-        vision_max_figures=60,
-        query_proxy_timeout_seconds=30.0,
         sharepoint_site_url="",
     )
     values.update(overrides)
@@ -95,6 +99,57 @@ def test_processing_profile_digest_is_stable_and_tracks_ingestion_settings() -> 
     assert services._processing_profile_digest(replace(
         config, summary_enabled=not config.summary_enabled,
     )) != digest
+    assert services._processing_profile_digest(replace(
+        config, embedding_deployment="other-embedding",
+    )) != digest
+    assert services._processing_profile_digest(replace(
+        config, chunk_max_tokens=config.chunk_max_tokens - 1,
+    )) != digest
+    assert services._processing_profile_digest(
+        replace(
+            config,
+            admission=replace(config.admission, max_pages_per_source=1_999),
+        )
+    ) != digest
+    assert services._processing_profile_digest(
+        replace(
+            config,
+            admission=replace(config.admission, max_eligible_sources=9_999),
+        )
+    ) == digest
+    assert services._processing_profile_digest(
+        replace(
+            config,
+            execution=replace(
+                config.execution,
+                embedding_batch_size=64,
+                wave_size=config.execution.wave_size + 1,
+            ),
+        )
+    ) == digest
+    assert services._processing_profile_digest(replace(
+        config, business_name="Renamed Business",
+    )) == digest
+
+
+def test_discovered_document_snapshots_configured_business_name() -> None:
+    config = build_config(business_name="Business A")
+    source = DiscoveredPdf(
+        item_id="item-a",
+        parent_item_id="parent-a",
+        name="guide.pdf",
+        source_path="/guide.pdf",
+        source_url="https://example.invalid/guide.pdf",
+        e_tag="etag-a",
+        mime_type="application/pdf",
+        size_bytes=100,
+        discovery_ordinal=1,
+    )
+
+    document = services._source_to_document(source, config, "run-a")
+
+    assert document.business_name == "Business A"
+    assert document.to_cosmos_item()["businessName"] == "Business A"
 
 
 class FakeRepository:
@@ -113,6 +168,7 @@ class FakeLifecycleRepository:
         self.retired: list[dict[str, Any]] = []
         self.deleted: list[dict[str, Any]] = []
         self.refreshed: list[dict[str, Any]] = []
+        self.feedback_updated: list[dict[str, Any]] = []
         self.ready_by_document_id: dict[str, ReadyDocumentRef] = {}
         self.acl_revoked_by_document_id: dict[str, ReadyDocumentRef] = {}
         self.transcribing_by_document_id: dict[str, dict[str, Any]] = {}
@@ -174,6 +230,9 @@ class FakeLifecycleRepository:
     def refresh_document_acl(self, **kwargs: Any) -> None:
         self.refreshed.append(kwargs)
 
+    def update_document_acl_feedback(self, **kwargs: Any) -> None:
+        self.feedback_updated.append(kwargs)
+
 
 class RecordingWorkRegistry:
     def __init__(self, events: list[str]) -> None:
@@ -191,6 +250,72 @@ class RecordingWorkRegistry:
 
     def settle_document_operation(self, *_args: Any, **_kwargs: Any) -> None:
         self.events.append("settle")
+
+
+class DeltaQuarantineRegistry:
+    def __init__(
+        self,
+        winner: dict[str, Any] | None = None,
+        replay_outcome: dict[str, Any] | None = None,
+    ) -> None:
+        self.winner = winner
+        self.replay_outcome = replay_outcome
+        self.unresolved = 0
+        self.settlements: list[dict[str, Any]] = []
+        self.cleared_winners: list[dict[str, Any]] = []
+        self.cursor_outcomes: list[dict[str, Any]] = []
+
+    def begin_delta_round(self, *_args: Any) -> dict[str, str]:
+        return {"state": "active"}
+
+    def delta_page_capture(self, *_args: Any) -> None:
+        return None
+
+    def get_document_winner(
+        self, _source_id: str, _document_id: str
+    ) -> dict[str, Any] | None:
+        return self.winner
+
+    def clear_document_winner(self, *_args: Any, **kwargs: Any) -> bool:
+        self.cleared_winners.append(kwargs)
+        self.winner = None
+        return True
+
+    def begin_document_operation(
+        self, _plan: Any, **_kwargs: Any
+    ) -> dict[str, Any]:
+        if self.replay_outcome is not None:
+            return {
+                "status": "completed",
+                "terminalStatus": "quarantined",
+                "outcome": self.replay_outcome,
+            }
+        self.unresolved = 1
+        return {"status": "acquired", "operationId": "quarantine-operation"}
+
+    def start_document_operation(
+        self, *_args: Any, **_kwargs: Any
+    ) -> dict[str, str]:
+        return {"status": "started"}
+
+    def settle_document_operation(
+        self, *_args: Any, **kwargs: Any
+    ) -> dict[str, str]:
+        self.settlements.append(kwargs)
+        self.unresolved = 0
+        return {"status": "completed"}
+
+    def get_unresolved_document_operation_count(self, _source_id: str) -> int:
+        return self.unresolved
+
+    def mark_delta_round_cursor_ready(
+        self, _source_id: str, _round_id: str, _owner_id: str,
+        _delta_link: str, outcome: dict[str, Any],
+    ) -> None:
+        self.cursor_outcomes.append(outcome)
+
+    def complete_delta_round(self, *_args: Any) -> dict[str, str]:
+        return {"state": "committed"}
 
 
 def _delta_pdf_item(
@@ -437,6 +562,167 @@ def test_two_source_discovery_then_delta_isolates_identity_cursors_and_outcomes(
         for source in source_order
     ]
     assert tuple(repository.created[:2]) == full_documents
+
+
+def test_delta_sync_returns_durable_enumeration_continuation_without_committing_cursor() -> None:
+    config = build_config(execution=ExecutionBatchConfig(delta_max_pages=1))
+    committed_cursor = "https://graph.microsoft.com/v1.0/drives/drive/root/delta?token=old"
+    lifecycle = FakeLifecycleRepository(cursor=committed_cursor)
+    first_next = "https://graph.microsoft.com/v1.0/drives/drive/root/delta?skip=2"
+    second_next = "https://graph.microsoft.com/v1.0/drives/drive/root/delta?skip=3"
+
+    class Capture:
+        def __init__(self) -> None:
+            self.resume_calls = 0
+
+        def resume_state(self):
+            self.resume_calls += 1
+            next_link = first_next if self.resume_calls == 1 else second_next
+            return {
+                "roundStartKind": "incremental",
+                "roundStartUrl": committed_cursor,
+                "receiptId": "receipt-1",
+                "pageOrdinal": self.resume_calls,
+                "requestUrl": first_next,
+                "predecessorReceiptId": None,
+                "nextLink": next_link,
+                "deltaLink": None,
+            }
+
+        def count_observed_entries(self):
+            return 2
+
+    capture = Capture()
+
+    class Registry:
+        def begin_delta_round(self, *_args):
+            return {"state": "active"}
+
+        def delta_page_capture(self, *_args):
+            return capture
+
+    class Connector:
+        def read_drive_delta(self, _max_pages, delta_link=None, *, page_capture=None):
+            assert delta_link == first_next
+            assert page_capture is capture
+            raise GraphPageLimitExceeded(second_next)
+
+    outcome = services.run_delta_sync(
+        config,
+        FakeRepository(),
+        lifecycle,
+        Connector(),
+        None,
+        None,
+        None,
+        work_registry=Registry(),
+        source_plan=SimpleNamespace(source_id="source"),
+        owner_instance_id="delta-owner",
+        delta_execution_id="delta-instance",
+    )
+
+    assert outcome.continuation_phase == "enumerating"
+    assert outcome.continuation_token == second_next
+    assert outcome.items_seen == 2
+    assert lifecycle.saved_cursors == []
+
+
+@pytest.mark.parametrize(
+    "reduced_items",
+    [
+        pytest.param((), id="zero-items"),
+        pytest.param(({"id": "folder-1", "folder": {}},), id="single-page"),
+    ],
+)
+def test_delta_sync_terminal_enumeration_runs_baseline_and_acl_before_cursor_ready(
+    monkeypatch: pytest.MonkeyPatch,
+    reduced_items: tuple[dict[str, Any], ...],
+) -> None:
+    config = build_config()
+    lifecycle = FakeLifecycleRepository(
+        cursor="https://graph.microsoft.com/v1.0/drives/drive/root/delta?token=old",
+    )
+    next_link = "https://graph.microsoft.com/v1.0/drives/drive/root/delta?skip=200"
+    candidate = "https://graph.microsoft.com/v1.0/drives/drive/root/delta?token=new"
+    events: list[str] = []
+
+    class Capture:
+        def resume_state(self):
+            return {
+                "roundStartKind": "reset",
+                "roundStartUrl": next_link,
+                "receiptId": "receipt-199",
+                "pageOrdinal": 199,
+                "requestUrl": next_link,
+                "predecessorReceiptId": "receipt-198",
+                "nextLink": next_link,
+                "deltaLink": None,
+            }
+
+        def list_reduced_items_page(self, *, page_size, continuation_token):
+            assert page_size == 50
+            assert continuation_token is None
+            return SimpleNamespace(items=reduced_items, continuation_token=None)
+
+        def has_reduced_item(self, item_id):
+            return any(item["id"] == item_id for item in reduced_items)
+
+        def count_observed_entries(self):
+            return len(reduced_items)
+
+    capture = Capture()
+
+    class Registry:
+        def begin_delta_round(self, *_args):
+            return {"state": "active"}
+
+        def delta_page_capture(self, *_args):
+            return capture
+
+        def get_unresolved_document_operation_count(self, _source_id):
+            return 0
+
+        def mark_delta_round_cursor_ready(self, *_args):
+            events.append("cursor_ready")
+
+    class Connector:
+        def read_drive_delta(self, _max_pages, delta_link=None, *, page_capture=None):
+            assert delta_link == next_link
+            assert page_capture is capture
+            return DriveDelta([], candidate, False)
+
+    def list_ready_documents_page(**_kwargs):
+        events.append("baseline")
+        return SimpleNamespace(items=(), continuation_token=None)
+
+    def run_acl_resync_page(*_args, **_kwargs):
+        events.append("acl")
+        return SimpleNamespace(updated=0, retired=0), None
+
+    lifecycle.list_ready_documents_page = list_ready_documents_page  # type: ignore[method-assign]
+    monkeypatch.setattr(services, "run_acl_resync_page", run_acl_resync_page)
+
+    outcome = services.run_delta_sync(
+        config,
+        FakeRepository(),
+        lifecycle,
+        Connector(),
+        None,
+        None,
+        None,
+        work_registry=Registry(),
+        source_plan=SimpleNamespace(source_id="source"),
+        owner_instance_id="delta-owner",
+        delta_execution_id="delta-instance",
+        processing_phase="enumerating",
+        phase_continuation_token=next_link,
+        defer_cursor_commit=True,
+    )
+
+    assert events == ["baseline", "acl", "cursor_ready"]
+    assert outcome.continuation_phase == "commit"
+    assert outcome.continuation_token == candidate
+    assert lifecycle.saved_cursors == []
 
 
 def test_delta_sync_returns_after_one_reduced_item_page_without_committing_cursor() -> None:
@@ -1036,7 +1322,11 @@ def _assert_delta_work_context(kwargs: dict[str, Any]) -> None:
     assert kwargs["document_work_attempt_id"] == "operation-1"
 
 
-def test_run_delta_sync_retains_cursor_when_any_item_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("retryable", [True, False])
+def test_run_delta_sync_retains_cursor_when_any_item_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    retryable: bool,
+) -> None:
     config = build_config(allowed_extensions=(".pdf", ".wav"))
     old_cursor = "https://graph.microsoft.com/v1.0/drives/drive/root/delta?token=old"
     lifecycle = FakeLifecycleRepository(cursor=old_cursor)
@@ -1054,7 +1344,7 @@ def test_run_delta_sync_retains_cursor_when_any_item_fails(monkeypatch: pytest.M
         services, "process_document",
         lambda *a, **k: ActivityOutcome(
             document_id="doc", status=ActivityStatus.FAILED, chunks_written=0, retry_count=0,
-            error=services.SafeError("processing_failed", "embedding", True),
+            error=services.SafeError("processing_failed", "embedding", retryable),
         ),
     )
     with _mock_connector(handler) as client:
@@ -1066,6 +1356,286 @@ def test_run_delta_sync_retains_cursor_when_any_item_fails(monkeypatch: pytest.M
     assert outcome.failed == 1
     assert lifecycle.saved_cursors == []
     assert lifecycle.get_delta_cursor(config.source_id) == old_cursor
+
+
+@pytest.mark.parametrize("prior_version_count", [0, 1, 2])
+def test_terminal_delta_quarantines_replacement_and_retires_prior_versions(
+    monkeypatch: pytest.MonkeyPatch,
+    prior_version_count: int,
+) -> None:
+    config = build_config()
+    document_id = create_document_id("source", "drive", "item-1")
+    lifecycle = FakeLifecycleRepository(
+        cursor="https://graph.microsoft.com/v1.0/drives/drive/root/delta?token=old",
+    )
+    prior_versions = [
+        ReadyDocumentRef(
+            document_id=document_id,
+            source_run_id=f"source:prior-{index}",
+            document_key=f"source:prior-{index}:{document_id}",
+            item_id="item-1",
+            allowed_group_ids=("group-a",),
+            acl_hash="acl-hash",
+            etag=f"prior-etag-{index}",
+            source_etag="prior-source-etag",
+            source_id="source",
+            drive_id="drive",
+        )
+        for index in range(prior_version_count)
+    ]
+    lifecycle.versions_by_document_id[document_id] = prior_versions
+    winner = None
+    if prior_versions:
+        first = prior_versions[0]
+        winner = {
+            "sourceRunId": first.source_run_id,
+            "documentKey": first.document_key,
+            "sourceEtag": first.source_etag,
+            "processingProfileDigest": services._processing_profile_digest(config),
+        }
+    registry = DeltaQuarantineRegistry(winner)
+    audit_container = MagicMock()
+
+    class Repository(FakeRepository):
+        failed_replacement: VersionedRecord | None = None
+
+        def get_document(
+            self, _source_run_id: str, _document_id: str
+        ) -> VersionedRecord | None:
+            return self.failed_replacement
+
+    repository = Repository()
+
+    def quarantine_document(
+        _config: IngestionConfig,
+        document: SourceDocumentRecord,
+        *_args: Any,
+        **_kwargs: Any,
+    ) -> ActivityOutcome:
+        error = services.SafeError("unsupported_source_format", "terminal", False)
+        repository.failed_replacement = VersionedRecord(
+            replace(
+                document,
+                status=DocumentStatus.FAILED,
+                stage=services.DocumentStage.TERMINAL,
+                error=error,
+            ),
+            "failed-etag",
+        )
+        return ActivityOutcome(
+            document_id=document.document_id,
+            status=ActivityStatus.QUARANTINED,
+            chunks_written=0,
+            retry_count=0,
+            error=error,
+        )
+
+    monkeypatch.setattr(services, "process_document", quarantine_document)
+
+    class Connector:
+        def read_drive_delta(self, *_args: Any, **_kwargs: Any) -> DriveDelta:
+            return DriveDelta(
+                [_delta_pdf_item("item-1")],
+                "https://graph.microsoft.com/v1.0/drives/drive/root/delta?token=new",
+                False,
+            )
+
+    outcome = services.run_delta_sync(
+        config,
+        repository,
+        lifecycle,
+        Connector(),
+        None,
+        None,
+        None,
+        audit_container=audit_container,
+        work_registry=registry,
+        source_plan=SimpleNamespace(source_id="source"),
+        owner_instance_id="delta-owner",
+        delta_execution_id="delta-instance",
+    )
+
+    assert outcome.quarantined == 1
+    assert outcome.failed == 0
+    assert [item["reason"] for item in lifecycle.retired] == [
+        "replacement_failed"
+    ] * prior_version_count
+    assert len(registry.cleared_winners) == min(prior_version_count, 1)
+    assert registry.settlements[-1]["status"] == "quarantined"
+    assert registry.settlements[-1]["outcome"]["status"] == "quarantined"
+    assert registry.cursor_outcomes[-1]["quarantined"] == 1
+    assert lifecycle.saved_cursors == [
+        "https://graph.microsoft.com/v1.0/drives/drive/root/delta?token=new"
+    ]
+    audit_item = audit_container.create_item.call_args[0][0]
+    assert audit_item["operation"] == "document_quarantined"
+    assert audit_item["errorCode"] == "unsupported_source_format"
+    assert "content" not in audit_item
+
+
+@pytest.mark.parametrize("failure_mode", ["retirement", "identity", "winner"])
+def test_terminal_delta_keeps_cursor_when_quarantine_settlement_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    failure_mode: str,
+) -> None:
+    config = build_config()
+    document_id = create_document_id("source", "drive", "item-1")
+    lifecycle = FakeLifecycleRepository(
+        cursor="https://graph.microsoft.com/v1.0/drives/drive/root/delta?token=old",
+    )
+    previous = ReadyDocumentRef(
+        document_id=document_id,
+        source_run_id="source:prior",
+        document_key=f"source:prior:{document_id}",
+        item_id="item-1",
+        allowed_group_ids=("group-a",),
+        acl_hash="acl-hash",
+        etag="prior-etag",
+        source_etag="prior-source-etag",
+        source_id="source",
+        drive_id="other-drive" if failure_mode == "identity" else "drive",
+    )
+    lifecycle.versions_by_document_id[document_id] = [previous]
+    if failure_mode == "retirement":
+        def fail_retirement(**_kwargs: Any) -> None:
+            raise LifecycleConflictError("etag_conflict")
+
+        monkeypatch.setattr(
+            lifecycle,
+            "retire_document",
+            fail_retirement,
+        )
+    winner = None
+    if failure_mode == "winner":
+        winner = {
+            "sourceRunId": previous.source_run_id,
+            "documentKey": previous.document_key,
+            "sourceEtag": previous.source_etag,
+            "processingProfileDigest": services._processing_profile_digest(config),
+        }
+    registry = DeltaQuarantineRegistry(winner)
+    if failure_mode == "winner":
+        monkeypatch.setattr(
+            registry,
+            "clear_document_winner",
+            lambda *_args, **_kwargs: False,
+        )
+
+    class Repository(FakeRepository):
+        failed_replacement: VersionedRecord | None = None
+
+        def get_document(
+            self, _source_run_id: str, _document_id: str
+        ) -> VersionedRecord | None:
+            return self.failed_replacement
+
+    repository = Repository()
+
+    def quarantine_document(
+        _config: IngestionConfig,
+        document: SourceDocumentRecord,
+        *_args: Any,
+        **_kwargs: Any,
+    ) -> ActivityOutcome:
+        error = services.SafeError("unsupported_source_format", "terminal", False)
+        repository.failed_replacement = VersionedRecord(
+            replace(
+                document,
+                status=DocumentStatus.FAILED,
+                stage=services.DocumentStage.TERMINAL,
+                error=error,
+            ),
+            "failed-etag",
+        )
+        return ActivityOutcome(
+            document_id=document.document_id,
+            status=ActivityStatus.QUARANTINED,
+            chunks_written=0,
+            retry_count=0,
+            error=error,
+        )
+
+    monkeypatch.setattr(services, "process_document", quarantine_document)
+
+    class Connector:
+        def read_drive_delta(self, *_args: Any, **_kwargs: Any) -> DriveDelta:
+            return DriveDelta(
+                [_delta_pdf_item("item-1")],
+                "https://graph.microsoft.com/v1.0/drives/drive/root/delta?token=new",
+                False,
+            )
+
+    outcome = services.run_delta_sync(
+        config,
+        repository,
+        lifecycle,
+        Connector(),
+        None,
+        None,
+        None,
+        work_registry=registry,
+        source_plan=SimpleNamespace(source_id="source"),
+        owner_instance_id="delta-owner",
+        delta_execution_id="delta-instance",
+    )
+
+    assert outcome.quarantined == 0
+    assert outcome.failed == 1
+    assert registry.settlements[-1]["status"] == "failed"
+    assert lifecycle.saved_cursors == []
+
+
+def test_terminal_delta_replays_quarantine_without_reprocessing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = build_config()
+    lifecycle = FakeLifecycleRepository(
+        cursor="https://graph.microsoft.com/v1.0/drives/drive/root/delta?token=old",
+    )
+    registry = DeltaQuarantineRegistry({
+        "sourceRunId": "source:prior",
+        "documentKey": "source:prior:document",
+        "sourceEtag": "different-etag",
+        "processingProfileDigest": services._processing_profile_digest(config),
+    }, replay_outcome={
+        "documentId": create_document_id("source", "drive", "item-1"),
+        "status": "quarantined",
+    })
+    monkeypatch.setattr(
+        services,
+        "process_document",
+        lambda *_args, **_kwargs: pytest.fail(
+            "completed quarantine must not be reprocessed"
+        ),
+    )
+
+    class Connector:
+        def read_drive_delta(self, *_args: Any, **_kwargs: Any) -> DriveDelta:
+            return DriveDelta(
+                [_delta_pdf_item("item-1")],
+                "https://graph.microsoft.com/v1.0/drives/drive/root/delta?token=new",
+                False,
+            )
+
+    outcome = services.run_delta_sync(
+        config,
+        FakeRepository(),
+        lifecycle,
+        Connector(),
+        None,
+        None,
+        None,
+        work_registry=registry,
+        source_plan=SimpleNamespace(source_id="source"),
+        owner_instance_id="delta-owner",
+        delta_execution_id="delta-instance",
+    )
+
+    assert outcome.quarantined == 1
+    assert outcome.failed == 0
+    assert lifecycle.saved_cursors == [
+        "https://graph.microsoft.com/v1.0/drives/drive/root/delta?token=new"
+    ]
 
 
 def test_run_delta_sync_keeps_cursor_when_audio_transcription_is_pending(
@@ -1935,6 +2505,30 @@ def test_resync_document_acl_is_a_noop_when_hash_unchanged() -> None:
     assert lifecycle.retired == []
 
 
+def test_resync_document_acl_updates_feedback_without_refreshing_chunks() -> None:
+    config = build_config()
+    lifecycle = FakeLifecycleRepository()
+    connector = FakeConnector(
+        lambda *a, **k: VerifiedAcl(
+            ("group-a",),
+            "hash-a",
+            (AclFeedback.SHARED_LINK,),
+        )
+    )
+
+    result = services.resync_document_acl(config, _ready_ref(), lifecycle, connector)
+
+    assert result == "updated"
+    assert lifecycle.refreshed == []
+    assert lifecycle.feedback_updated == [{
+        "source_run_id": "source:run-a",
+        "document_id": "doc-1",
+        "etag": "etag-1",
+        "acl_status": AclStatus.VERIFIED,
+        "acl_feedback": (AclFeedback.SHARED_LINK,),
+    }]
+
+
 @pytest.mark.parametrize("mode", ["delta", "periodic"])
 @pytest.mark.parametrize("revoke_source_a", [False, True])
 @pytest.mark.parametrize("source_order", [("source-a", "source-b"), ("source-b", "source-a")])
@@ -2010,7 +2604,10 @@ def test_two_source_acl_changes_and_reconciliation_do_not_mutate_other_source(
                 selected_connector: SharePointConnector, item_id: str, max_pages: int,
             ) -> VerifiedAcl:
                 assert selected_connector.drive_id == config.drive_id
-                assert item_id == "same-item" and max_pages == config.acl_max_pages
+                assert (
+                    item_id == "same-item"
+                    and max_pages == config.execution.acl_max_pages
+                )
                 if source == "source-a":
                     if revoke_source_a:
                         raise TerminalDocumentError("unsafe_acl:no_verified_security_groups")
@@ -2213,6 +2810,7 @@ def test_resync_document_acl_skips_audit_when_container_is_none() -> None:
 
 
 def test_lifecycle_reconciliation_isolates_poison_documents() -> None:
+    config = build_config()
     acl_ref = LifecycleDocumentRef(
         document_id="doc-acl",
         source_run_id="source:run-a",
@@ -2224,6 +2822,8 @@ def test_lifecycle_reconciliation_isolates_poison_documents() -> None:
         acl_hash="hash-a",
         pending_allowed_group_ids=("group-b",),
         pending_acl_hash="hash-b",
+        pending_acl_status=AclStatus.VERIFIED,
+        pending_acl_feedback=(),
     )
     poison_ref = LifecycleDocumentRef(
         document_id="doc-retire",
@@ -2250,10 +2850,26 @@ def test_lifecycle_reconciliation_isolates_poison_documents() -> None:
         (acl_ref, poison_ref, delete_ref),
         "next-page",
     )
+    repository = MagicMock()
+    repository.get_document.return_value = VersionedRecord(
+        SimpleNamespace(
+            item_id="item-acl",
+            status=DocumentStatus.ACL_REFRESHING,
+            acl_status=AclStatus.VERIFIED,
+            acl_feedback=(),
+            e_tag="source-etag",
+        ),
+        "etag-acl",
+    )
+    connector = FakeConnector(
+        lambda *_args, **_kwargs: VerifiedAcl(("group-c",), "hash-c")
+    )
 
     outcome, continuation = services.run_lifecycle_reconciliation_page(
-        MagicMock(),
+        config,
+        repository,
         lifecycle,
+        lambda: connector,
         source_id="source",
         page_size=10,
     )
@@ -2267,8 +2883,10 @@ def test_lifecycle_reconciliation_isolates_poison_documents() -> None:
         document_id="doc-acl",
         document_key="source:run-a:doc-acl",
         etag="etag-acl",
-        allowed_group_ids=("group-b",),
-        acl_hash="hash-b",
+        allowed_group_ids=("group-c",),
+        acl_hash="hash-c",
+        acl_status=AclStatus.VERIFIED,
+        acl_feedback=(),
     )
     lifecycle.delete_document_and_chunks.assert_called_once_with(
         source_run_id="source:run-a",
@@ -2276,6 +2894,200 @@ def test_lifecycle_reconciliation_isolates_poison_documents() -> None:
         document_key="source:run-a:doc-delete",
         etag="etag-delete",
     )
+
+
+def test_lifecycle_reconciliation_retires_when_pending_acl_is_no_longer_verifiable() -> None:
+    ref = LifecycleDocumentRef(
+        document_id="doc-acl",
+        source_run_id="source:run-a",
+        document_key="source:run-a:doc-acl",
+        status=DocumentStatus.ACL_REFRESHING,
+        lifecycle_generation=1,
+        etag="etag-acl",
+        allowed_group_ids=("group-a",),
+        acl_hash="hash-a",
+        pending_allowed_group_ids=("group-b",),
+        pending_acl_hash="hash-b",
+        pending_acl_status=AclStatus.VERIFIED,
+        pending_acl_feedback=(),
+    )
+    lifecycle = MagicMock(spec=DocumentLifecycleRepository)
+    lifecycle.list_lifecycle_transitions_page.return_value = LifecycleDocumentPage(
+        (ref,),
+        None,
+    )
+    repository = MagicMock()
+    repository.get_document.return_value = VersionedRecord(
+        SimpleNamespace(
+            item_id="item-acl",
+            status=DocumentStatus.ACL_REFRESHING,
+            acl_status=AclStatus.VERIFIED,
+            acl_feedback=(),
+            e_tag="source-etag",
+        ),
+        "etag-acl",
+    )
+
+    def _raise_terminal(*_args: Any, **_kwargs: Any) -> None:
+        raise TerminalDocumentError("unsafe_acl:no_verified_security_groups")
+
+    outcome, continuation = services.run_lifecycle_reconciliation_page(
+        build_config(),
+        repository,
+        lifecycle,
+        lambda: FakeConnector(_raise_terminal),
+        source_id="source",
+        page_size=10,
+    )
+
+    assert outcome.repaired == 1
+    assert outcome.failed == 0
+    assert continuation is None
+    lifecycle.retire_document.assert_called_once_with(
+        source_run_id="source:run-a",
+        document_id="doc-acl",
+        document_key="source:run-a:doc-acl",
+        etag="etag-acl",
+        reason="acl_revoked",
+    )
+    lifecycle.refresh_document_acl.assert_not_called()
+
+
+def test_lifecycle_reconciliation_keeps_pending_acl_on_transient_failure() -> None:
+    ref = LifecycleDocumentRef(
+        document_id="doc-acl",
+        source_run_id="source:run-a",
+        document_key="source:run-a:doc-acl",
+        status=DocumentStatus.ACL_REFRESHING,
+        lifecycle_generation=1,
+        etag="etag-acl",
+        allowed_group_ids=("group-a",),
+        acl_hash="hash-a",
+        pending_allowed_group_ids=("group-b",),
+        pending_acl_hash="hash-b",
+        pending_acl_status=AclStatus.VERIFIED,
+        pending_acl_feedback=(),
+    )
+    lifecycle = MagicMock(spec=DocumentLifecycleRepository)
+    lifecycle.list_lifecycle_transitions_page.return_value = LifecycleDocumentPage(
+        (ref,),
+        None,
+    )
+    repository = MagicMock()
+    repository.get_document.return_value = VersionedRecord(
+        SimpleNamespace(
+            item_id="item-acl",
+            status=DocumentStatus.ACL_REFRESHING,
+            acl_status=AclStatus.VERIFIED,
+            acl_feedback=(),
+            e_tag="source-etag",
+        ),
+        "etag-acl",
+    )
+
+    def _raise_transient(*_args: Any, **_kwargs: Any) -> None:
+        raise TimeoutError("graph_throttled")
+
+    outcome, continuation = services.run_lifecycle_reconciliation_page(
+        build_config(),
+        repository,
+        lifecycle,
+        lambda: FakeConnector(_raise_transient),
+        source_id="source",
+        page_size=10,
+    )
+
+    assert outcome.repaired == 0
+    assert outcome.failed == 1
+    assert continuation is None
+    lifecycle.retire_document.assert_not_called()
+    lifecycle.refresh_document_acl.assert_not_called()
+
+
+def test_lifecycle_reconciliation_rejects_stale_acl_refresh_fence() -> None:
+    ref = LifecycleDocumentRef(
+        document_id="doc-acl",
+        source_run_id="source:run-a",
+        document_key="source:run-a:doc-acl",
+        status=DocumentStatus.ACL_REFRESHING,
+        lifecycle_generation=1,
+        etag="etag-stale",
+        allowed_group_ids=("group-a",),
+        acl_hash="hash-a",
+        pending_allowed_group_ids=("group-b",),
+        pending_acl_hash="hash-b",
+        pending_acl_status=AclStatus.VERIFIED,
+        pending_acl_feedback=(),
+    )
+    lifecycle = MagicMock(spec=DocumentLifecycleRepository)
+    lifecycle.list_lifecycle_transitions_page.return_value = LifecycleDocumentPage(
+        (ref,),
+        None,
+    )
+    repository = MagicMock()
+    repository.get_document.return_value = VersionedRecord(
+        SimpleNamespace(
+            item_id="item-acl",
+            status=DocumentStatus.ACL_REFRESHING,
+            acl_status=AclStatus.VERIFIED,
+            acl_feedback=(),
+            e_tag="source-etag",
+        ),
+        "etag-current",
+    )
+
+    def _unexpected_connector() -> FakeConnector:
+        pytest.fail("a stale ACL-refreshing fence must not build a Graph connector")
+
+    outcome, continuation = services.run_lifecycle_reconciliation_page(
+        build_config(),
+        repository,
+        lifecycle,
+        _unexpected_connector,
+        source_id="source",
+        page_size=10,
+    )
+
+    assert outcome.repaired == 0
+    assert outcome.failed == 1
+    assert continuation is None
+    lifecycle.retire_document.assert_not_called()
+    lifecycle.refresh_document_acl.assert_not_called()
+
+
+def test_lifecycle_reconciliation_does_not_require_graph_for_non_acl_repair() -> None:
+    ref = LifecycleDocumentRef(
+        document_id="doc-delete",
+        source_run_id="source:run-a",
+        document_key="source:run-a:doc-delete",
+        status=DocumentStatus.DELETING,
+        lifecycle_generation=1,
+        etag="etag-delete",
+        allowed_group_ids=("group-a",),
+        acl_hash="hash-a",
+    )
+    lifecycle = MagicMock(spec=DocumentLifecycleRepository)
+    lifecycle.list_lifecycle_transitions_page.return_value = LifecycleDocumentPage(
+        (ref,),
+        None,
+    )
+
+    def _unexpected_connector() -> FakeConnector:
+        pytest.fail("non-ACL reconciliation must not build a Graph connector")
+
+    outcome, continuation = services.run_lifecycle_reconciliation_page(
+        build_config(),
+        MagicMock(),
+        lifecycle,
+        _unexpected_connector,
+        source_id="source",
+        page_size=10,
+    )
+
+    assert outcome.repaired == 1
+    assert outcome.failed == 0
+    assert continuation is None
+    lifecycle.delete_document_and_chunks.assert_called_once()
 
 
 def test_acl_resync_page_claims_each_mutation_before_acl_refresh(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2321,7 +3133,14 @@ def test_lifecycle_reconciliation_claims_each_repair_before_mutation(
     )
 
     outcome, token = services.run_lifecycle_reconciliation_page(
-        MagicMock(), lifecycle, source_id="source", page_size=10,
+        build_config(),
+        MagicMock(),
+        lifecycle,
+        lambda: FakeConnector(
+            lambda *_args, **_kwargs: VerifiedAcl(("group-a",), "hash-a")
+        ),
+        source_id="source",
+        page_size=10,
         work_registry=registry, source_plan=SimpleNamespace(source_id="source"),
         owner_instance_id="lifecycle-owner", work_scope_id="lifecycle-owner",
     )

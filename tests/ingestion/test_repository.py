@@ -12,6 +12,8 @@ import ingestion.repository as repository_module
 from azure.core import MatchConditions
 
 from ingestion.models import (
+    AclFeedback,
+    AclStatus,
     AudioMetadata,
     AudioOperationRecord,
     AudioOperationState,
@@ -763,6 +765,8 @@ def test_audio_document_admits_and_readies_without_visual_manifest() -> None:
         replace(
             bound.record, status=DocumentStatus.ADMITTING, stage=DocumentStage.VERIFYING,
             written_chunk_count=1, source_verified_at=UTC,
+            acl_status=AclStatus.VERIFIED,
+            acl_feedback=(AclFeedback.SHARED_LINK,),
         ),
         bound.etag,
     )
@@ -1211,6 +1215,24 @@ def test_run_history_is_ordered_by_started_at_descending() -> None:
     assert "ORDER BY c.startedAt DESC" in runs.query_calls[-1]["query"]
 
 
+def test_failed_document_retry_query_selects_only_retryable_failures() -> None:
+    documents = StatefulContainer("sourceRunId")
+    repository = IngestionRepository(
+        StatefulContainer("sourceId"),
+        documents,
+        StatefulContainer("documentKey"),
+    )
+
+    page = repository.list_failed_documents_page(
+        "source",
+        "run-a",
+        page_size=10,
+    )
+
+    assert page.items == ()
+    assert "c.error.retryable = true" in documents.query_calls[-1]["query"]
+
+
 def build_audio_operation(**overrides: Any) -> AudioOperationRecord:
     return AudioOperationRecord(**({
         "source_id": "source", "drive_id": "drive", "item_id": "item", "owner_id": "owner",
@@ -1637,7 +1659,8 @@ def test_stale_run_writes_never_change_source_control() -> None:
 
 
 def test_services_finalize_marks_completed_with_errors_when_documents_failed() -> None:
-    from config import IngestionConfig
+    from config import ExecutionBatchConfig, IngestionConfig
+    from ingestion.models import SourceAdmissionConfig
     from ingestion.services import finalize
 
     runs = StatefulContainer("sourceId")
@@ -1677,14 +1700,14 @@ def test_services_finalize_marks_completed_with_errors_when_documents_failed() -
         document_intelligence_endpoint="https://di.example",
         content_understanding_endpoint="https://cu.example",
         content_understanding_analyzer_id="rag-document-search-v1",
-        language_endpoint="https://lang.example", openai_endpoint="https://openai.example",
+        language_endpoint="https://lang.example",         openai_endpoint="https://openai.example",
+        embedding_deployment="test-embedding",
         vision_deployment="gpt-5.4",
         managed_identity_client_id="mi",
-        chunk_max_tokens=800, chunk_overlap_tokens=100, acl_max_pages=10,
-        download_timeout_seconds=120.0, delta_max_pages=200, embedding_batch_size=100,
-        max_pdf_pages=500, vision_max_output_tokens=400,
-        vision_max_image_bytes=2 * 1024 * 1024, vision_max_figures=60,
-        query_proxy_timeout_seconds=30.0,
+        admission=SourceAdmissionConfig(),
+        execution=ExecutionBatchConfig(),
+        chunk_max_tokens=800, chunk_overlap_tokens=100,
+        vision_max_output_tokens=400,
         sharepoint_site_url="",
     )
 
@@ -1770,6 +1793,7 @@ def build_document(*, item_id: str = "item", run_id: str = "run-a") -> SourceDoc
         document_id=document_id,
         source_run_id=create_source_run_id("source", run_id),
         document_key=create_document_key("source", run_id, document_id),
+        business_name="Business A",
     )
 
 
@@ -1812,6 +1836,8 @@ def begin_admission(
             processing.record,
             status=DocumentStatus.ADMITTING,
             stage=DocumentStage.VERIFYING,
+            acl_status=AclStatus.VERIFIED,
+            acl_feedback=(AclFeedback.SHARED_LINK,),
             expected_chunk_count=count,
             written_chunk_count=count,
             visual_manifest_page_count=(
@@ -1919,6 +1945,41 @@ def _legacy_chunk_item() -> dict[str, Any]:
 def test_document_from_item_backward_compat_missing_source_modified_at() -> None:
     record = repository_module._document_from_item(_legacy_document_item())
     assert record.source_modified_at is None
+
+
+def test_document_from_item_backward_compat_missing_business_name() -> None:
+    document = build_document()
+    item = document.to_cosmos_item()
+    item.pop("businessName", None)
+
+    record = repository_module._document_from_item(item)
+
+    assert record.business_name is None
+
+
+def test_new_source_document_requires_business_name() -> None:
+    repository = IngestionRepository(
+        StatefulContainer("sourceId"),
+        StatefulContainer("sourceRunId"),
+        StatefulContainer("documentKey"),
+    )
+    document = replace(build_document(), business_name=None)
+
+    with pytest.raises(ValueError, match="require business name"):
+        repository.create_discovered_document(document)
+
+
+def test_new_visual_manifest_page_requires_business_name() -> None:
+    repository = IngestionRepository(
+        StatefulContainer("sourceId"),
+        StatefulContainer("sourceRunId"),
+        StatefulContainer("documentKey"),
+    )
+    pages = build_manifest_pages(replace(build_document(), business_name="Business A"))
+    pages = tuple(replace(page, business_name=None) for page in pages)
+
+    with pytest.raises(ValueError, match="require business name"):
+        repository.write_visual_manifest_pages(pages)
 
 
 def test_chunk_from_item_backward_compat_missing_source_modified_at() -> None:

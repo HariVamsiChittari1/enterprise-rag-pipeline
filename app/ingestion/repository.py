@@ -14,6 +14,10 @@ from azure.core import MatchConditions
 logger = logging.getLogger(__name__)
 
 from ingestion.models import (
+    SOURCE_DOCUMENT_RECORD_TYPE,
+    VISUAL_MANIFEST_PAGE_RECORD_TYPE,
+    AclFeedback,
+    AclStatus,
     AudioMetadata,
     AudioOperationRecord,
     AudioOperationState,
@@ -27,8 +31,8 @@ from ingestion.models import (
     EnrichmentProfile,
     EnrichmentStatuses,
     Entity,
-    ExtractionProvenance,
     ExtractionProfile,
+    ExtractionProvenance,
     IngestionRunRecord,
     LocatorKind,
     ModuleStatus,
@@ -37,18 +41,15 @@ from ingestion.models import (
     RunStage,
     RunStatus,
     SafeError,
-    ScaleLimits,
     SearchChunkRecord,
-    SOURCE_DOCUMENT_RECORD_TYPE,
     SourceControlRecord,
     SourceDocumentRecord,
     SourceLocator,
-    VisualDisposition,
     VisualCoverageStatus,
+    VisualDisposition,
     VisualManifestEntry,
     VisualManifestPage,
     VisualRelevance,
-    VISUAL_MANIFEST_PAGE_RECORD_TYPE,
     create_audio_control_partition_id,
     create_chunk_id,
     create_source_run_id,
@@ -56,7 +57,6 @@ from ingestion.models import (
     serialized_size_bytes,
     visual_manifest_hash,
 )
-
 
 RecordT = TypeVar("RecordT")
 MAX_BATCH_OPERATIONS = 100
@@ -326,6 +326,7 @@ class IngestionRepository:
     ) -> VersionedRecord[SourceDocumentRecord]:
         if document.status is not DocumentStatus.DISCOVERED or document.stage is not DocumentStage.DISCOVERED:
             raise ValueError("new source documents must be discovered")
+        _require_business_name_for_new_record(document.business_name, "source document")
         try:
             self._source_documents.create_item(body=document.to_cosmos_item())
         except Exception as error:
@@ -463,6 +464,7 @@ class IngestionRepository:
             or not document.allowed_group_ids
             or not document.acl_hash
             or document.acl_evaluated_at is None
+            or document.acl_status is not AclStatus.VERIFIED
         ):
             raise ValueError("admitting document integrity fields are incomplete")
         if not is_audio:
@@ -478,6 +480,8 @@ class IngestionRepository:
                 "updatedAt",
                 "allowedGroupIds",
                 "aclHash",
+                "aclStatus",
+                "aclFeedback",
                 "aclEvaluatedAt",
                 "expectedChunkCount",
                 "writtenChunkCount",
@@ -561,7 +565,8 @@ class IngestionRepository:
         source_run_id = create_source_run_id(source_id, run_id)
         query = (
             "SELECT * FROM c WHERE c.sourceRunId = @sourceRunId "
-            "AND c.recordType = @recordType AND c.status = 'failed'"
+            "AND c.recordType = @recordType AND c.status = 'failed' "
+            "AND c.error.retryable = true"
         )
         parameters = [
             {"name": "@sourceRunId", "value": source_run_id},
@@ -637,6 +642,7 @@ class IngestionRepository:
     ) -> int:
         validated = self._validate_visual_manifest_pages(pages)
         for page in validated:
+            _require_business_name_for_new_record(page.business_name, "visual manifest page")
             try:
                 self._source_documents.create_item(body=page.to_cosmos_item())
             except Exception as error:
@@ -662,6 +668,7 @@ class IngestionRepository:
             or document.ready_at is None
             or document.failed_at is not None
             or document.error is not None
+            or document.acl_status is not AclStatus.VERIFIED
         ):
             raise ValueError("ready document integrity fields are incomplete")
         # Audio documents have transcript chunks but no visual manifest to verify.
@@ -1109,8 +1116,6 @@ class IngestionRepository:
         validated = tuple(chunks)
         if any(not isinstance(chunk, SearchChunkRecord) for chunk in validated):
             raise TypeError("chunks must be SearchChunkRecord values")
-        if len(validated) > ScaleLimits().max_chunks_per_pdf:
-            raise ValueError("chunk input exceeds the schema-v1 document limit")
         first = validated[0]
         identity = (
             first.document_key,
@@ -1536,6 +1541,12 @@ def _document_from_item(item: Mapping[str, Any]) -> SourceDocumentRecord:
     values["status"] = DocumentStatus(values["status"])
     values["stage"] = DocumentStage(values["stage"])
     values["allowed_group_ids"] = tuple(values["allowed_group_ids"])
+    if "acl_status" in values:
+        values["acl_status"] = AclStatus(values["acl_status"])
+    if "acl_feedback" in values:
+        values["acl_feedback"] = tuple(
+            AclFeedback(feedback) for feedback in values["acl_feedback"]
+        )
     values.setdefault("source_modified_at", None)
     for _removed in ("quality_flags", "profiles", "acl_policy_version", "verified_at"):
         values.pop(_removed, None)
@@ -1626,6 +1637,14 @@ def _domain_item(item: Mapping[str, Any]) -> dict[str, Any]:
 
 def _same_domain(stored: Any, requested: Any) -> bool:
     return stored.to_cosmos_item() == requested.to_cosmos_item()
+
+
+def _require_business_name_for_new_record(
+    business_name: str | None,
+    record_name: str,
+) -> None:
+    if not isinstance(business_name, str) or not business_name.strip():
+        raise ValueError(f"new {record_name}s require business name")
 
 
 def _error_status(error: Exception) -> int | None:

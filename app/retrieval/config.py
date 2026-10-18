@@ -24,12 +24,18 @@ def parse_catalog_poll_seconds(raw: str | None) -> int:
     return seconds
 
 
+def parse_agent_max_iterations(raw: str | None) -> int:
+    if raw is None:
+        return 5
+    if not raw or not raw.isascii() or not raw.isdecimal() or int(raw) < 1:
+        raise ValueError("AGENT_MAX_ITERATIONS must be a positive integer")
+    return int(raw)
+
+
 @dataclass(frozen=True)
 class RetrievalConfig:
     cosmos_endpoint: str
     cosmos_database: str
-    cosmos_chunks_container: str
-    cosmos_manifests_container: str
     cosmos_audit_container: str
     openai_endpoint: str
     embedding_deployment: str
@@ -37,9 +43,6 @@ class RetrievalConfig:
     tenant_id: str
     managed_identity_client_id: str
     retrieval_audience: str
-    gateway_client_id: str
-    gateway_principal_id: str
-    deployment_instance_id: str
     retrieval_timeout_seconds: float
     generation_timeout_seconds: float
     agent_timeout_seconds: float
@@ -51,7 +54,6 @@ class RetrievalConfig:
     openai_api_version: str
     app_insights_connection_string: str | None
     include_citations: bool
-    acl_enabled: bool
     catalog_poll_seconds: int = 7200
     catalog_container: str = "retrieval-config"
     operation_timeout_seconds: float = 27.0
@@ -63,22 +65,19 @@ def load_retrieval_config() -> RetrievalConfig:
     return RetrievalConfig(
         cosmos_endpoint=_required("COSMOS_ENDPOINT"),
         cosmos_database=_required("COSMOS_DATABASE"),
-        cosmos_chunks_container=os.getenv("COSMOS_CHUNKS_CONTAINER", "search-chunks"),
-        cosmos_manifests_container=os.getenv("COSMOS_MANIFESTS_CONTAINER", "source-documents"),
         cosmos_audit_container=os.getenv("COSMOS_AUDIT_CONTAINER", "service-audit"),
         openai_endpoint=_required("AZURE_OPENAI_ENDPOINT"),
         embedding_deployment=os.getenv("EMBEDDING_DEPLOYMENT", "text-embedding-3-large"),
         chat_deployment=_required("CHAT_DEPLOYMENT"),
         tenant_id=_required("TENANT_ID"),
-        managed_identity_client_id=_required("MANAGED_IDENTITY_CLIENT_ID"),
+        managed_identity_client_id=os.getenv(
+            "MANAGED_IDENTITY_CLIENT_ID", ""
+        ).strip(),
         retrieval_audience=_required("RETRIEVAL_API_AUDIENCE"),
-        gateway_client_id=_required("RETRIEVAL_GATEWAY_CLIENT_ID"),
-        gateway_principal_id=_required("RETRIEVAL_GATEWAY_PRINCIPAL_ID"),
-        deployment_instance_id=_required("DEPLOYMENT_INSTANCE_ID"),
         retrieval_timeout_seconds=float(os.getenv("RETRIEVAL_TIMEOUT_SECONDS", "5.0")),
         generation_timeout_seconds=float(os.getenv("GENERATION_TIMEOUT_SECONDS", "15.0")),
-        agent_timeout_seconds=float(os.getenv("AGENT_TIMEOUT_SECONDS", "8.0")),
-        agent_max_iterations=int(os.getenv("AGENT_MAX_ITERATIONS", "5")),
+        agent_timeout_seconds=float(os.getenv("AGENT_TIMEOUT_SECONDS", "20.0")),
+        agent_max_iterations=parse_agent_max_iterations(os.getenv("AGENT_MAX_ITERATIONS")),
         # Azure OpenAI v1 Responses API only supports "preview" today; "latest" (GA) isn't
         # released yet. Override via AGENT_OPENAI_API_VERSION once Microsoft ships "latest".
         agent_api_version=os.getenv("AGENT_OPENAI_API_VERSION", "preview"),
@@ -88,7 +87,6 @@ def load_retrieval_config() -> RetrievalConfig:
         openai_api_version=os.getenv("OPENAI_API_VERSION", "2024-10-21"),
         app_insights_connection_string=os.getenv("APPLICATIONINSIGHTS_CONNECTION_STRING", "").strip() or None,
         include_citations=os.getenv("INCLUDE_CITATIONS", "true").strip().lower() != "false",
-        acl_enabled=os.getenv("ACL_ENABLED", "true").strip().lower() not in ("false", "0", "no"),
         catalog_poll_seconds=parse_catalog_poll_seconds(os.getenv("RETRIEVAL_CATALOG_POLL_SECONDS")),
         catalog_container=os.getenv("RETRIEVAL_CONFIG_CONTAINER", "retrieval-config").strip() or "retrieval-config",
         operation_timeout_seconds=float(os.getenv("RETRIEVAL_OPERATION_TIMEOUT_SECONDS", "27.0")),

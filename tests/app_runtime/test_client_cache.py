@@ -2,11 +2,8 @@
 underlying SDK client once per process and reuse it across calls (Azure Functions
 Python guidance: create clients at module level, don't rebuild per invocation).
 
-Monkeypatches the SDK classes each factory imports locally (azure.cosmos.CosmosClient,
-azure.identity.DefaultAzureCredential, openai.AzureOpenAI), matching the pattern used in
-test_retire_prior_version.py: a local `from x import Y` re-resolves the module attribute
-on every call, so patching the module attribute is sufficient. Production code is never
-modified by these tests.
+Monkeypatches the SDK clients and the shared explicit credential factory.
+Production code is never modified by these tests.
 """
 
 from __future__ import annotations
@@ -21,6 +18,7 @@ import httpx
 import openai
 import pytest
 
+import cosmos_connection
 import function_app
 from config import ExtractionProvider
 
@@ -82,7 +80,7 @@ def _fake_config(**overrides: Any) -> SimpleNamespace:
         tenant_id="tenant-id",
         app_client_id="app-client-id",
         drive_id="drive-id",
-        acl_max_pages=10,
+        execution=SimpleNamespace(acl_max_pages=10),
         sharepoint_site_url="",
     )
     base.update(overrides)
@@ -92,7 +90,11 @@ def _fake_config(**overrides: Any) -> SimpleNamespace:
 def test_build_repository_constructs_cosmos_client_once(monkeypatch: pytest.MonkeyPatch) -> None:
     FakeCosmosClient.instances.clear()
     monkeypatch.setattr(azure.cosmos, "CosmosClient", FakeCosmosClient)
-    monkeypatch.setattr(azure.identity, "DefaultAzureCredential", lambda **kwargs: object())
+    monkeypatch.setattr(
+        cosmos_connection,
+        "create_azure_credential",
+        lambda *_args: object(),
+    )
     config = _fake_config()
 
     first = function_app._build_repository(config)
@@ -102,10 +104,46 @@ def test_build_repository_constructs_cosmos_client_once(monkeypatch: pytest.Monk
     assert len(FakeCosmosClient.instances) == 1
 
 
+@pytest.mark.parametrize(
+    "factory_name",
+    ["_build_repository", "_build_lifecycle_repository"],
+)
+def test_content_repository_factories_key_clients_by_container_pair(
+    monkeypatch: pytest.MonkeyPatch,
+    factory_name: str,
+) -> None:
+    FakeCosmosClient.instances.clear()
+    monkeypatch.setattr(azure.cosmos, "CosmosClient", FakeCosmosClient)
+    monkeypatch.setattr(
+        cosmos_connection,
+        "create_azure_credential",
+        lambda *_args: object(),
+    )
+    factory = getattr(function_app, factory_name)
+
+    same_pair = _fake_config()
+    same_pair_again = _fake_config(
+        cosmos_source_documents_container="source-documents",
+        cosmos_search_chunks_container="search-chunks",
+    )
+    different_pair = _fake_config(
+        cosmos_source_documents_container="source-documents-alt",
+        cosmos_search_chunks_container="search-chunks-alt",
+    )
+
+    same_first = factory(same_pair)
+    same_second = factory(same_pair_again)
+    different = factory(different_pair)
+
+    assert same_first is same_second
+    assert same_first is not different
+    assert len(FakeCosmosClient.instances) == 1
+
+
 def test_build_openai_client_constructs_sdk_client_once(monkeypatch: pytest.MonkeyPatch) -> None:
     FakeAzureOpenAI.instances.clear()
     monkeypatch.setattr(openai, "AzureOpenAI", FakeAzureOpenAI)
-    monkeypatch.setattr(azure.identity, "DefaultAzureCredential", lambda **kwargs: object())
+    monkeypatch.setattr(function_app, "create_azure_credential", lambda *_args: object())
     monkeypatch.setattr(azure.identity, "get_bearer_token_provider", lambda credential, scope: lambda: "token")
     config = _fake_config()
 
@@ -125,9 +163,9 @@ def test_build_cu_client_constructs_sdk_client_once(monkeypatch: pytest.MonkeyPa
         FakeContentUnderstandingClient,
     )
     monkeypatch.setattr(
-        azure.identity,
-        "DefaultAzureCredential",
-        lambda **kwargs: credential,
+        function_app,
+        "create_azure_credential",
+        lambda *_args: credential,
     )
     config = _fake_config(content_understanding_endpoint="https://cu.example/")
 
@@ -197,7 +235,7 @@ def test_build_sharepoint_client_constructs_client_once(monkeypatch: pytest.Monk
             self.kwargs = kwargs
 
     monkeypatch.setattr("azure.keyvault.secrets.SecretClient", FakeSecretClient)
-    monkeypatch.setattr(azure.identity, "DefaultAzureCredential", lambda **kwargs: object())
+    monkeypatch.setattr(function_app, "create_azure_credential", lambda *_args: object())
     monkeypatch.setattr(azure.identity, "CertificateCredential", lambda **kwargs: object())
     monkeypatch.setattr(httpx, "HTTPTransport", lambda **kwargs: object())
     monkeypatch.setattr(httpx, "Client", FakeHttpxClient)
@@ -226,14 +264,14 @@ def test_build_sharepoint_client_constructs_client_once(monkeypatch: pytest.Monk
             graph_client,
             config.drive_id,
             "https://tenant.sharepoint.com/sites/site",
-            config.acl_max_pages,
+            config.execution.acl_max_pages,
             getattr(config, "sharepoint_site_id", None),
         ),
         (
             graph_client,
             second_config.drive_id,
             second_config.sharepoint_site_url,
-            second_config.acl_max_pages,
+            second_config.execution.acl_max_pages,
             second_config.sharepoint_site_id,
         ),
     ]

@@ -2,8 +2,8 @@ from dataclasses import replace
 
 import pytest
 import tiktoken
-
-from ingestion.chunking import chunk_audio_segments, chunk_pages
+from ingestion.chunking import chunk_audio_segments as _chunk_audio_segments
+from ingestion.chunking import chunk_pages as _chunk_pages
 from ingestion.errors import TerminalDocumentError
 from ingestion.models import (
     AudioMetadata,
@@ -15,6 +15,18 @@ from ingestion.models import (
     SourceLocator,
     VisualCoverageStatus,
 )
+
+TEST_MAX_CHUNKS_PER_SOURCE = 2_000
+
+
+def chunk_audio_segments(*args, **kwargs):
+    kwargs.setdefault("max_chunks_per_source", TEST_MAX_CHUNKS_PER_SOURCE)
+    return _chunk_audio_segments(*args, **kwargs)
+
+
+def chunk_pages(*args, **kwargs):
+    kwargs.setdefault("max_chunks_per_source", TEST_MAX_CHUNKS_PER_SOURCE)
+    return _chunk_pages(*args, **kwargs)
 
 
 def audio_metadata() -> AudioMetadata:

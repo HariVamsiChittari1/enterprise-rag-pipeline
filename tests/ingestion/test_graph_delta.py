@@ -4,8 +4,9 @@ previously untested, though the mechanism already existed in graph.py)."""
 from __future__ import annotations
 
 import httpx
+import pytest
 
-from ingestion.graph import read_drive_delta
+from ingestion.graph import GraphPageLimitExceeded, read_drive_delta
 
 
 def test_read_drive_delta_first_call_establishes_baseline() -> None:
@@ -129,6 +130,51 @@ def test_read_drive_delta_restarts_when_410_repeats_expired_location() -> None:
     assert delta.delta_link == final_link
 
 
+def test_read_drive_delta_uses_durable_page_ordinal_for_reset_traceback() -> None:
+    expired = "https://graph.microsoft.com/v1.0/drives/drive-1/root/delta?token=expired"
+    reset_location = "https://graph.microsoft.com/v1.0/drives/drive-1/root/delta"
+    final_link = "https://graph.microsoft.com/v1.0/drives/drive-1/root/delta?token=reset-fresh"
+
+    class Capture:
+        def paging_position(self, request_url):
+            assert request_url == expired
+            return 1, "receipt-0"
+
+        def begin_page(self, request_url, _page_ordinal, _predecessor_receipt_id):
+            if request_url == expired:
+                return {"state": "capture", "receiptId": "receipt-1"}
+            return {"state": "capture", "receiptId": "receipt-2"}
+
+        def record_reset(self, request_url, page_ordinal, location):
+            assert request_url == expired
+            assert page_ordinal == 1
+            assert location == reset_location
+
+        def seal_page(self, *_args):
+            return "receipt-2"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == expired:
+            return httpx.Response(410, headers={"location": reset_location})
+        assert str(request.url) == reset_location
+        return httpx.Response(
+            200,
+            json={"value": [{"id": "item-1"}], "@odata.deltaLink": final_link},
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        delta = read_drive_delta(
+            client,
+            "drive-1",
+            max_pages=10,
+            delta_link=expired,
+            page_capture=Capture(),
+        )
+
+    assert delta.is_full_baseline is True
+    assert delta.delta_link == final_link
+
+
 def test_read_drive_delta_deduplicates_repeated_item_ids_keeping_latest_state() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
@@ -213,6 +259,44 @@ def test_read_drive_delta_seals_fresh_pages_with_their_begin_ordinal() -> None:
 
     assert capture.begun == [(first_url, 0), (next_url, 1)]
     assert capture.sealed == [(first_url, 0, None), (next_url, 1, "receipt-0")]
+
+
+def test_read_drive_delta_returns_durable_next_link_at_page_budget() -> None:
+    start_url = "https://graph.microsoft.com/v1.0/drives/drive-1/root/delta?skip=7"
+    next_url = "https://graph.microsoft.com/v1.0/drives/drive-1/root/delta?skip=8"
+
+    class Capture:
+        def __init__(self) -> None:
+            self.begun: list[tuple[str, int, str | None]] = []
+            self.sealed: list[tuple[str, int, str | None]] = []
+
+        def paging_position(self, request_url):
+            assert request_url == start_url
+            return 7, "receipt-6"
+
+        def begin_page(self, request_url, page_ordinal, predecessor_receipt_id):
+            self.begun.append((request_url, page_ordinal, predecessor_receipt_id))
+            return {"state": "capture", "receiptId": "receipt-7"}
+
+        def seal_page(self, request_url, page_ordinal, predecessor_receipt_id, *_rest):
+            self.sealed.append((request_url, page_ordinal, predecessor_receipt_id))
+            return "receipt-7"
+
+    capture = Capture()
+    transport = httpx.MockTransport(lambda _request: httpx.Response(
+        200, json={"value": [{"id": "item-8"}], "@odata.nextLink": next_url},
+    ))
+    with httpx.Client(transport=transport) as client, pytest.raises(
+        GraphPageLimitExceeded,
+    ) as raised:
+        read_drive_delta(
+            client, "drive-1", max_pages=1,
+            delta_link=start_url, page_capture=capture,
+        )
+
+    assert raised.value.next_link == next_url
+    assert capture.begun == [(start_url, 7, "receipt-6")]
+    assert capture.sealed == [(start_url, 7, "receipt-6")]
 
 
 def test_read_drive_delta_handles_double_410_reset() -> None:

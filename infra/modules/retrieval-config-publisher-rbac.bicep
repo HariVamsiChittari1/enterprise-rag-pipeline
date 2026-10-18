@@ -7,6 +7,9 @@ param editorPrincipalId string = ''
 @description('Optional guarded writer principal; separate from bootstrap and human editor')
 param writerPrincipalId string = ''
 
+@description('Function API guarded writer principal')
+param functionWriterPrincipalId string = ''
+
 @description('Cosmos account resource ID')
 param cosmosAccountId string
 
@@ -25,7 +28,6 @@ var readActions = [
 var editActions = concat(readActions, [
   'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/items/replace'
   'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/executeQuery'
-  'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/readChangeFeed'
 ])
 
 resource bootstrapRole 'Microsoft.DocumentDB/databaseAccounts/sqlRoleDefinitions@2024-05-15' = {
@@ -93,6 +95,15 @@ resource writer 'Microsoft.DocumentDB/databaseAccounts/sqlRoleAssignments@2024-0
   properties: {
     roleDefinitionId: writerRole.id
     principalId: writerPrincipalId
+    scope: containerScope
+  }
+}
+
+resource functionWriter 'Microsoft.DocumentDB/databaseAccounts/sqlRoleAssignments@2024-05-15' = if (!empty(functionWriterPrincipalId)) {
+  name: '${accountName}/${guid(functionWriterPrincipalId, cosmosAccountId, retrievalConfigContainerName, 'function-writer')}'
+  properties: {
+    roleDefinitionId: writerRole.id
+    principalId: functionWriterPrincipalId
     scope: containerScope
   }
 }

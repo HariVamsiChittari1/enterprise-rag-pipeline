@@ -19,11 +19,14 @@ from typing import Any, Mapping
 from azure.core import MatchConditions
 
 from ingestion.models import (
-    DocumentStage,
-    DocumentStatus,
     RETIRED_REASONS,
     SOURCE_DOCUMENT_RECORD_TYPE,
     VISUAL_MANIFEST_PAGE_RECORD_TYPE,
+    AclFeedback,
+    AclStatus,
+    DocumentStage,
+    DocumentStatus,
+    canonical_acl_feedback,
 )
 
 logger = logging.getLogger(__name__)
@@ -61,6 +64,8 @@ class ReadyDocumentRef:
     allowed_group_ids: tuple[str, ...]
     acl_hash: str
     etag: str
+    acl_status: AclStatus = AclStatus.VERIFIED
+    acl_feedback: tuple[AclFeedback, ...] = ()
     source_etag: str | None = None
     lifecycle_generation: int = 0
     status: DocumentStatus = DocumentStatus.READY
@@ -88,6 +93,8 @@ class LifecycleDocumentRef:
     expected_chunk_count: int | None = None
     pending_allowed_group_ids: tuple[str, ...] | None = None
     pending_acl_hash: str | None = None
+    pending_acl_status: AclStatus | None = None
+    pending_acl_feedback: tuple[AclFeedback, ...] | None = None
     pending_retired_reason: str | None = None
 
 
@@ -159,7 +166,7 @@ class DocumentLifecycleRepository:
         _validate_page_size(page_size)
         query = (
             "SELECT c.sourceId, c.driveId, c.documentId, c.sourceRunId, c.documentKey, c.itemId, "
-            "c.allowedGroupIds, c.aclHash, c.eTag, c.status, "
+            "c.allowedGroupIds, c.aclHash, c.aclStatus, c.aclFeedback, c.eTag, c.status, "
             "c.lifecycleGeneration, c.processingProfileDigest, c._etag FROM c "
             "WHERE c.sourceId = @sourceId AND c.recordType = @recordType AND ("
             "ARRAY_CONTAINS(@statuses, c.status) OR "
@@ -192,7 +199,7 @@ class DocumentLifecycleRepository:
     ) -> ReadyDocumentRef | None:
         query = (
             "SELECT c.sourceId, c.driveId, c.documentId, c.sourceRunId, c.documentKey, c.itemId, "
-            "c.allowedGroupIds, c.aclHash, c.eTag, c.status, "
+            "c.allowedGroupIds, c.aclHash, c.aclStatus, c.aclFeedback, c.eTag, c.status, "
             "c.lifecycleGeneration, c.processingProfileDigest, c._etag FROM c "
             "WHERE c.sourceId = @sourceId AND c.recordType = @recordType "
             "AND ARRAY_CONTAINS(@statuses, c.status) AND c.documentId = @documentId"
@@ -228,7 +235,7 @@ class DocumentLifecycleRepository:
     ) -> ReadyDocumentRef | None:
         query = (
             "SELECT c.sourceId, c.driveId, c.documentId, c.sourceRunId, c.documentKey, c.itemId, "
-            "c.allowedGroupIds, c.aclHash, c.eTag, c.status, "
+            "c.allowedGroupIds, c.aclHash, c.aclStatus, c.aclFeedback, c.eTag, c.status, "
             "c.lifecycleGeneration, c._etag, c._ts FROM c "
             "WHERE c.sourceId = @sourceId AND c.recordType = @recordType AND c.status = @retiredStatus "
             "AND c.retiredReason = @retiredReason "
@@ -311,6 +318,7 @@ class DocumentLifecycleRepository:
             "SELECT c.sourceId, c.driveId, c.documentId, c.sourceRunId, c.documentKey, c.status, "
             "c.lifecycleGeneration, c.allowedGroupIds, c.aclHash, "
             "c.expectedChunkCount, c.pendingAllowedGroupIds, c.pendingAclHash, "
+            "c.pendingAclStatus, c.pendingAclFeedback, "
             "c.pendingRetiredReason, c._etag FROM c "
             "WHERE c.sourceId = @sourceId AND c.recordType = @recordType "
             "AND ARRAY_CONTAINS(@statuses, c.status)"
@@ -499,7 +507,7 @@ class DocumentLifecycleRepository:
         _validate_page_size(page_size)
         query = (
             "SELECT c.sourceId, c.driveId, c.documentId, c.sourceRunId, c.documentKey, c.itemId, "
-            "c.allowedGroupIds, c.aclHash, c.eTag, c.status, "
+            "c.allowedGroupIds, c.aclHash, c.aclStatus, c.aclFeedback, c.eTag, c.status, "
             "c.lifecycleGeneration, c.processingProfileDigest, c._etag FROM c "
             "WHERE c.sourceId = @sourceId AND c.recordType = @recordType "
             "AND c.documentId = @documentId"
@@ -576,9 +584,10 @@ class DocumentLifecycleRepository:
             raise ValueError("retired_reason must be one of the supported values")
         now = _now_iso()
         current = self._read_document(source_run_id, document_id)
+        current_status = current.get("status")
         generation = (
             _require_generation(current)
-            if current.get("status") == DocumentStatus.RETIRING.value
+            if current_status == DocumentStatus.RETIRING.value
             else _require_generation(current) + 1
         )
         begin_operations = [
@@ -593,7 +602,8 @@ class DocumentLifecycleRepository:
                 partition_key=source_run_id,
                 patch_operations=begin_operations,
                 filter_predicate=(
-                    "from c where c.status = 'ready' OR c.status = 'retiring'"
+                    "from c where c.status = 'ready' OR "
+                    "c.status = 'acl_refreshing' OR c.status = 'retiring'"
                 ),
                 etag=etag,
                 match_condition=MatchConditions.IfNotModified,
@@ -615,6 +625,16 @@ class DocumentLifecycleRepository:
             {"op": "set", "path": "/updatedAt", "value": now},
             {"op": "remove", "path": "/pendingRetiredReason"},
         ]
+        for pending_acl_field in (
+            "pendingAllowedGroupIds",
+            "pendingAclHash",
+            "pendingAclStatus",
+            "pendingAclFeedback",
+        ):
+            if pending_acl_field in current:
+                complete_operations.append(
+                    {"op": "remove", "path": f"/{pending_acl_field}"}
+                )
         try:
             self._source_documents.patch_item(
                 item=document_id,
@@ -640,7 +660,8 @@ class DocumentLifecycleRepository:
             iterator = self._source_documents.query_items(
                 query=(
                     "SELECT TOP @pageSize c.documentId, c.sourceRunId, c.documentKey, "
-                    "c.status, c.lifecycleGeneration, c.allowedGroupIds, c.aclHash, c._etag FROM c "
+                    "c.status, c.lifecycleGeneration, c.allowedGroupIds, c.aclHash, "
+                    "c.pendingAclStatus, c.pendingAclFeedback, c._etag FROM c "
                     "WHERE c.sourceId = @sourceId AND c.recordType = @recordType"
                 ),
                 parameters=[
@@ -688,7 +709,13 @@ class DocumentLifecycleRepository:
         etag: str,
         allowed_group_ids: tuple[str, ...],
         acl_hash: str,
+        acl_status: AclStatus = AclStatus.VERIFIED,
+        acl_feedback: tuple[AclFeedback, ...] = (),
     ) -> None:
+        if acl_status is not AclStatus.VERIFIED:
+            raise ValueError("ACL refresh requires verified status")
+        if canonical_acl_feedback(acl_feedback) != acl_feedback:
+            raise ValueError("acl_feedback must be sorted and unique")
         now = _now_iso()
         current = self._read_document(source_run_id, document_id)
         generation = (
@@ -705,6 +732,12 @@ class DocumentLifecycleRepository:
                 "value": list(allowed_group_ids),
             },
             {"op": "set", "path": "/pendingAclHash", "value": acl_hash},
+            {"op": "set", "path": "/pendingAclStatus", "value": acl_status.value},
+            {
+                "op": "set",
+                "path": "/pendingAclFeedback",
+                "value": [value.value for value in acl_feedback],
+            },
             {"op": "set", "path": "/updatedAt", "value": now},
         ]
         if (
@@ -752,12 +785,20 @@ class DocumentLifecycleRepository:
         complete_patch = [
             {"op": "set", "path": "/allowedGroupIds", "value": list(allowed_group_ids)},
             {"op": "set", "path": "/aclHash", "value": acl_hash},
+            {"op": "set", "path": "/aclStatus", "value": acl_status.value},
+            {
+                "op": "set",
+                "path": "/aclFeedback",
+                "value": [value.value for value in acl_feedback],
+            },
             {"op": "set", "path": "/aclEvaluatedAt", "value": now},
             {"op": "set", "path": "/status", "value": DocumentStatus.READY.value},
             {"op": "set", "path": "/lifecycleGeneration", "value": generation},
             {"op": "set", "path": "/updatedAt", "value": now},
             {"op": "remove", "path": "/pendingAllowedGroupIds"},
             {"op": "remove", "path": "/pendingAclHash"},
+            {"op": "remove", "path": "/pendingAclStatus"},
+            {"op": "remove", "path": "/pendingAclFeedback"},
         ]
         try:
             self._source_documents.patch_item(
@@ -772,6 +813,44 @@ class DocumentLifecycleRepository:
             if _error_status(error) in (404, 412):
                 raise LifecycleConflictError("document changed during ACL refresh") from None
             raise LifecycleRepositoryError("Cosmos document ACL refresh completion failed") from None
+
+    def update_document_acl_feedback(
+        self,
+        *,
+        source_run_id: str,
+        document_id: str,
+        etag: str,
+        acl_status: AclStatus,
+        acl_feedback: tuple[AclFeedback, ...],
+    ) -> None:
+        """Persist non-authorizing ACL observations without touching chunks or generation."""
+        if acl_status is not AclStatus.VERIFIED:
+            raise ValueError("ACL feedback update requires verified status")
+        if canonical_acl_feedback(acl_feedback) != acl_feedback:
+            raise ValueError("acl_feedback must be sorted and unique")
+        now = _now_iso()
+        try:
+            self._source_documents.patch_item(
+                item=document_id,
+                partition_key=source_run_id,
+                patch_operations=[
+                    {"op": "set", "path": "/aclStatus", "value": acl_status.value},
+                    {
+                        "op": "set",
+                        "path": "/aclFeedback",
+                        "value": [value.value for value in acl_feedback],
+                    },
+                    {"op": "set", "path": "/aclEvaluatedAt", "value": now},
+                    {"op": "set", "path": "/updatedAt", "value": now},
+                ],
+                filter_predicate="from c where c.status = 'ready'",
+                etag=etag,
+                match_condition=MatchConditions.IfNotModified,
+            )
+        except Exception as error:
+            if _error_status(error) in (404, 412):
+                raise LifecycleConflictError("document already changed or missing") from None
+            raise LifecycleRepositoryError("Cosmos document ACL feedback update failed") from None
 
     def set_document_chunks_retrievable(
         self,
@@ -1235,6 +1314,8 @@ def _ready_ref_from_row(row: Mapping[str, Any]) -> ReadyDocumentRef:
             allowed_group_ids=tuple(row["allowedGroupIds"]),
             acl_hash=row["aclHash"],
             etag=row["_etag"],
+            acl_status=AclStatus(row.get("aclStatus", AclStatus.PENDING.value)),
+            acl_feedback=_acl_feedback(row.get("aclFeedback", [])),
             source_etag=row.get("eTag") if isinstance(row.get("eTag"), str) else None,
             lifecycle_generation=_require_generation(row),
             status=DocumentStatus(row.get("status", DocumentStatus.READY.value)),
@@ -1246,7 +1327,7 @@ def _ready_ref_from_row(row: Mapping[str, Any]) -> ReadyDocumentRef:
                 else None
             ),
         )
-    except (KeyError, ValueError) as error:
+    except (KeyError, TypeError, ValueError) as error:
         raise LifecycleRepositoryError("ready-document row is missing an expected field") from error
 
 
@@ -1301,6 +1382,14 @@ def _lifecycle_ref_from_row(row: Mapping[str, Any]) -> LifecycleDocumentRef:
                 if isinstance(row.get("pendingAclHash"), str)
                 else None
             ),
+            pending_acl_status=(
+                AclStatus(row["pendingAclStatus"])
+                if row.get("pendingAclStatus") is not None else None
+            ),
+            pending_acl_feedback=(
+                _acl_feedback(row["pendingAclFeedback"])
+                if row.get("pendingAclFeedback") is not None else None
+            ),
             pending_retired_reason=(
                 row.get("pendingRetiredReason")
                 if isinstance(row.get("pendingRetiredReason"), str)
@@ -1311,6 +1400,15 @@ def _lifecycle_ref_from_row(row: Mapping[str, Any]) -> LifecycleDocumentRef:
         raise LifecycleRepositoryError(
             "lifecycle-transition row is malformed"
         ) from error
+
+
+def _acl_feedback(value: Any) -> tuple[AclFeedback, ...]:
+    if not isinstance(value, list):
+        raise ValueError("persisted ACL feedback must be a list")
+    feedback = tuple(AclFeedback(item) for item in value)
+    if canonical_acl_feedback(feedback) != feedback:
+        raise ValueError("persisted ACL feedback must be sorted and unique")
+    return feedback
 
 
 def _error_status(error: Exception) -> int | None:

@@ -168,10 +168,16 @@ class SecureCosmosRetriever:
         raw: bool = False,
         search_terms: list[str] | None = None,
         eligible_source_ids: list[str] | tuple[str, ...] | None = None,
+        acl_enabled: bool | None = None,
     ) -> list[RetrievedChunk] | list[dict[str, Any]]:
+        if acl_enabled is not None and not isinstance(acl_enabled, bool):
+            raise ValueError("acl_enabled_invalid")
+        effective_acl_enabled = (
+            self._acl_enabled if acl_enabled is None else acl_enabled
+        )
         if not query_text.strip():
             raise ValueError("query_text_required")
-        if self._acl_enabled and not principal_ids:
+        if effective_acl_enabled and not principal_ids:
             raise ValueError("principal_ids_required")
         if top_k < 1 or top_k > 50:
             raise ValueError("top_k_out_of_range")
@@ -204,7 +210,7 @@ class SecureCosmosRetriever:
         if eligible_source_ids is not None:
             filters.append(_SOURCE_FILTER)
             parameters.append({"name": "@eligibleSourceIds", "value": normalized_source_ids})
-        if self._acl_enabled:
+        if effective_acl_enabled:
             filters.append(_ACL_FILTER)
             parameters.append(
                 {"name": "@principalIds", "value": sorted(set(principal_ids))}

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -25,7 +26,6 @@ def _source(source_id: str, drive_id: str = "drive-a", **overrides: Any) -> dict
     item: dict[str, Any] = {
         "id": source_id,
         "sourceId": source_id,
-        "recordType": "ingestion-source",
         "schemaVersion": 1,
         "sourceKind": "sharepoint-drive",
         "desiredState": "active",
@@ -33,6 +33,11 @@ def _source(source_id: str, drive_id: str = "drive-a", **overrides: Any) -> dict
             "siteId": f"site-{source_id}",
             "siteUrl": f"https://tenant.sharepoint.com/sites/{source_id}",
             "driveId": drive_id,
+            "businessName": f"Business {source_id}",
+            "contentScope": "business",
+            "chunksContainer": "business-a-search-chunks",
+            "manifestsContainer": "business-a-source-documents",
+            "retrievalAclEnabled": True,
         },
         "_etag": f"etag-{source_id}",
     }
@@ -53,13 +58,11 @@ class FakeSources:
         self.items = {item["sourceId"]: deepcopy(item) for item in items}
 
     def query_items(self, **kwargs: Any) -> Any:
-        assert "@recordType" in {p["name"] for p in kwargs["parameters"]}
         if "c.config.driveId = @driveId" in kwargs["query"]:
             parameters = {item["name"]: item["value"] for item in kwargs["parameters"]}
             return [
                 item for item in self.items.values()
-                if item.get("recordType") == parameters["@recordType"]
-                and item.get("config", {}).get("driveId") == parameters["@driveId"]
+                if item.get("config", {}).get("driveId") == parameters["@driveId"]
             ][:2]
         return _RunsPageIterator(list(self.items.values()), kwargs["max_item_count"])
 
@@ -164,7 +167,11 @@ class FakeRuns:
                 values.get("@sourceReprovision"),
             }
             and all(
-                item.get(field) == values[parameter]
+                (
+                    item.get(field, 0)
+                    if parameter == "@generation"
+                    else item.get(field)
+                ) == values[parameter]
                 for parameter, field in (
                     ("@recordType", "recordType"),
                     ("@owner", "ownerInstanceId"),
@@ -172,6 +179,7 @@ class FakeRuns:
                     ("@receiptId", "receiptId"),
                     ("@roundId", "roundId"),
                     ("@itemId", "itemId"),
+                    ("@generation", "traversalGeneration"),
                     ("@dispatchId", "dispatchId"),
                     ("@status", "status"),
                 )
@@ -200,6 +208,8 @@ class FakeRuns:
         batch_operations: list[tuple[Any, ...]],
         partition_key: str,
     ) -> list[dict[str, int]]:
+        if len(batch_operations) > 100:
+            raise ValueError("transactional batch exceeds 100 operations")
         self.batch_calls.append((partition_key, deepcopy(batch_operations)))
         if self.before_batch is not None:
             callback = self.before_batch
@@ -366,6 +376,7 @@ def test_delta_page_capture_seals_fragments_and_replays_exact_response() -> None
     repository.acquire_drive_coordinator(
         plan, owner_instance_id="delta-owner", operation="delta-sync",
     )
+    repository.begin_delta_round(plan, "delta-owner", "round-1", None)
     capture = repository.delta_page_capture(plan, "delta-owner", "round-1")
     request_url = "https://graph.microsoft.com/v1.0/drives/drive-a/root/delta"
     items = [{"id": "item-1", "name": "one.pdf"}, {"id": "item-2", "name": "two.pdf"}]
@@ -387,6 +398,112 @@ def test_delta_page_capture_seals_fragments_and_replays_exact_response() -> None
     assert len(fragments) == len(items)
 
 
+def test_delta_page_resume_preserves_url_predecessor_and_page_ordinal() -> None:
+    repository, _, _ = _repository([_source("source-a")])
+    plan = _accept_source(repository, "source-a")
+    repository.acquire_drive_coordinator(
+        plan, owner_instance_id="delta-owner", operation="delta-sync",
+    )
+    first_url = "https://graph.microsoft.com/v1.0/drives/drive-a/root/delta"
+    next_url = "https://graph.microsoft.com/v1.0/drives/drive-a/root/delta?skip=2"
+    final_url = "https://graph.microsoft.com/v1.0/drives/drive-a/root/delta?token=end"
+    repository.begin_delta_round(plan, "delta-owner", "round-resume", first_url)
+    capture = repository.delta_page_capture(plan, "delta-owner", "round-resume")
+
+    first = capture.begin_page(first_url, 0, None)
+    first_receipt = capture.seal_page(
+        first_url, 0, None, [{"id": "item-1", "name": "old.pdf"}], next_url, None,
+    )
+
+    resumed = repository.delta_page_capture(plan, "delta-owner", "round-resume")
+    assert resumed.resume_state()["nextLink"] == next_url
+    assert resumed.paging_position(next_url) == (1, first_receipt)
+    resumed.begin_page(next_url, 1, first_receipt)
+    resumed.seal_page(
+        next_url, 1, first_receipt,
+        [{"id": "item-1", "name": "latest.pdf"}], None, final_url,
+    )
+
+    final = resumed.resume_state()
+    assert first["receiptId"] == first_receipt
+    assert final["deltaLink"] == final_url
+    assert resumed.paging_position(next_url) == (1, first_receipt)
+    assert resumed.list_reduced_items() == [{"id": "item-1", "name": "latest.pdf"}]
+
+
+def test_delta_page_capture_reads_legacy_generation_zero_state() -> None:
+    repository, _, runs = _repository([_source("source-a")])
+    plan = _accept_source(repository, "source-a")
+    repository.acquire_drive_coordinator(
+        plan, owner_instance_id="delta-owner", operation="delta-sync",
+    )
+    repository.begin_delta_round(plan, "delta-owner", "round-legacy", None)
+    capture = repository.delta_page_capture(plan, "delta-owner", "round-legacy")
+    request_url = "https://graph.microsoft.com/v1.0/drives/drive-a/root/delta"
+    final_url = f"{request_url}?token=legacy"
+    capture.begin_page(request_url, 0, None)
+    capture.seal_page(
+        request_url, 0, None,
+        [{"id": "item-legacy", "name": "legacy.pdf"}],
+        None, final_url,
+    )
+
+    for item in runs.items.values():
+        if item.get("roundId") == "round-legacy":
+            item.pop("traversalGeneration", None)
+
+    resumed = repository.delta_page_capture(plan, "delta-owner", "round-legacy")
+
+    assert resumed.resume_state()["traversalGeneration"] == 0
+    assert resumed.begin_page(request_url, 0, None)["state"] == "sealed"
+    assert resumed.list_reduced_items() == [
+        {"id": "item-legacy", "name": "legacy.pdf"},
+    ]
+    assert resumed.has_reduced_item("item-legacy") is True
+    assert resumed.count_observed_entries() == 1
+
+
+def test_delta_page_capture_fences_receipt_creation_against_round_reset() -> None:
+    repository, _, runs = _repository([_source("source-a")])
+    plan = _accept_source(repository, "source-a")
+    repository.acquire_drive_coordinator(
+        plan, owner_instance_id="delta-owner", operation="delta-sync",
+    )
+    repository.begin_delta_round(plan, "delta-owner", "round-fence", None)
+    capture = repository.delta_page_capture(plan, "delta-owner", "round-fence")
+
+    def advance_generation() -> None:
+        key, current = next(
+            (key, item)
+            for key, item in runs.items.items()
+            if item.get("recordType") == "delta-round"
+            and item.get("roundId") == "round-fence"
+        )
+        runs._etag += 1
+        runs.items[key] = deepcopy(current) | {
+            "traversalGeneration": 1,
+            "_etag": f"etag-{runs._etag}",
+        }
+
+    runs.before_batch = advance_generation
+
+    with pytest.raises(
+        SourceRegistryConflictError,
+        match="delta_page_capture_conflict",
+    ):
+        capture.begin_page(
+            "https://graph.microsoft.com/v1.0/drives/drive-a/root/delta",
+            0,
+            None,
+        )
+
+    assert not any(
+        item.get("recordType") == "delta-page-receipt"
+        and item.get("roundId") == "round-fence"
+        for item in runs.items.values()
+    )
+
+
 def test_delta_page_capture_persists_reset_anchor_for_replay() -> None:
     repository, _, _ = _repository([_source("source-a")])
     plan = _accept_source(repository, "source-a")
@@ -402,9 +519,12 @@ def test_delta_page_capture_persists_reset_anchor_for_replay() -> None:
 
     claim = capture.begin_page(request_url, 0, None)
     capture.record_reset(request_url, 0, reset_location)
-    replay = capture.begin_page(request_url, 0, None)
-    capture.begin_page(reset_location, 0, None)
-    capture.seal_page(
+    resumed = repository.delta_page_capture(
+        plan, "delta-owner", "round-reset",
+    )
+    reset_state = resumed.resume_state()
+    resumed.begin_page(reset_location, 0, None)
+    resumed.seal_page(
         reset_location,
         0,
         None,
@@ -414,9 +534,59 @@ def test_delta_page_capture_persists_reset_anchor_for_replay() -> None:
     )
 
     assert claim["state"] == "capture"
-    assert replay["state"] == "reset"
-    assert replay["location"] == reset_location
-    assert capture.count_observed_entries() == 1
+    assert reset_state["roundStartKind"] == "reset"
+    assert reset_state["roundStartUrl"] == reset_location
+    assert reset_state["traversalGeneration"] == 1
+    assert resumed.count_observed_entries() == 1
+
+
+def test_delta_page_capture_resets_clear_invalidated_reductions() -> None:
+    repository, _, runs = _repository([_source("source-a")])
+    plan = _accept_source(repository, "source-a")
+    repository.acquire_drive_coordinator(
+        plan, owner_instance_id="delta-owner", operation="delta-sync",
+    )
+    repository.begin_delta_round(plan, "delta-owner", "round-reset-clean", None)
+    capture = repository.delta_page_capture(plan, "delta-owner", "round-reset-clean")
+    stale_url = "https://graph.microsoft.com/v1.0/drives/drive-a/root/delta?token=stale"
+    reset_url = "https://graph.microsoft.com/v1.0/drives/drive-a/root/delta?token=reset"
+    stale_items = [
+        {"id": f"item-stale-{ordinal}", "name": f"stale-{ordinal}.pdf"}
+        for ordinal in range(101)
+    ]
+    capture.begin_page(stale_url, 0, None)
+    capture.seal_page(
+        stale_url,
+        0,
+        None,
+        stale_items,
+        None,
+        None,
+    )
+
+    capture.record_reset(stale_url, 0, reset_url)
+
+    assert capture.list_reduced_items() == []
+    assert repository.has_reduced_delta_item(
+        "source-a", "round-reset-clean", "item-stale-0",
+    ) is False
+    assert len([
+        item for item in runs.items.values()
+        if item.get("recordType") == "delta-item-state"
+        and item.get("traversalGeneration") == 0
+    ]) == 101
+    assert max(len(operations) for _source, operations in runs.batch_calls) <= 100
+
+    capture.begin_page(reset_url, 0, None)
+    capture.seal_page(
+        reset_url,
+        0,
+        None,
+        [{"id": "item-fresh", "name": "fresh.pdf"}],
+        None,
+        "https://graph.microsoft.com/v1.0/drives/drive-a/root/delta?token=fresh",
+    )
+    assert capture.list_reduced_items() == [{"id": "item-fresh", "name": "fresh.pdf"}]
 
 
 def test_delta_page_reduction_uses_last_page_and_entry_occurrence() -> None:
@@ -425,6 +595,7 @@ def test_delta_page_reduction_uses_last_page_and_entry_occurrence() -> None:
     repository.acquire_drive_coordinator(
         plan, owner_instance_id="delta-owner", operation="delta-sync",
     )
+    repository.begin_delta_round(plan, "delta-owner", "round-reduce", None)
     capture = repository.delta_page_capture(plan, "delta-owner", "round-reduce")
     first_url = "https://graph.microsoft.com/v1.0/drives/drive-a/root/delta"
     next_url = "https://graph.microsoft.com/v1.0/next"
@@ -534,6 +705,71 @@ def test_full_sync_progress_commits_cursor_round_and_owner_atomically() -> None:
         round_id="full-round",
         candidate_delta_link="https://graph.microsoft.com/v1.0/drives/drive-a/root/delta?token=final",
     ) == {"committed": True, "replayed": True}
+
+
+def test_full_sync_progress_survives_label_and_acl_policy_updates() -> None:
+    repository, _, _ = _repository([_source("source-a")])
+    plan = _accept_source(repository, "source-a")
+    repository.acquire_drive_coordinator(
+        plan,
+        owner_instance_id="full-owner",
+        operation="full-sync",
+    )
+    repository.begin_delta_round(plan, "full-owner", "full-round", None)
+    repository.mark_delta_round_cursor_ready(
+        "source-a",
+        "full-round",
+        "full-owner",
+        "https://graph.microsoft.com/final",
+        {"items_seen": 1, "failed": 0, "pending": 0},
+    )
+    renamed, _ = repository.change_source_business_name(
+        source_id=plan.source_id,
+        business_name="Renamed Business",
+        if_match=plan.catalog_etag,
+    )
+    repository.change_source_policy(
+        source_id=plan.source_id,
+        retrieval_acl_enabled=False,
+        if_match=renamed.catalog_etag,
+    )
+
+    result = repository.commit_full_sync_progress(
+        plan,
+        "full-owner",
+        round_id="full-round",
+        candidate_delta_link="https://graph.microsoft.com/final",
+    )
+
+    assert result == {"committed": True, "replayed": False}
+
+
+def test_full_sync_progress_fails_closed_after_lifecycle_change() -> None:
+    repository, sources, _ = _repository([_source("source-a")])
+    plan = _accept_source(repository, "source-a")
+    repository.acquire_drive_coordinator(
+        plan,
+        owner_instance_id="full-owner",
+        operation="full-sync",
+    )
+    repository.begin_delta_round(plan, "full-owner", "full-round", None)
+    repository.mark_delta_round_cursor_ready(
+        "source-a",
+        "full-round",
+        "full-owner",
+        "https://graph.microsoft.com/final",
+        {"items_seen": 1, "failed": 0, "pending": 0},
+    )
+    sources.items["source-a"]["desiredState"] = "paused"
+    sources.items["source-a"]["_etag"] = "paused-etag"
+
+    with pytest.raises(SourceRegistryConflictError, match="source_catalog_changed"):
+        repository.commit_full_sync_progress(
+            plan,
+            "full-owner",
+            round_id="full-round",
+            candidate_delta_link="https://graph.microsoft.com/final",
+        )
 
 
 @pytest.mark.parametrize("source_order", [("a", "b"), ("b", "a")])
@@ -704,6 +940,36 @@ def test_winner_clear_only_allows_source_retirement_maintenance(operation: str) 
     assert repository.observe_lifecycle(retired_plan)["retired"] is True
 
 
+def test_retirement_latch_survives_label_and_acl_policy_updates() -> None:
+    repository, _, _ = _repository([_source("source-a")])
+    plan = _accept_source(repository, "source-a")
+    renamed, _ = repository.change_source_business_name(
+        source_id=plan.source_id,
+        business_name="Renamed Business",
+        if_match=plan.catalog_etag,
+    )
+    repository.change_source_policy(
+        source_id=plan.source_id,
+        retrieval_acl_enabled=False,
+        if_match=renamed.catalog_etag,
+    )
+
+    gate = repository.write_retirement_latch(plan, retired=False)
+
+    assert gate["sourceId"] == plan.source_id
+    assert gate["retired"] is False
+
+
+def test_retirement_latch_fails_closed_after_lifecycle_change() -> None:
+    repository, sources, _ = _repository([_source("source-a")])
+    plan = _accept_source(repository, "source-a")
+    sources.items["source-a"]["desiredState"] = "paused"
+    sources.items["source-a"]["_etag"] = "paused-etag"
+
+    with pytest.raises(SourceRegistryConflictError, match="source_catalog_changed"):
+        repository.write_retirement_latch(plan, retired=False)
+
+
 def test_operation_replay_is_idempotent_and_does_not_repeat_side_effects() -> None:
     repository, _, runs = _repository([_source("source-a")])
     plan = _accept_source(repository, "source-a")
@@ -765,6 +1031,58 @@ def test_operation_replay_is_idempotent_and_does_not_repeat_side_effects() -> No
         item for item in runs.items.values()
         if item["recordType"] == "document-attempt"
     ]
+
+
+def test_quarantined_operation_is_terminal_and_replays_explicit_outcome() -> None:
+    repository, _, _ = _repository([_source("source-a")])
+    plan = _accept_source(repository, "source-a")
+    repository.acquire_drive_coordinator(
+        plan, owner_instance_id="orchestration-a", operation="delta-sync",
+    )
+    claim = repository.begin_document_operation(
+        plan,
+        owner_instance_id="orchestration-a",
+        physical_run_id="source-a:run-a",
+        item_id="document-a",
+        operation_kind="delta-sync",
+    )
+    repository.start_document_operation(
+        "source-a",
+        "orchestration-a",
+        claim["operationId"],
+        "source-a:run-a",
+        "document-a",
+        "delta-sync",
+    )
+    outcome = {
+        "documentId": "document-a",
+        "status": "quarantined",
+        "error": "unsupported_source_format",
+    }
+
+    settled = repository.settle_document_operation(
+        "source-a",
+        "orchestration-a",
+        claim["operationId"],
+        physical_run_id="source-a:run-a",
+        item_id="document-a",
+        operation_kind="delta-sync",
+        status="quarantined",
+        outcome=outcome,
+    )
+    replay = repository.begin_document_operation(
+        plan,
+        owner_instance_id="orchestration-a",
+        physical_run_id="source-a:run-a",
+        item_id="document-a",
+        operation_kind="delta-sync",
+    )
+
+    assert settled["status"] == "completed"
+    assert replay["status"] == "completed"
+    assert replay["terminalStatus"] == "quarantined"
+    assert replay["outcome"] == outcome
+    assert repository.get_unresolved_document_operation_count("source-a") == 0
 
 
 def test_operation_identity_mismatch_cannot_settle_another_item() -> None:
@@ -1022,6 +1340,16 @@ def test_source_retirement_maintenance_requires_quiescence_and_retries_same_owne
     first = repository.begin_operator_maintenance(
         retired_plan, owner_instance_id="retire-owner", operation="source-retirement",
     )
+    renamed, _ = repository.change_source_business_name(
+        source_id=retired_plan.source_id,
+        business_name="Renamed Business",
+        if_match=retired_plan.catalog_etag,
+    )
+    repository.change_source_policy(
+        source_id=retired_plan.source_id,
+        retrieval_acl_enabled=False,
+        if_match=renamed.catalog_etag,
+    )
     assert repository.begin_operator_maintenance(
         retired_plan, owner_instance_id="retire-owner", operation="source-retirement",
     ) == first
@@ -1033,25 +1361,74 @@ def test_source_retirement_maintenance_requires_quiescence_and_retries_same_owne
     assert repository.get_drive_coordinator("source-a")["state"] == "settled"
 
 
-def test_existing_owner_cannot_continue_under_changed_catalog_for_new_work() -> None:
+def test_existing_owner_continues_after_label_and_acl_policy_updates() -> None:
     repository, _, _ = _repository([_source("source-a")])
     plan = _accept_source(repository, "source-a")
     repository.acquire_drive_coordinator(
         plan, owner_instance_id="orchestration-a", operation="full-sync",
     )
-    changed_plan = SourcePlan(plan.source, "new-catalog-etag", plan.binding_digest)
+    renamed, _ = repository.change_source_business_name(
+        source_id=plan.source_id,
+        business_name="Renamed Business",
+        if_match=plan.catalog_etag,
+    )
+    repository.change_source_policy(
+        source_id=plan.source_id,
+        retrieval_acl_enabled=False,
+        if_match=renamed.catalog_etag,
+    )
 
-    with pytest.raises(SourceRegistryConflictError, match="catalog_changed"):
+    coordinator = repository.acquire_drive_coordinator(
+        plan,
+        owner_instance_id="orchestration-a",
+        operation="delta-sync",
+    )
+
+    assert coordinator["ownerInstanceId"] == "orchestration-a"
+    assert coordinator["acceptedBindingDigest"] == plan.binding_digest
+
+
+def test_existing_owner_fails_closed_after_lifecycle_change() -> None:
+    repository, sources, _ = _repository([_source("source-a")])
+    plan = _accept_source(repository, "source-a")
+    repository.acquire_drive_coordinator(
+        plan,
+        owner_instance_id="orchestration-a",
+        operation="full-sync",
+    )
+    sources.items["source-a"]["desiredState"] = "paused"
+    sources.items["source-a"]["_etag"] = "paused-etag"
+
+    with pytest.raises(SourceRegistryConflictError, match="source_catalog_changed"):
         repository.acquire_drive_coordinator(
-            changed_plan,
+            plan,
             owner_instance_id="orchestration-a",
             operation="delta-sync",
         )
 
-    current_owner = repository.assert_drive_coordinator_owner(
-        "source-a", "orchestration-a",
+
+def test_existing_owner_fails_closed_after_binding_change() -> None:
+    repository, sources, _ = _repository([_source("source-a")])
+    plan = _accept_source(repository, "source-a")
+    repository.acquire_drive_coordinator(
+        plan,
+        owner_instance_id="orchestration-a",
+        operation="full-sync",
     )
-    assert current_owner["ownerInstanceId"] == "orchestration-a"
+    sources.items["source-a"]["config"]["chunksContainer"] = (
+        "business-b-search-chunks"
+    )
+    sources.items["source-a"]["_etag"] = "binding-etag"
+
+    with pytest.raises(
+        SourceRegistryConflictError,
+        match="source_binding_is_immutable",
+    ):
+        repository.acquire_drive_coordinator(
+            plan,
+            owner_instance_id="orchestration-a",
+            operation="delta-sync",
+        )
 
 
 def test_unreserved_duplicate_drive_rejects_each_duplicate_and_keeps_other_sources() -> None:
@@ -1443,6 +1820,45 @@ def test_source_plan_payload_round_trip_preserves_identity() -> None:
     assert SourcePlan.from_payload(plan.to_payload()) == plan
 
 
+def test_config_for_source_binds_immutable_container_routing() -> None:
+    from ingestion.source_registry import config_for_source
+
+    config = SimpleNamespace(
+        source_id="legacy-source",
+        drive_id="legacy-drive",
+        sharepoint_site_url="https://tenant.sharepoint.com/sites/legacy",
+        sharepoint_site_id="legacy-site",
+        cosmos_search_chunks_container="legacy-chunks",
+        cosmos_source_documents_container="legacy-documents",
+    )
+    plan = SourcePlan(
+        SharePointSource(
+            source_id="source-a",
+            site_id="site-a",
+            site_url="https://tenant.sharepoint.com/sites/a",
+            drive_id="drive-a",
+            desired_state="active",
+            content_scope="business",
+            chunks_container="business-a-search-chunks",
+            manifests_container="business-a-source-documents",
+            retrieval_acl_enabled=True,
+            business_name="Business A",
+        ),
+        "etag-a",
+        "a" * 64,
+    )
+
+    bound = config_for_source(config, plan)
+
+    assert bound.source_id == "source-a"
+    assert bound.drive_id == "drive-a"
+    assert bound.sharepoint_site_url == "https://tenant.sharepoint.com/sites/a"
+    assert bound.sharepoint_site_id == "site-a"
+    assert bound.business_name == "Business A"
+    assert bound.cosmos_search_chunks_container == "business-a-search-chunks"
+    assert bound.cosmos_source_documents_container == "business-a-source-documents"
+
+
 def test_registering_existing_source_id_preserves_source_and_drive_identity() -> None:
     from ingestion.models import create_document_id
 
@@ -1467,6 +1883,11 @@ def test_registering_existing_source_id_preserves_source_and_drive_identity() ->
         site_id="graph-site-id",
         site_url="https://tenant.sharepoint.com/sites/legacy",
         drive_id="legacy-drive-id",
+        business_name="Legacy Business",
+        content_scope="business",
+        chunks_container="business-a-search-chunks",
+        manifests_container="business-a-source-documents",
+        retrieval_acl_enabled=True,
     )
     plan = repository.change_source_state(
         source_id="legacy-source", desired_state="active", if_match=plan.catalog_etag,
@@ -1490,12 +1911,27 @@ def test_registering_existing_source_id_preserves_source_and_drive_identity() ->
         )
 
 
-def _register(repository: SourceRegistryRepository, source_id: str = "source-new", drive_id: str = "drive-new"):
+def _register(
+    repository: SourceRegistryRepository,
+    source_id: str = "source-new",
+    drive_id: str = "drive-new",
+    *,
+    business_name: str = "Business New",
+    content_scope: str = "business",
+    chunks_container: str = "business-a-search-chunks",
+    manifests_container: str = "business-a-source-documents",
+    retrieval_acl_enabled: bool | None = True,
+):
     return repository.register_sharepoint_source(
         source_id=source_id,
         site_id=f"site-{source_id}",
         site_url=f"https://tenant.sharepoint.com/sites/{source_id}/",
         drive_id=drive_id,
+        business_name=business_name,
+        content_scope=content_scope,
+        chunks_container=chunks_container,
+        manifests_container=manifests_container,
+        retrieval_acl_enabled=retrieval_acl_enabled,
     )
 
 
@@ -1505,6 +1941,10 @@ def test_register_creates_paused_accepted_source() -> None:
     plan = _register(repository)
 
     assert plan.source.desired_state == "paused"
+    assert plan.source.business_name == "Business New"
+    assert plan.source.content_scope == "business"
+    assert plan.source.retrieval_acl_enabled is True
+    assert "recordType" not in sources.items["source-new"]
     assert sources.items["source-new"]["config"]["siteUrl"] == "https://tenant.sharepoint.com/sites/source-new"
     assert repository.read_source_plan("source-new") == plan
     assert runs.items[("source-new", "source-serving")]["retired"] is False
@@ -1515,6 +1955,152 @@ def test_register_exact_retry_returns_existing_plan() -> None:
     first = _register(repository)
 
     assert _register(repository) == first
+
+
+def test_register_common_defaults_acl_policy_to_false() -> None:
+    repository, sources, _ = _repository([])
+
+    plan = _register(
+        repository,
+        content_scope="common",
+        chunks_container="common-search-chunks",
+        manifests_container="common-source-documents",
+        retrieval_acl_enabled=None,
+    )
+
+    assert plan.source.retrieval_acl_enabled is False
+    assert sources.items["source-new"]["config"]["retrievalAclEnabled"] is False
+
+
+def test_register_business_requires_explicit_acl_policy() -> None:
+    repository, _, _ = _repository([])
+
+    with pytest.raises(
+        SourceRegistryError,
+        match="source_retrievalAclEnabled_invalid",
+    ):
+        _register(repository, retrieval_acl_enabled=None)
+
+
+def test_register_common_rejects_enabled_acl_policy() -> None:
+    repository, _, _ = _repository([])
+
+    with pytest.raises(
+        SourceRegistryError,
+        match="source_retrievalAclEnabled_invalid",
+    ):
+        _register(
+            repository,
+            content_scope="common",
+            chunks_container="common-search-chunks",
+            manifests_container="common-source-documents",
+            retrieval_acl_enabled=True,
+        )
+
+
+def test_register_retry_rejects_changed_routing_contract() -> None:
+    repository, _, _ = _repository([])
+    _register(repository)
+
+    with pytest.raises(SourceRegistryConflictError, match="source_id_conflict"):
+        _register(repository, chunks_container="business-b-search-chunks")
+
+
+def test_change_source_policy_preserves_binding_and_updates_etag() -> None:
+    repository, sources, _ = _repository([])
+    original = _register(repository)
+
+    updated = repository.change_source_policy(
+        source_id=original.source_id,
+        retrieval_acl_enabled=False,
+        if_match=original.catalog_etag,
+    )
+
+    assert updated.source.retrieval_acl_enabled is False
+    assert updated.binding_digest == original.binding_digest
+    assert updated.catalog_etag != original.catalog_etag
+    assert sources.items["source-new"]["config"] == {
+        "siteId": "site-source-new",
+        "siteUrl": "https://tenant.sharepoint.com/sites/source-new",
+        "driveId": "drive-new",
+        "businessName": "Business New",
+        "contentScope": "business",
+        "chunksContainer": "business-a-search-chunks",
+        "manifestsContainer": "business-a-source-documents",
+        "retrievalAclEnabled": False,
+    }
+
+
+def test_change_source_business_name_preserves_binding_and_updates_etag() -> None:
+    repository, sources, _ = _repository([])
+    original = _register(repository)
+
+    updated, previous_business_name = repository.change_source_business_name(
+        source_id=original.source_id,
+        business_name="  Commercial Banking  ",
+        if_match=original.catalog_etag,
+    )
+
+    assert previous_business_name == "Business New"
+    assert updated.source.business_name == "Commercial Banking"
+    assert updated.binding_digest == original.binding_digest
+    assert updated.catalog_etag != original.catalog_etag
+    assert sources.items["source-new"]["config"]["businessName"] == (
+        "Commercial Banking"
+    )
+
+
+def test_change_source_business_name_rejects_stale_etag() -> None:
+    repository, _, _ = _repository([])
+    original = _register(repository)
+
+    with pytest.raises(SourceRegistryConflictError, match="source_etag_mismatch"):
+        repository.change_source_business_name(
+            source_id=original.source_id,
+            business_name="Commercial Banking",
+            if_match="stale",
+        )
+
+
+def test_register_retry_rejects_changed_business_name() -> None:
+    repository, _, _ = _repository([])
+    _register(repository)
+
+    with pytest.raises(SourceRegistryConflictError, match="source_id_conflict"):
+        _register(repository, business_name="Different Business")
+
+
+def test_change_source_policy_rejects_stale_etag() -> None:
+    repository, _, _ = _repository([])
+    original = _register(repository)
+
+    with pytest.raises(SourceRegistryConflictError, match="source_etag_mismatch"):
+        repository.change_source_policy(
+            source_id=original.source_id,
+            retrieval_acl_enabled=False,
+            if_match="stale",
+        )
+
+
+def test_change_common_source_policy_rejects_true() -> None:
+    repository, _, _ = _repository([])
+    original = _register(
+        repository,
+        content_scope="common",
+        chunks_container="common-search-chunks",
+        manifests_container="common-source-documents",
+        retrieval_acl_enabled=None,
+    )
+
+    with pytest.raises(
+        SourceRegistryError,
+        match="source_retrievalAclEnabled_invalid",
+    ):
+        repository.change_source_policy(
+            source_id=original.source_id,
+            retrieval_acl_enabled=True,
+            if_match=original.catalog_etag,
+        )
 
 
 @pytest.mark.parametrize("failing_step", ["catalog", "source-binding", "drive-binding", "source-serving"])
@@ -1702,8 +2288,7 @@ def test_retire_lifecycle_failure_is_completed_by_same_state_retry() -> None:
         _change(repository, sources, "retired")
 
     assert sources.items["source-new"]["desiredState"] == "retired"
-    catalog = type("Catalog", (), {"query_items": lambda _self, **_kw: list(sources.items.values())})()
-    assert SourcePolicyReader(catalog).capture().eligible_source_ids == []
+    assert SourcePolicyReader(sources).capture("source-new").eligible_source_ids == []
     assert runs.items[("source-new", "source-serving")]["retired"] is False
 
     runs.replace_item = original_replace

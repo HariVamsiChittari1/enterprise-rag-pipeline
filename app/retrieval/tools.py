@@ -25,6 +25,7 @@ def make_search_tool(
     principal: Principal,
     retrieved_chunks: list[RetrievedChunk],
     *,
+    source_id: str | None = None,
     usage: list[dict[str, Any]] | None = None,
     scoring_profile: str | None = None,
     max_evidence: int = 5,
@@ -34,6 +35,7 @@ def make_search_tool(
     deadline_monotonic: float | None = None,
     policy: RequestPolicy | None = None,
     source_policy_versions: dict[str, SourceEligibility] | None = None,
+    source_policy_snapshot: SourcePolicySnapshot | None = None,
 ):
     """Create a search tool closure bound to the caller's ACL.
 
@@ -41,8 +43,12 @@ def make_search_tool(
     evidence cap, stable citation labels, usage forwarding, and tool-text formatting.
     """
     policy = policy or rag_service.capture_policy(scoring_profile, expand_synonyms)
-    source_policy_snapshot: SourcePolicySnapshot | None = None
-    source_policy_captured = False
+    source_policy_captured = source_policy_snapshot is not None
+    if source_policy_snapshot is not None and source_policy_versions is not None:
+        source_policy_versions.update({
+            source.source_id: source
+            for source in source_policy_snapshot.sources
+        })
     source_policy_lock = asyncio.Lock()
 
     async def search_knowledge_base(
@@ -81,6 +87,7 @@ def make_search_tool(
                 now=now,
                 policy=policy,
                 source_policy_snapshot=source_policy_snapshot,
+                source_id=source_id,
                 validate_source_policy=False,
             )
             return (

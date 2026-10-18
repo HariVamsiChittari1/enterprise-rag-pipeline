@@ -48,6 +48,9 @@ param speechAllowedIpAddress string = ''
 @description('SharePoint tenant ID')
 param sharePointTenantId string
 
+@description('Microsoft Entra tenant ID protecting the retrieval API')
+param entraApiTenantId string
+
 @description('SharePoint application client ID')
 param sharePointAppClientId string
 
@@ -79,11 +82,12 @@ param functionApiAudience string
 @description('Retrieval API application/client ID')
 param retrievalApiClientId string
 
-@description('Retrieval API audience')
-param retrievalApiAudience string
-
 @description('Retrieval API service-principal object ID for external role-assignment validation')
 param retrievalApiServicePrincipalId string
+
+@description('Approved native/public client application IDs allowed to call the retrieval API')
+@minLength(1)
+param retrievalAllowedApplicationClientIds array
 
 @secure()
 @description('Shared secret for Microsoft Graph webhook clientState validation')
@@ -123,9 +127,6 @@ param deployOperations bool = false
 
 @description('Application Insights daily cap in GB; -1 means unlimited')
 param applicationInsightsDailyCapGb int = -1
-
-@description('Enable ACL filtering in the retrieval service')
-param aclEnabled bool = true
 
 @description('Include source citations in retrieval query responses')
 param includeCitations bool = true
@@ -236,6 +237,16 @@ module cosmos './modules/cosmos.bicep' = {
     metadataAutoscaleMaxThroughput: cosmosMetadataAutoscaleMaxRUs
     searchChunksAutoscaleMaxThroughput: cosmosSearchChunksAutoscaleMaxRUs
     tags: tags
+  }
+}
+
+module contentTopology './modules/cosmos-content-topology.bicep' = {
+  name: 'content-topology'
+  params: {
+    cosmosAccountName: cosmos.outputs.cosmosAccountName
+    databaseName: cosmos.outputs.databaseName
+    mode: cosmosDbMode
+    searchChunksAutoscaleMaxThroughput: cosmosSearchChunksAutoscaleMaxRUs
   }
 }
 
@@ -410,8 +421,6 @@ module functions './modules/functions.bicep' = if (deployServing) {
     cosmosContainerNames: {
       ingestionRuns: cosmos.outputs.ingestionRunsContainerName
       ingestionSources: cosmos.outputs.ingestionSourcesContainerName
-      sourceDocuments: cosmos.outputs.sourceDocumentsContainerName
-      searchChunks: cosmos.outputs.searchChunksContainerName
     }
     durableTaskSchedulerEndpoint: durableTask.outputs.endpoint
     durableTaskHubName: durableTask.outputs.taskHubName
@@ -442,10 +451,8 @@ module functions './modules/functions.bicep' = if (deployServing) {
     sharePointCertificateSecretName: sharePointCertificateSecretName
     adminApiClientId: adminApiClientId
     functionApiAudience: functionApiAudience
-    retrievalServiceScope: '${retrievalApiAudience}/.default'
     webhookClientState: webhookClientState
     allowedApplicationClientIds: allowedApplicationClientIds
-    retrievalServiceUrl: aca.?outputs.?internalUrl ?? ''
     tags: tags
   }
 }
@@ -519,6 +526,16 @@ module acaRetrievalIdentity './modules/identity.bicep' = {
   }
 }
 
+module contentRbac './modules/cosmos-content-rbac.bicep' = {
+  name: 'content-rbac'
+  params: {
+    cosmosAccountName: cosmos.outputs.cosmosAccountName
+    cosmosDatabaseName: cosmos.outputs.databaseName
+    functionPrincipalId: identity.outputs.identityPrincipalId
+    retrievalPrincipalId: acaRetrievalIdentity.outputs.identityPrincipalId
+  }
+}
+
 module operationsIdentity './modules/identity.bicep' = {
   params: {
     identityName: '${prefix}-operations-mi'
@@ -557,6 +574,7 @@ module retrievalConfigPublisherRbac './modules/retrieval-config-publisher-rbac.b
     publisherPrincipalId: operationsIdentity.outputs.identityPrincipalId
     editorPrincipalId: catalogEditorPrincipalId
     writerPrincipalId: catalogWriterPrincipalId
+    functionWriterPrincipalId: identity.outputs.identityPrincipalId
     cosmosAccountId: cosmos.outputs.cosmosAccountId
     cosmosDatabaseName: cosmos.outputs.databaseName
     retrievalConfigContainerName: cosmos.outputs.retrievalConfigContainerName
@@ -575,7 +593,6 @@ module operationsJob './modules/aca-operations-job.bicep' = if (deployOperations
     cosmosEndpoint: cosmos.outputs.endpoint
     cosmosDatabaseName: cosmos.outputs.databaseName
     retrievalConfigContainerName: cosmos.outputs.retrievalConfigContainerName
-    deploymentInstanceId: deploymentInstanceId
     catalogDigest: retrievalCatalogDigest
     catalogOperation: catalogOperation
     tags: tags
@@ -593,11 +610,7 @@ module retrievalConfig './modules/retrieval-config.bicep' = if (deployServing) {
     tenantId: sharePointTenantId
     managedIdentityClientId: acaRetrievalIdentity.outputs.identityClientId
     retrievalApiAudience: retrievalApiClientId
-    gatewayClientId: identity.outputs.identityClientId
-    gatewayPrincipalId: identity.outputs.identityPrincipalId
-    deploymentInstanceId: deploymentInstanceId
     catalogPollSeconds: retrievalCatalogPollSeconds
-    aclEnabled: aclEnabled
     includeCitations: includeCitations
     appInsightsConnectionString: monitoring.outputs.connectionString
     retrievalConfigContainer: cosmos.outputs.retrievalConfigContainerName
@@ -613,27 +626,16 @@ module aca './modules/aca.bicep' = if (deployServing) {
     observerPrincipalId: catalogObserverPrincipalId
     location: location
     acrLoginServer: acr.outputs.loginServer
-    imageName: retrievalImageReference
+    imageDigest: last(split(retrievalImageReference, '@sha256:'))
     managedIdentityId: acaRetrievalIdentity.outputs.identityId
     managedEnvironmentId: acaEnvironment.outputs.environmentId
     retrievalEnvVars: retrievalConfig.?outputs.?envVars ?? []
     retrievalApiClientId: retrievalApiClientId
     retrievalApiAudience: retrievalApiClientId
-    entraIssuer: '${environment().authentication.loginEndpoint}${sharePointTenantId}/v2.0'
-    gatewayClientId: identity.outputs.identityClientId
-    gatewayPrincipalId: identity.outputs.identityPrincipalId
+    allowedApplicationClientIds: retrievalAllowedApplicationClientIds
+    entraIssuer: '${environment().authentication.loginEndpoint}${entraApiTenantId}/v2.0'
     minReplicas: retrievalMinReplicas
     maxReplicas: retrievalMaxReplicas
-    tags: tags
-  }
-}
-
-module acaDns './modules/aca-dns.bicep' = if (deployServing) {
-  name: 'aca-dns'
-  params: {
-    domainName: acaEnvironment.outputs.defaultDomain
-    staticIp: acaEnvironment.outputs.staticIp
-    virtualNetworkId: networking.outputs.virtualNetworkId
     tags: tags
   }
 }
@@ -651,6 +653,7 @@ output retrievalApiServicePrincipalId string = retrievalApiServicePrincipalId
 output keyVaultName string = sharePointKeyVaultName
 output cosmosDbEndpoint string = cosmos.outputs.endpoint
 output cosmosDbDatabaseName string = cosmos.outputs.databaseName
+output cosmosContentContainerPairs array = contentTopology.outputs.contentContainerPairs
 output documentIntelligenceEndpoint string = documentIntelligence.outputs.documentIntelligenceEndpoint
 output contentUnderstandingAccountId string = contentUnderstanding.?outputs.?accountId ?? ''
 output contentUnderstandingEndpoint string = contentUnderstanding.?outputs.?endpoint ?? ''
@@ -659,7 +662,8 @@ output contentUnderstandingCompletionDeploymentName string = contentUnderstandin
 output contentUnderstandingEmbeddingDeploymentName string = contentUnderstanding.?outputs.?embeddingDeploymentName ?? ''
 output openAiEndpoint string = openAiEndpoint
 output acrLoginServer string = acr.outputs.loginServer
-output retrievalServiceUrl string = aca.?outputs.?internalUrl ?? ''
+output retrievalServiceUrl string = aca.?outputs.?publicUrl ?? ''
+output retrievalQueryUrl string = aca.?outputs.?queryUrl ?? ''
 output retrievalContainerAppName string = aca.?outputs.?containerAppName ?? ''
 output catalogObservationWorkspaceId string = monitoring.outputs.logAnalyticsWorkspaceId
 output retrievalConfigMap object = retrievalConfig.?outputs.?configMap ?? {}

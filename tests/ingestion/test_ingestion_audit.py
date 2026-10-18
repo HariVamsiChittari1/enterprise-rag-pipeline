@@ -47,16 +47,18 @@ def test_embed_texts_writes_audit_record_per_batch() -> None:
     audit_container = MagicMock()
 
     embed_texts(
-        client, ["text-1", "text-2"],
+        client, ["text-1", "text-2"], "test-embedding",
         audit_container=audit_container,
         source_id="source-a",
         run_id="run-1",
+        business_name="Business A",
     )
 
     assert audit_container.create_item.call_count == 1
     item = audit_container.create_item.call_args[0][0]
     assert item["sourceId"] == "source-a"
     assert item["runId"] == "run-1"
+    assert item["businessName"] == "Business A"
     assert item["operation"] == "ingestion_embedding"
     assert item["prompt_tokens"] == 500
     assert item["completion_tokens"] == 0
@@ -68,7 +70,7 @@ def test_embed_texts_writes_audit_record_per_batch() -> None:
 def test_embed_texts_skips_audit_when_container_is_none() -> None:
     client = _fake_openai_client()
 
-    result = embed_texts(client, ["text-1"])
+    result = embed_texts(client, ["text-1"], "test-embedding")
 
     assert len(result) == 1
     assert len(result[0]) == 3072
@@ -80,7 +82,7 @@ def test_audit_write_failure_does_not_break_embedding() -> None:
     audit_container.create_item.side_effect = RuntimeError("cosmos unavailable")
 
     result = embed_texts(
-        client, ["text-1"],
+        client, ["text-1"], "test-embedding",
         audit_container=audit_container,
         source_id="src",
         run_id="run",
@@ -111,3 +113,12 @@ def test_write_audit_record_is_best_effort() -> None:
     write_audit_record(container, "src", "run", {"operation": "test"})
 
     container.create_item.assert_called_once()
+
+
+def test_write_audit_record_omits_business_name_without_source_context() -> None:
+    container = MagicMock()
+
+    write_audit_record(container, "", "global", {"operation": "global_event"})
+
+    item = container.create_item.call_args.args[0]
+    assert "businessName" not in item

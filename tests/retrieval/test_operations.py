@@ -18,7 +18,7 @@ class FakeContainer:
 
     def create_item(self, *, body: dict[str, Any]) -> dict[str, Any]:
         self.create_calls += 1
-        key = (body["deploymentInstanceId"], body["id"])
+        key = (body["id"], body["id"])
         if key in self.items:
             raise CosmosResourceExistsError(status_code=409, message="exists")
         stored = {**body, "_etag": f"etag-{len(self.items) + 1}"}
@@ -83,12 +83,11 @@ def _configure(
 ) -> tuple[FakeCosmos, list[FakeCredential]]:
     path = tmp_path / "catalog.json"
     path.write_text(json.dumps(_source()), encoding="utf-8")
-    digest = load_catalog_item(build_catalog_item(_source(), "instance-a")).digest
+    digest = load_catalog_item(build_catalog_item(_source())).digest
     values = {
         "COSMOS_ENDPOINT": "https://cosmos.example",
         "COSMOS_DATABASE": "rag-db",
         "RETRIEVAL_CONFIG_CONTAINER": "retrieval-config",
-        "DEPLOYMENT_INSTANCE_ID": "instance-a",
         "EXPECTED_CATALOG_DIGEST": digest,
         "MANAGED_IDENTITY_CLIENT_ID": "identity-client",
         "CATALOG_PATH": str(path),
@@ -120,7 +119,7 @@ def test_private_runner_publishes_and_replays_same_catalog(
     assert first == second
     assert first["catalogDigest"].startswith("sha256:")
     assert first["catalogEtag"]
-    assert set(container.items) == {("instance-a", "runtime-catalog")}
+    assert set(container.items) == {("runtime-catalog", "runtime-catalog")}
     assert cosmos.closed is True
     assert all(credential.closed for credential in credentials)
 
@@ -147,14 +146,14 @@ def test_private_runner_refuses_different_existing_catalog(
     _configure(monkeypatch, tmp_path, container)
     changed = _source()
     changed["config"]["retrieval"]["overFetchFactor"] = 4
-    existing = build_catalog_item(changed, "instance-a")
+    existing = build_catalog_item(changed)
     existing["_etag"] = "etag-existing"
-    container.items[("instance-a", "runtime-catalog")] = existing
+    container.items[("runtime-catalog", "runtime-catalog")] = existing
 
     with pytest.raises(CatalogConflictError, match="explicit disposition"):
         operations.publish_bootstrap_catalog()
 
-    assert container.items[("instance-a", "runtime-catalog")] == existing
+    assert container.items[("runtime-catalog", "runtime-catalog")] == existing
 
 
 def test_verify_preserves_client_edit_without_seed_or_write(
@@ -164,8 +163,8 @@ def test_verify_preserves_client_edit_without_seed_or_write(
     cosmos, credentials = _configure(monkeypatch, tmp_path, container)
     changed = _source()
     changed["config"]["retrieval"]["overFetchFactor"] = 4
-    existing = {**build_catalog_item(changed, "instance-a"), "_etag": "client-edit"}
-    container.items[("instance-a", "runtime-catalog")] = existing
+    existing = {**build_catalog_item(changed), "_etag": "client-edit"}
+    container.items[("runtime-catalog", "runtime-catalog")] = existing
     monkeypatch.delenv("EXPECTED_CATALOG_DIGEST")
     monkeypatch.setenv("CATALOG_PATH", str(tmp_path / "missing.json"))
 
@@ -178,7 +177,7 @@ def test_verify_preserves_client_edit_without_seed_or_write(
         "catalogDigest": load_catalog_item(existing).digest,
     }
     assert container.create_calls == 0
-    assert container.items[("instance-a", "runtime-catalog")] == existing
+    assert container.items[("runtime-catalog", "runtime-catalog")] == existing
     assert cosmos.closed and all(credential.closed for credential in credentials)
 
 
@@ -189,18 +188,18 @@ def test_invalid_readback_fails_and_closes_resources(
 ) -> None:
     container = FakeContainer()
     cosmos, credentials = _configure(monkeypatch, tmp_path, container)
-    existing = {**build_catalog_item(_source(), "instance-a"), "_etag": "existing"}
+    existing = {**build_catalog_item(_source()), "_etag": "existing"}
     if corruption == "partition":
-        existing["deploymentInstanceId"] = "other-instance"
+        existing["id"] = "other-catalog"
     elif corruption == "etag":
         del existing["_etag"]
     else:
         existing["config"]["retrieval"]["overFetchFactor"] = 0
-    container.items[("instance-a", "runtime-catalog")] = existing
+    container.items[("runtime-catalog", "runtime-catalog")] = existing
 
     assert operations.main([operation]) == 2
 
-    assert container.items[("instance-a", "runtime-catalog")] == existing
+    assert container.items[("runtime-catalog", "runtime-catalog")] == existing
     assert cosmos.closed and all(credential.closed for credential in credentials)
 
 
@@ -268,11 +267,11 @@ def test_interrupted_create_can_be_replayed_without_overwrite(
     monkeypatch.setattr(container, "create_item", interrupted_create)
     with pytest.raises(CatalogError, match="create failed"):
         operations.publish_bootstrap_catalog()
-    existing = dict(container.items[("instance-a", "runtime-catalog")])
+    existing = dict(container.items[("runtime-catalog", "runtime-catalog")])
     monkeypatch.setattr(container, "create_item", create)
 
     result = operations.publish_bootstrap_catalog()
 
     assert result["catalogEtag"] == existing["_etag"]
-    assert container.items[("instance-a", "runtime-catalog")] == existing
+    assert container.items[("runtime-catalog", "runtime-catalog")] == existing
     assert cosmos.closed and all(credential.closed for credential in credentials)

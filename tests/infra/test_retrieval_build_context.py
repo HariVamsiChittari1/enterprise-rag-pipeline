@@ -77,6 +77,7 @@ def test_dockerignore_reincludes_only_expected_retrieval_inputs() -> None:
         "!retrieval/catalog.example.json",
         "!retrieval/requirements.txt",
         "!retrieval/Dockerfile",
+        "!azure_credentials.py",
         "!source_registry.py",
         "!cosmos_connection.py",
     }
@@ -127,6 +128,7 @@ def test_forbidden_files_are_excluded(forbidden: str) -> None:
     "retrieval/catalog.example.json",
     "retrieval/requirements.txt",
     "retrieval/Dockerfile",
+    "azure_credentials.py",
     "source_registry.py",
     "cosmos_connection.py",
 ])
@@ -140,9 +142,13 @@ def test_required_files_are_included(required: str) -> None:
 def test_walked_app_context_only_contains_retrieval_image_inputs() -> None:
     rules = _read_rules()
     uploaded = _walk_app(rules)
-    # Only the two shared runtime modules may enter alongside retrieval/.
+    # Only the shared runtime modules may enter alongside retrieval/.
     non_retrieval = [path for path in uploaded if not path.startswith("retrieval/")]
-    assert non_retrieval == ["cosmos_connection.py", "source_registry.py"], (
+    assert non_retrieval == [
+        "azure_credentials.py",
+        "cosmos_connection.py",
+        "source_registry.py",
+    ], (
         f"unexpected root files entered the build context: {non_retrieval}"
     )
     # The Dockerfile must be present so 'az acr build --file retrieval/Dockerfile' works.

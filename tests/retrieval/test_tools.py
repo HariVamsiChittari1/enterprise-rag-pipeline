@@ -57,7 +57,7 @@ class FakeRagService:
         self._error = error
         self.calls: list[dict[str, Any]] = []
         self.snapshot = RuntimeCatalogSnapshot(
-            deployment_instance_id="test", catalog_id="runtime-catalog", etag="etag-a",
+            catalog_id="runtime-catalog", etag="etag-a",
             digest="sha256:" + "a" * 64, operation_id="operation-a",
             changed_at="2026-09-08T00:00:00Z", accepted_at=datetime(2026, 9, 8, tzinfo=timezone.utc),
             over_fetch_factor=1, hybrid_weights=(1, 1), full_text_score_scope="Global",
@@ -66,7 +66,16 @@ class FakeRagService:
         )
         self.policy = None
         self.source_policy_snapshot = SourcePolicySnapshot((
-            SourceEligibility("source-a", "catalog-etag"),
+            SourceEligibility(
+                "source-a",
+                "catalog-etag",
+                "active",
+                "business",
+                "search-chunks",
+                "source-documents",
+                True,
+                "Business A",
+            ),
         ))
 
     def capture_policy(self, requested=None, expand_synonyms=None) -> RequestPolicy:
@@ -125,6 +134,7 @@ async def test_search_tool_delegates_policy_and_formats_chunks(
     fixed_now = datetime(2026, 1, 1, tzinfo=timezone.utc)
     tool = make_search_tool(
         service, principal, captured,
+        source_id="source-a",
         scoring_profile="fresh",
         max_evidence=4,
         expand_synonyms=True,
@@ -147,6 +157,7 @@ async def test_search_tool_delegates_policy_and_formats_chunks(
         "now": fixed_now,
         "policy": service.policy,
         "source_policy_snapshot": None,
+        "source_id": "source-a",
         "validate_source_policy": False,
     }]
 
@@ -253,7 +264,16 @@ async def test_search_tool_reuses_request_source_policy_for_final_validation(
     await tool(query="second")
 
     assert expected_sources == {
-        "source-a": SourceEligibility("source-a", "catalog-etag")
+        "source-a": SourceEligibility(
+            "source-a",
+            "catalog-etag",
+            "active",
+            "business",
+            "search-chunks",
+            "source-documents",
+            True,
+            "Business A",
+        )
     }
     assert all(call["validate_source_policy"] is False for call in service.calls)
     assert service.calls[0]["source_policy_snapshot"] is None

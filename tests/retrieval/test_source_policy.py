@@ -4,13 +4,14 @@ from copy import deepcopy
 from typing import Any
 
 import pytest
+from retrieval.source_policy import SourcePolicyReader, SourcePolicyReadError
 
-from retrieval.source_policy import SourcePolicyReadError, SourcePolicyReader
+
 def _source(source_id: str = "source-a", **overrides: Any) -> dict[str, Any]:
+    config_overrides = overrides.pop("config", {})
     item: dict[str, Any] = {
         "id": source_id,
         "sourceId": source_id,
-        "recordType": "ingestion-source",
         "schemaVersion": 1,
         "sourceKind": "sharepoint-drive",
         "desiredState": "active",
@@ -18,10 +19,16 @@ def _source(source_id: str = "source-a", **overrides: Any) -> dict[str, Any]:
             "siteId": "site-a",
             "siteUrl": "https://tenant.sharepoint.com/sites/a",
             "driveId": "drive-a",
+            "businessName": "Business A",
+            "contentScope": "business",
+            "chunksContainer": "business-a-search-chunks",
+            "manifestsContainer": "business-a-source-documents",
+            "retrievalAclEnabled": True,
         },
         "_etag": "catalog-etag-a",
     }
     item.update(overrides)
+    item["config"].update(config_overrides)
     return item
 
 
@@ -30,12 +37,15 @@ class FakeContainer:
         self.rows = rows
         self.items = {row["sourceId"]: row for row in rows}
         self.reads: list[tuple[str, str]] = []
+        self.query_calls = 0
         self.query_error: Exception | None = None
         self.read_error: Exception | None = None
 
     def query_items(self, **kwargs: Any) -> list[dict[str, Any]]:
-        assert "@recordType" in {p["name"] for p in kwargs["parameters"]}
+        self.query_calls += 1
+        assert kwargs["parameters"] == []
         assert "SELECT c.id" in kwargs["query"]
+        assert "recordType" not in kwargs["query"]
         if self.query_error:
             raise self.query_error
         return self.rows
@@ -59,49 +69,99 @@ def test_capture_admits_active_source() -> None:
     source = _source()
     reader, sources = _reader(source)
 
-    snapshot = reader.capture()
+    snapshot = reader.capture("source-a")
 
     assert snapshot.eligible_source_ids == ["source-a"]
-    assert sources.reads == []
+    assert sources.query_calls == 0
+    assert sources.reads == [("source-a", "source-a")]
+
+
+def test_capture_point_reads_one_source_policy() -> None:
+    source = _source()
+    reader, sources = _reader(source)
+
+    snapshot = reader.capture("source-a")
+
+    assert snapshot.eligible_source_ids == ["source-a"]
+    assert snapshot.sources[0].catalog_etag == "catalog-etag-a"
+    assert snapshot.sources[0].business_name == "Business A"
+    assert snapshot.sources[0].content_scope == "business"
+    assert snapshot.sources[0].chunks_container == "business-a-search-chunks"
+    assert snapshot.sources[0].manifests_container == "business-a-source-documents"
+    assert snapshot.sources[0].retrieval_acl_enabled is True
+    assert sources.query_calls == 0
+    assert sources.reads == [("source-a", "source-a")]
 
 
 @pytest.mark.parametrize("desired_state", ["paused", "retired"])
 def test_capture_withholds_inactive_source(desired_state: str) -> None:
     reader, _ = _reader(_source(desiredState=desired_state))
 
-    assert reader.capture().eligible_source_ids == []
+    assert reader.capture("source-a").eligible_source_ids == []
 
 
-@pytest.mark.parametrize("overrides", [{"schemaVersion": True}, {"_etag": ""}])
-def test_capture_withholds_unreadable_source_policy(overrides: dict[str, Any]) -> None:
-    reader, _ = _reader(_source(**overrides))
+def test_capture_rejects_malformed_source_policy() -> None:
+    reader, _ = _reader(_source(schemaVersion=True))
 
-    assert reader.capture().eligible_source_ids == []
+    with pytest.raises(
+        SourcePolicyReadError,
+        match="source_registry_point_read_failed",
+    ):
+        reader.capture("source-a")
 
 
-def test_registry_enumeration_failure_fails_closed() -> None:
+def test_capture_withholds_source_policy_without_etag() -> None:
+    reader, _ = _reader(_source(_etag=""))
+
+    assert reader.capture("source-a").eligible_source_ids == []
+
+
+def test_point_read_does_not_enumerate_registry() -> None:
     source = _source()
     reader, sources = _reader(source)
     sources.query_error = RuntimeError("cosmos unavailable")
 
-    with pytest.raises(SourcePolicyReadError, match="source_registry_enumeration_failed"):
-        reader.capture()
+    assert reader.capture("source-a").eligible_source_ids == ["source-a"]
+    assert sources.query_calls == 0
 
 
 @pytest.mark.parametrize("desired_state", ["paused", "retired"])
 def test_final_check_detects_withdrawal_after_capture(desired_state: str) -> None:
     source = _source()
     reader, sources = _reader(source)
-    snapshot = reader.capture()
+    snapshot = reader.capture("source-a")
     sources.items["source-a"]["desiredState"] = desired_state
 
     assert not reader.validate_sources(snapshot, {"source-a"})
 
 
-def test_final_check_detects_policy_edit_after_capture() -> None:
+def test_final_check_allows_label_and_etag_edit_after_capture() -> None:
     source = _source()
     reader, sources = _reader(source)
-    snapshot = reader.capture()
+    snapshot = reader.capture("source-a")
+    sources.items["source-a"]["_etag"] = "new-etag"
+    sources.items["source-a"]["config"]["businessName"] = "Renamed Business"
+
+    assert reader.validate_sources(snapshot, {"source-a"})
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("contentScope", "common"),
+        ("chunksContainer", "business-b-search-chunks"),
+        ("manifestsContainer", "business-b-source-documents"),
+        ("retrievalAclEnabled", False),
+    ],
+)
+def test_final_check_detects_retrieval_semantic_change_after_capture(
+    field: str,
+    value: object,
+) -> None:
+    source = _source()
+    reader, sources = _reader(source)
+    snapshot = reader.capture("source-a")
+    sources.items["source-a"]["config"][field] = value
     sources.items["source-a"]["_etag"] = "new-etag"
 
     assert not reader.validate_sources(snapshot, {"source-a"})
@@ -110,7 +170,7 @@ def test_final_check_detects_policy_edit_after_capture() -> None:
 def test_final_check_withholds_missing_policy() -> None:
     source = _source()
     reader, sources = _reader(source)
-    snapshot = reader.capture()
+    snapshot = reader.capture("source-a")
     del sources.items["source-a"]
 
     assert not reader.validate_sources(snapshot, {"source-a"})
@@ -119,7 +179,7 @@ def test_final_check_withholds_missing_policy() -> None:
 def test_final_check_withholds_unreadable_policy() -> None:
     source = _source()
     reader, sources = _reader(source)
-    snapshot = reader.capture()
+    snapshot = reader.capture("source-a")
     sources.read_error = RuntimeError("cosmos unavailable")
 
     assert not reader.validate_sources(snapshot, {"source-a"})
@@ -128,7 +188,7 @@ def test_final_check_withholds_unreadable_policy() -> None:
 def test_final_check_withholds_malformed_policy() -> None:
     source = _source()
     reader, sources = _reader(source)
-    snapshot = reader.capture()
+    snapshot = reader.capture("source-a")
     sources.items["source-a"]["schemaVersion"] = True
 
     assert not reader.validate_sources(snapshot, {"source-a"})
@@ -137,7 +197,10 @@ def test_final_check_withholds_malformed_policy() -> None:
 def test_unknown_source_is_not_validated_as_eligible() -> None:
     reader, _ = _reader(_source())
 
-    assert not reader.validate_sources(reader.capture(), {"not-registered"})
+    assert not reader.validate_sources(
+        reader.capture("source-a"),
+        {"not-registered"},
+    )
 
 
 @pytest.mark.parametrize("other_state", ["active", "paused", "retired"])
@@ -163,12 +226,13 @@ def test_mixed_source_lifecycle_keeps_unrelated_active_source_eligible(
         },
     )
     reader, sources = _reader(active, other)
-    snapshot = reader.capture()
+    snapshot = reader.capture(active_source)
 
-    expected = {active_source, other_source} if other_state == "active" else {active_source}
-    assert set(snapshot.eligible_source_ids) == expected
+    assert snapshot.eligible_source_ids == [active_source]
+    assert sources.query_calls == 0
+    assert sources.reads == [(active_source, active_source)]
     assert reader.validate_sources(snapshot, {active_source})
-    assert reader.validate_sources(snapshot, {other_source}) == (other_state == "active")
+    assert not reader.validate_sources(snapshot, {other_source})
 
     sources.items[other_source]["desiredState"] = "retired"
     sources.items[other_source]["_etag"] = "changed-etag"

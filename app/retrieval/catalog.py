@@ -54,10 +54,9 @@ CATALOG_ITEM_SCHEMA: Mapping[str, Any] = {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
     "additionalProperties": False,
-    "required": ["id", "deploymentInstanceId", "type", "config"],
+    "required": ["id", "type", "config"],
     "properties": {
         "id": {"const": CATALOG_ID},
-        "deploymentInstanceId": {"type": "string", "minLength": 1, "maxLength": 100},
         "type": {"const": CATALOG_TYPE},
         "change": {
             "type": "object",
@@ -109,6 +108,10 @@ class CatalogError(RuntimeError):
         self.etag = etag
 
 
+class CatalogSizeError(CatalogError):
+    """A catalog exceeds the canonical persisted-item size budget."""
+
+
 class CatalogConflictError(CatalogError):
     """A persisted catalog conflicts with the reviewed operation."""
 
@@ -123,7 +126,6 @@ class UnknownScoringProfileError(ValueError):
 
 @dataclass(frozen=True)
 class RuntimeCatalogSnapshot:
-    deployment_instance_id: str
     catalog_id: str
     etag: str | None
     digest: str
@@ -178,15 +180,12 @@ class RequestPolicy:
 
 def build_catalog_item(
     source: Mapping[str, Any],
-    deployment_instance_id: str,
     *,
     operation_id: str | None = None,
     changed_at: datetime | None = None,
     reason: str | None = None,
 ) -> dict[str, Any]:
     """Build a direct-edit item, optionally carrying guarded-writer metadata."""
-    if not isinstance(deployment_instance_id, str) or not deployment_instance_id.strip():
-        raise CatalogError("deployment instance id is required")
     if not isinstance(source, Mapping) or set(source) != {"config"}:
         raise CatalogError("catalog source contains unknown top-level fields")
     if not isinstance(source.get("config"), dict):
@@ -195,7 +194,6 @@ def build_catalog_item(
     config = _normalize_json_numbers(source["config"])
     item = {
         "id": CATALOG_ID,
-        "deploymentInstanceId": deployment_instance_id.strip(),
         "type": CATALOG_TYPE,
         "config": config,
     }
@@ -217,7 +215,7 @@ def load_catalog_item(item: Mapping[str, Any]) -> RuntimeCatalogSnapshot:
         raise CatalogError("catalog must be an object")
     values = _without_cosmos_system_properties(item)
     if len(_canonical_json(values)) > MAX_CATALOG_ITEM_BYTES:
-        raise CatalogError(
+        raise CatalogSizeError(
             f"catalog item exceeds {MAX_CATALOG_ITEM_BYTES} UTF-8 bytes"
         )
     _validate_schema(CATALOG_ITEM_SCHEMA, values, "catalog")
@@ -233,8 +231,6 @@ def load_catalog_item(item: Mapping[str, Any]) -> RuntimeCatalogSnapshot:
             raise CatalogError("catalog change identity or UTC timestamp is invalid") from None
         if not change["reason"].strip():
             raise CatalogError("catalog change reason must not be blank")
-    if not values["deploymentInstanceId"].strip():
-        raise CatalogError("catalog identity and change reason must not be blank")
     etag = item.get("_etag")
     if etag is not None and (not isinstance(etag, str) or not etag.strip()):
         raise CatalogError("catalog ETag is invalid")
@@ -252,7 +248,6 @@ def load_catalog_item(item: Mapping[str, Any]) -> RuntimeCatalogSnapshot:
     retrieval = config["retrieval"]
     weights = retrieval["hybridWeights"]
     return RuntimeCatalogSnapshot(
-        deployment_instance_id=values["deploymentInstanceId"],
         catalog_id=values["id"],
         etag=etag,
         digest="sha256:" + hashlib.sha256(_canonical_json(_normalize_json_numbers(config))).hexdigest(),
@@ -270,21 +265,14 @@ def load_catalog_item(item: Mapping[str, Any]) -> RuntimeCatalogSnapshot:
 
 
 class RuntimeCatalogLoader:
-    def __init__(
-        self,
-        container: Any,
-        deployment_instance_id: str,
-    ) -> None:
+    def __init__(self, container: Any) -> None:
         self._container = container
-        self._deployment_instance_id = deployment_instance_id
-        if not isinstance(deployment_instance_id, str) or not deployment_instance_id.strip():
-            raise CatalogError("deployment instance id is required")
 
     def load(self) -> RuntimeCatalogSnapshot:
         try:
             item = self._container.read_item(
                 item=CATALOG_ID,
-                partition_key=self._deployment_instance_id,
+                partition_key=CATALOG_ID,
             )
         except CosmosResourceNotFoundError:
             raise CatalogMissingError("runtime catalog item is missing") from None
@@ -292,7 +280,7 @@ class RuntimeCatalogLoader:
             raise CatalogError("runtime catalog item read failed") from None
         try:
             catalog = load_catalog_item(item)
-            if catalog.deployment_instance_id != self._deployment_instance_id or catalog.etag is None:
+            if catalog.catalog_id != CATALOG_ID or catalog.etag is None:
                 raise CatalogError("runtime catalog identity or ETag is inconsistent")
         except Exception:
             etag = item.get("_etag") if isinstance(item, Mapping) else None
@@ -303,15 +291,14 @@ class RuntimeCatalogLoader:
         return catalog
 
     def baseline(self) -> RuntimeCatalogSnapshot:
-        """Return the built-in baseline snapshot for this loader's deployment instance."""
-        return _build_baseline_snapshot(self._deployment_instance_id)
+        """Return the built-in baseline snapshot."""
+        return _build_baseline_snapshot()
 
 
-def _build_baseline_snapshot(deployment_instance_id: str) -> RuntimeCatalogSnapshot:
+def _build_baseline_snapshot() -> RuntimeCatalogSnapshot:
     """Return the built-in baseline snapshot used when no catalog item exists."""
     item = {
         "id": CATALOG_ID,
-        "deploymentInstanceId": deployment_instance_id,
         "type": CATALOG_TYPE,
         "config": BASELINE_CONFIG,
         "_etag": BASELINE_ETAG,
@@ -331,7 +318,7 @@ def publish_catalog(container: Any, item: dict[str, Any]) -> None:
     try:
         persisted = container.read_item(
             item=expected.catalog_id,
-            partition_key=expected.deployment_instance_id,
+            partition_key=expected.catalog_id,
         )
     except Exception:
         raise CatalogError("catalog verification read failed") from None
@@ -399,7 +386,7 @@ def _without_cosmos_system_properties(item: Mapping[str, Any]) -> dict[str, Any]
 
 def _validate_operation_manifest(manifest: Mapping[str, Any]) -> datetime:
     fields = {
-        "operationId", "createdAt", "deploymentInstanceId", "expectedEtag",
+        "operationId", "createdAt", "expectedEtag",
         "candidateDigest", "candidateFileDigest", "reason",
     }
     if not isinstance(manifest, Mapping) or set(manifest) != fields:
@@ -410,7 +397,6 @@ def _validate_operation_manifest(manifest: Mapping[str, Any]) -> datetime:
         digest = manifest[field]
         if len(digest) != 71 or not digest.startswith("sha256:") or any(char not in "0123456789abcdef" for char in digest[7:]):
             raise CatalogError("operation manifest digest is invalid")
-    _validate_schema(CATALOG_ITEM_SCHEMA["properties"]["deploymentInstanceId"], manifest["deploymentInstanceId"], "operation deployment")
     _validate_schema(CATALOG_ITEM_SCHEMA["properties"]["change"], {
         "operationId": manifest["operationId"], "changedAt": manifest["createdAt"],
         "reason": manifest["reason"],
@@ -432,12 +418,43 @@ def build_operation_candidate(
     if manifest["candidateFileDigest"] != file_digest:
         raise CatalogConflictError("candidate file changed since preparation")
     item = build_catalog_item(
-        source, manifest["deploymentInstanceId"], operation_id=manifest["operationId"],
+        source, operation_id=manifest["operationId"],
         changed_at=changed_at, reason=manifest["reason"],
     )
     if load_catalog_item(item).digest != manifest["candidateDigest"]:
         raise CatalogConflictError("candidate configuration changed since preparation")
     return item
+
+
+def prepare_catalog_operation(
+    source: Mapping[str, Any],
+    *,
+    operation_id: str,
+    changed_at: datetime,
+    expected_etag: str,
+    reason: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Build one guarded-writer candidate and manifest from an API request."""
+    if not isinstance(expected_etag, str) or not expected_etag.strip():
+        raise CatalogError("expected ETag is required")
+    source_digest = "sha256:" + hashlib.sha256(_canonical_json(source)).hexdigest()
+    candidate = build_catalog_item(
+        source,
+        operation_id=operation_id,
+        changed_at=changed_at,
+        reason=reason,
+    )
+    snapshot = load_catalog_item(candidate)
+    manifest = {
+        "operationId": operation_id,
+        "createdAt": snapshot.changed_at,
+        "expectedEtag": expected_etag,
+        "candidateDigest": snapshot.digest,
+        "candidateFileDigest": source_digest,
+        "reason": reason,
+    }
+    build_operation_candidate(manifest, source, source_digest)
+    return candidate, manifest
 
 
 def catalog_body(item: Mapping[str, Any]) -> dict[str, Any]:
@@ -447,7 +464,7 @@ def catalog_body(item: Mapping[str, Any]) -> dict[str, Any]:
 
 def _history_item(preimage: Mapping[str, Any], manifest: Mapping[str, Any]) -> dict[str, Any]:
     snapshot = load_catalog_item(preimage)
-    if snapshot.etag != manifest["expectedEtag"] or snapshot.deployment_instance_id != manifest["deploymentInstanceId"]:
+    if snapshot.etag != manifest["expectedEtag"]:
         raise CatalogConflictError("history source identity does not match reviewed operation")
     body = catalog_body(preimage)
     digest = "sha256:" + hashlib.sha256(_canonical_json(body)).hexdigest()
@@ -457,7 +474,6 @@ def _history_item(preimage: Mapping[str, Any], manifest: Mapping[str, Any]) -> d
     }
     return {
         "id": "history:" + hashlib.sha256(_canonical_json(identity)).hexdigest(),
-        "deploymentInstanceId": snapshot.deployment_instance_id,
         "type": "retrieval-runtime-catalog-history",
         "sourceEtag": snapshot.etag,
         "preimageDigest": digest,
@@ -468,12 +484,12 @@ def _history_item(preimage: Mapping[str, Any], manifest: Mapping[str, Any]) -> d
     }
 
 
-def load_catalog_history(item: Mapping[str, Any], deployment_instance_id: str) -> dict[str, Any]:
+def load_catalog_history(item: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(item, Mapping):
         raise CatalogError("history must be an object")
     values = _without_cosmos_system_properties(item)
-    fields = {"id", "deploymentInstanceId", "type", "sourceEtag", "preimageDigest", "catalogDigest", "capturedAt", "operation", "preimage"}
-    if set(values) != fields or values.get("deploymentInstanceId") != deployment_instance_id:
+    fields = {"id", "type", "sourceEtag", "preimageDigest", "catalogDigest", "capturedAt", "operation", "preimage"}
+    if set(values) != fields:
         raise CatalogError("history identity or fields are invalid")
     preimage = values["preimage"]
     if not isinstance(preimage, dict) or any(key.startswith("_") for key in preimage):
@@ -496,10 +512,10 @@ def _verify_history(container: Any, expected: dict[str, Any]) -> None:
         if getattr(error, "status_code", None) != 409:
             raise CatalogError("history create failed before replacement") from None
     try:
-        actual = container.read_item(item=expected["id"], partition_key=expected["deploymentInstanceId"])
+        actual = container.read_item(item=expected["id"], partition_key=expected["id"])
     except Exception:
         raise CatalogError("history verification read failed before replacement") from None
-    load_catalog_history(actual, expected["deploymentInstanceId"])
+    load_catalog_history(actual)
     if _canonical_json(_without_cosmos_system_properties(actual)) != _canonical_json(expected):
         raise CatalogConflictError("history collision does not match prepared operation")
 
@@ -511,12 +527,12 @@ def _find_operation_history(container: Any, manifest: Mapping[str, Any]) -> str 
             {"name": "@type", "value": "retrieval-runtime-catalog-history"},
             {"name": "@operationId", "value": manifest["operationId"]},
         ],
-        partition_key=manifest["deploymentInstanceId"],
+        enable_cross_partition_query=True,
     ))
     if len(records) != 1:
         return None
     record = records[0]
-    load_catalog_history(record, manifest["deploymentInstanceId"])
+    load_catalog_history(record)
     if record["operation"] != manifest:
         raise CatalogConflictError("history operation does not match manifest")
     return record["id"]
@@ -525,7 +541,6 @@ def _find_operation_history(container: Any, manifest: Mapping[str, Any]) -> str 
 def _operation_outcome(container: Any, manifest: Mapping[str, Any], result: dict[str, Any], *, create: bool) -> None:
     identity = {
         "id": "runtime-catalog-outcome:" + manifest["operationId"],
-        "deploymentInstanceId": manifest["deploymentInstanceId"],
         "type": "retrieval-runtime-catalog-outcome",
         "manifestDigest": "sha256:" + hashlib.sha256(_canonical_json(manifest)).hexdigest(),
         "catalogDigest": result["catalogDigest"], "etag": result["etag"],
@@ -543,7 +558,7 @@ def _operation_outcome(container: Any, manifest: Mapping[str, Any], result: dict
                 if getattr(error, "status_code", None) != 409:
                     raise
         actual = _without_cosmos_system_properties(container.read_item(
-            item=identity["id"], partition_key=manifest["deploymentInstanceId"],
+            item=identity["id"], partition_key=identity["id"],
         ))
         if set(actual) != set(identity) | {"activityId", "resourceId"}:
             return
@@ -576,11 +591,11 @@ def apply_catalog_operation(
         "mapCount": len(snapshot.synonym_maps), "auditStatus": "not-observed",
     }
     try:
-        current = container.read_item(item=CATALOG_ID, partition_key=snapshot.deployment_instance_id)
+        current = container.read_item(item=CATALOG_ID, partition_key=CATALOG_ID)
     except Exception:
         raise CatalogError("runtime catalog read failed before replacement") from None
     current_snapshot = load_catalog_item(current)
-    if current_snapshot.deployment_instance_id != snapshot.deployment_instance_id or current_snapshot.etag is None:
+    if current_snapshot.catalog_id != CATALOG_ID or current_snapshot.etag is None:
         raise CatalogConflictError("runtime catalog identity or ETag is invalid")
     if current_snapshot.operation_id == snapshot.operation_id:
         if catalog_body(current) != expected:
@@ -622,7 +637,7 @@ def apply_catalog_operation(
             raise CatalogConflictError("ETag conflict; replacement was not applied and must not be retried") from None
         result["status"] = "outcome-unknown"
     try:
-        persisted = container.read_item(item=CATALOG_ID, partition_key=snapshot.deployment_instance_id)
+        persisted = container.read_item(item=CATALOG_ID, partition_key=CATALOG_ID)
         observed = load_catalog_item(persisted)
         if observed.etag is not None and catalog_body(persisted) == expected:
             result["etag"] = observed.etag

@@ -9,14 +9,17 @@ from typing import Any
 
 import pytest
 
-from config import IngestionConfig
+from config import ExecutionBatchConfig, IngestionConfig
 from ingestion.graph import VerifiedAcl
 from ingestion.models import (
+    AclFeedback,
+    AclStatus,
     ActivityStatus,
     AudioMetadata,
     DocumentStage,
     DocumentStatus,
     LocatorKind,
+    SourceAdmissionConfig,
     SourceDocumentRecord,
     content_sha256,
     content_sha256_bytes,
@@ -72,11 +75,12 @@ def _config(**overrides: Any) -> IngestionConfig:
         content_understanding_endpoint="https://cu.example",
         content_understanding_analyzer_id="prebuilt-documentSearch",
         language_endpoint="", openai_endpoint="https://openai.example",
+        embedding_deployment="test-embedding",
         vision_deployment="gpt-5.4", managed_identity_client_id="mi",
-        chunk_max_tokens=800, chunk_overlap_tokens=100, acl_max_pages=10,
-        download_timeout_seconds=120.0, delta_max_pages=200, embedding_batch_size=100,
-        max_pdf_pages=500, vision_max_output_tokens=400, vision_max_image_bytes=2 * 1024 * 1024,
-        vision_max_figures=60, query_proxy_timeout_seconds=30.0, sharepoint_site_url="",
+        admission=SourceAdmissionConfig(),
+        execution=ExecutionBatchConfig(),
+        chunk_max_tokens=800, chunk_overlap_tokens=100,
+        vision_max_output_tokens=400, sharepoint_site_url="",
         audio_writer_enabled=True,
         speech_endpoint="https://speech-fixture.cognitiveservices.azure.com",
         speech_region="eastus2", audio_deployment_region="eastus2", audio_locale="en-US",
@@ -189,15 +193,23 @@ class _Connector:
 def _run(monkeypatch: Any, *, config: IngestionConfig | None = None,
          token_provider: Any = lambda: "synthetic-token",
          transcribe: Any = None, mime: str = "audio/wav",
-         name: str = "clip.wav", acl: VerifiedAcl = ACL_A) -> tuple[_Repository, _LifecycleRepository, Any]:
+         name: str = "clip.wav", acl: VerifiedAcl = ACL_A,
+         expected_embedding_deployment: str | None = None,
+         ) -> tuple[_Repository, _LifecycleRepository, Any]:
     repository = _Repository()
     lifecycle = _LifecycleRepository()
-    monkeypatch.setattr(services, "embed_texts", lambda _c, texts, **_k: [(0.0,) * 3072 for _ in texts])
+    selected_config = config or _config()
+
+    def _embed(_client: Any, texts: list[str], **kwargs: Any) -> list[tuple[float, ...]]:
+        if expected_embedding_deployment is not None:
+            assert kwargs["deployment"] == expected_embedding_deployment
+        return [(0.0,) * 3072 for _ in texts]
+
+    monkeypatch.setattr(services, "embed_texts", _embed)
     monkeypatch.setattr(
         services, "transcribe_audio",
         transcribe or (lambda **_kwargs: transcript_body()),
     )
-    selected_config = config or _config()
     connector = _Connector(mime=mime, name=name)
     connector.acls = [acl, acl]
     outcome = process_document(
@@ -208,6 +220,20 @@ def _run(monkeypatch: Any, *, config: IngestionConfig | None = None,
     return repository, lifecycle, outcome
 
 
+def test_audio_processing_uses_configured_embedding_deployment(
+    monkeypatch: Any,
+) -> None:
+    deployment = "custom-audio-embedding"
+
+    _, _, outcome = _run(
+        monkeypatch,
+        config=_config(embedding_deployment=deployment),
+        expected_embedding_deployment=deployment,
+    )
+
+    assert outcome.status is ActivityStatus.SUCCEEDED
+
+
 @pytest.mark.parametrize("source_id", ["source-a", "source-b"])
 @pytest.mark.parametrize("mime,name", [
     ("audio/wav", "clip.wav"), ("audio/mpeg", "clip.mp3"), ("audio/flac", "clip.flac"),
@@ -216,7 +242,11 @@ def test_audio_document_is_transcribed_chunked_and_admitted(
     monkeypatch: Any, mime: str, name: str, source_id: str,
 ) -> None:
     drive_id = f"drive-{source_id}"
-    acl = VerifiedAcl((f"group-{source_id}",), content_sha256(source_id))
+    acl = VerifiedAcl(
+        (f"group-{source_id}",),
+        content_sha256(source_id),
+        (AclFeedback.SHARED_LINK,),
+    )
     repository, lifecycle, outcome = _run(
         monkeypatch, mime=mime, name=name, acl=acl,
         config=_config(source_id=source_id, drive_id=drive_id),
@@ -239,6 +269,8 @@ def test_audio_document_is_transcribed_chunked_and_admitted(
     admitted = repository.ready_document
     assert admitted is not None
     assert admitted.status is DocumentStatus.READY
+    assert admitted.acl_status is AclStatus.VERIFIED
+    assert admitted.acl_feedback == (AclFeedback.SHARED_LINK,)
     assert admitted.page_count is None
     assert admitted.content_hash == WAV_HASH
     assert admitted.audio is not None and admitted.source_verified_at is not None
@@ -255,13 +287,13 @@ def test_audio_requires_writer_enabled(monkeypatch: Any) -> None:
         audio_writer_enabled=False, speech_endpoint="", speech_region="",
         audio_deployment_region="", audio_locale="",
     ))
-    assert outcome.status is ActivityStatus.FAILED
+    assert outcome.status is ActivityStatus.QUARANTINED
     assert outcome.error is not None and outcome.error.code == "audio_writer_disabled"
 
 
 def test_audio_requires_token_provider(monkeypatch: Any) -> None:
     _, _, outcome = _run(monkeypatch, token_provider=None)
-    assert outcome.status is ActivityStatus.FAILED
+    assert outcome.status is ActivityStatus.QUARANTINED
     assert outcome.error is not None and outcome.error.code == "audio_transcription_token_provider_missing"
 
 
@@ -272,7 +304,7 @@ def test_audio_provider_terminal_failure_fails_closed(monkeypatch: Any) -> None:
         raise TerminalDocumentError("audio_transcription_rejected:400")
 
     repository, _, outcome = _run(monkeypatch, transcribe=_reject)
-    assert outcome.status is ActivityStatus.FAILED
+    assert outcome.status is ActivityStatus.QUARANTINED
     assert repository.ready_document is None
     assert "write_chunks" not in repository.calls
 
@@ -361,7 +393,7 @@ def test_audio_batch_submit_requires_blob_client(monkeypatch: Any) -> None:
         _batch_config(), _document(), "etag-0", repository, lifecycle, _Connector(),
         None, None, object(), speech_token_provider=lambda: "tok", blob_service_client=None,
     )
-    assert outcome.status is ActivityStatus.FAILED
+    assert outcome.status is ActivityStatus.QUARANTINED
     assert outcome.error is not None and outcome.error.code == "audio_staging_client_missing"
 
 

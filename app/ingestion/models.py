@@ -10,7 +10,6 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Mapping
 
-
 SCHEMA_VERSION = 1
 SUPPORTED_AUDIO_MIME_TYPES = frozenset({"audio/wav", "audio/mpeg", "audio/flac"})
 SOURCE_CONTROL_ID = "source-control"
@@ -61,9 +60,29 @@ class DocumentStatus(str, Enum):
     RETIRED = "retired"
 
 
+class AclStatus(str, Enum):
+    PENDING = "Pending"
+    VERIFIED = "Verified"
+
+
+class AclFeedback(str, Enum):
+    DIRECT_USER = "DirectUser"
+    INVALID_GROUP = "InvalidGroup"
+    INVALID_IDENTITY = "InvalidIdentity"
+    SHARED_LINK = "SharedLink"
+    SITE_GROUP = "SiteGroup"
+    UNIFIED_GROUP = "UnifiedGroup"
+    UNSUPPORTED_ROLE = "UnsupportedRole"
+
+
 # Reasons a previously-ready document can leave retrieval: permission loss detected by
 # ACL resync, a newer version superseding it, or the source item being deleted.
-RETIRED_REASONS = frozenset({"acl_revoked", "superseded", "deleted"})
+RETIRED_REASONS = frozenset({
+    "acl_revoked",
+    "superseded",
+    "deleted",
+    "replacement_failed",
+})
 
 
 class DocumentStage(str, Enum):
@@ -89,6 +108,7 @@ class ModuleStatus(str, Enum):
 class ActivityStatus(str, Enum):
     SUCCEEDED = "succeeded"
     FAILED = "failed"
+    QUARANTINED = "quarantined"
     SKIPPED = "skipped"
     PENDING = "pending"
 
@@ -319,31 +339,28 @@ class SafeError:
 
 
 @dataclass(frozen=True)
-class ScaleLimits:
-    max_eligible_pdfs: int = 10_000
+class SourceAdmissionConfig:
+    max_eligible_sources: int = 10_000
     max_drive_items: int = 50_000
     max_folders: int = 10_000
     max_folder_depth: int = 32
     max_graph_pages: int = 20_000
-    max_source_bytes: int = 100 * 1024 * 1024
-    max_rendered_pdf_bytes: int = 200 * 1024 * 1024
-    max_document_units: int = 300
+    max_source_bytes: int = 500 * 1024 * 1024
+    max_rendered_derivative_bytes: int = 500 * 1024 * 1024
+    max_pages_per_source: int = 2_000
+    max_content_units_per_source: int = 2_000
     max_office_characters: int = 8_000_000
-    max_visual_descriptions: int = 60
-    max_chunks_per_pdf: int = 2_000
+    max_visual_asset_bytes: int = 2 * 1024 * 1024
+    max_visual_assets_per_source: int = 60
+    max_audio_phrases_per_source: int = 20_000
+    max_audio_words_per_source: int = 400_000
+    max_chunks_per_source: int = 2_000
 
     def __post_init__(self) -> None:
-        for field in fields(self):
-            if getattr(self, field.name) <= 0:
-                raise ValueError(f"{field.name} must be positive")
-
-    @property
-    def max_pdf_bytes(self) -> int:
-        return self.max_source_bytes
-
-    @property
-    def max_pdf_pages(self) -> int:
-        return self.max_document_units
+        for model_field in fields(self):
+            value = getattr(self, model_field.name)
+            if type(value) is not int or value <= 0:
+                raise ValueError(f"{model_field.name} must be a positive integer")
 
 
 @dataclass(frozen=True)
@@ -425,7 +442,6 @@ class Settings:
     source_id: str
     drive_id: str
     code_version: str
-    limits: ScaleLimits = field(default_factory=ScaleLimits)
     profiles: ProfileSnapshot = field(default_factory=ProfileSnapshot)
     activity_timeout_seconds: float = 300.0
     document_wave_size: int = 4
@@ -763,6 +779,8 @@ class SourceDocumentRecord:
     attempt_count: int
     discovered_at: str
     updated_at: str
+    acl_status: AclStatus = AclStatus.PENDING
+    acl_feedback: tuple[AclFeedback, ...] = ()
     page_count: int | None = None
     expected_chunk_count: int | None = None
     written_chunk_count: int | None = None
@@ -789,6 +807,7 @@ class SourceDocumentRecord:
     audio: AudioMetadata | None = field(default=None, metadata={"omit_none": True})
     source_verified_at: str | None = field(default=None, metadata={"omit_none": True})
     processing_profile_digest: str | None = field(default=None, metadata={"omit_none": True})
+    business_name: str | None = field(default=None, metadata={"omit_none": True})
     # Transient batch-transcription tracking, set together while stage == TRANSCRIBING.
     transcription_job_url: str | None = field(default=None, metadata={"omit_none": True})
     staging_blob_name: str | None = field(default=None, metadata={"omit_none": True})
@@ -809,6 +828,8 @@ class SourceDocumentRecord:
             r"[0-9a-f]{64}", self.processing_profile_digest,
         ) is None:
             raise ValueError("processing profile digest is invalid")
+        if self.business_name is not None:
+            _require_text("business name", self.business_name, 200)
         is_audio = self.mime_type in SUPPORTED_AUDIO_MIME_TYPES
         if type(self.schema_version) is not int or self.schema_version != SCHEMA_VERSION:
             raise ValueError("unsupported source-document schema version")
@@ -848,7 +869,13 @@ class SourceDocumentRecord:
         ):
             raise ValueError("document schema does not accept audio fields")
         _validate_document_fields(self)
+        if not isinstance(self.acl_status, AclStatus):
+            raise ValueError("acl_status is invalid")
+        if canonical_acl_feedback(self.acl_feedback) != self.acl_feedback:
+            raise ValueError("acl_feedback must be sorted and unique")
         _validate_sorted_unique("allowed_group_ids", self.allowed_group_ids, require_nonempty=True)
+        if self.acl_status is AclStatus.VERIFIED and not self.allowed_group_ids:
+            raise ValueError("verified ACL requires at least one group")
         _require_sha256("acl_hash", self.acl_hash)
         if self.content_hash is not None:
             _require_sha256("content_hash", self.content_hash)
@@ -884,6 +911,7 @@ class VisualManifestPage:
     id: str
     record_type: str = VISUAL_MANIFEST_PAGE_RECORD_TYPE
     schema_version: int = SCHEMA_VERSION
+    business_name: str | None = field(default=None, metadata={"omit_none": True})
 
     def __post_init__(self) -> None:
         expected_source_run_id = create_source_run_id(self.source_id, self.run_id)
@@ -897,6 +925,8 @@ class VisualManifestPage:
             raise ValueError("invalid visual-manifest record type")
         _require_schema_version(self.schema_version)
         _require_text("manifest source version", self.source_version, 500)
+        if self.business_name is not None:
+            _require_text("business name", self.business_name, 200)
         if self.page_index < 0 or self.page_count < 1 or self.page_index >= self.page_count:
             raise ValueError("visual manifest page position is invalid")
         if not self.entries:
@@ -1031,10 +1061,11 @@ class ActivityOutcome:
         _require_text("document_id", self.document_id, 64)
         if self.chunks_written < 0 or self.retry_count < 0:
             raise ValueError("activity counters cannot be negative")
-        if self.status is ActivityStatus.FAILED and self.error is None:
-            raise ValueError("failed activities require a safe error")
-        if self.status is not ActivityStatus.FAILED and self.error is not None:
-            raise ValueError("only failed activities can contain an error")
+        failed_statuses = {ActivityStatus.FAILED, ActivityStatus.QUARANTINED}
+        if self.status in failed_statuses and self.error is None:
+            raise ValueError("failed or quarantined activities require a safe error")
+        if self.status not in failed_statuses and self.error is not None:
+            raise ValueError("only failed or quarantined activities can contain an error")
 
     def to_dict(self) -> dict[str, Any]:
         return _serialize_dataclass(self)
@@ -1338,6 +1369,7 @@ def _create_visual_manifest_page(
         entries=entries,
         page_hash=_visual_manifest_page_hash(entries),
         id=create_visual_manifest_page_id(document.document_id, page_index),
+        business_name=document.business_name,
     )
 
 
@@ -1355,6 +1387,16 @@ def canonical_group_ids(group_ids: list[str] | tuple[str, ...]) -> tuple[str, ..
     if not canonical:
         raise ValueError("ACL must contain at least one verified group")
     return canonical
+
+
+def canonical_acl_feedback(
+    feedback: list[AclFeedback] | tuple[AclFeedback, ...],
+) -> tuple[AclFeedback, ...]:
+    if not isinstance(feedback, (list, tuple)) or any(
+        not isinstance(value, AclFeedback) for value in feedback
+    ):
+        raise ValueError("ACL feedback contains an invalid value")
+    return tuple(sorted(set(feedback), key=lambda value: value.value))
 
 
 def content_sha256(content: str) -> str:

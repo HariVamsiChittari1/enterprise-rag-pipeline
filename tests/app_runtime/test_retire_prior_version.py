@@ -18,9 +18,10 @@ from ingestion.lifecycle_repository import LifecycleConflictError, ReadyDocument
 
 
 class FakeConfig:
-    def __init__(self, source_id: str = "source") -> None:
+    def __init__(self, source_id: str = "source", business_name: str = "Contoso") -> None:
         self.source_id = source_id
         self.drive_id = "drive"
+        self.business_name = business_name
 
 
 class FakeLifecycleRepo:
@@ -90,8 +91,21 @@ def _patch_repo(monkeypatch: pytest.MonkeyPatch, repo: FakeLifecycleRepo) -> Non
 def _patch_audit(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
 
-    def _fake_write(container: Any, source_id: str, run_id: str, record: dict[str, Any]) -> None:
-        records.append({"container": container, "source_id": source_id, "run_id": run_id, **record})
+    def _fake_write(
+        container: Any,
+        source_id: str,
+        run_id: str,
+        record: dict[str, Any],
+        *,
+        business_name: str | None = None,
+    ) -> None:
+        records.append({
+            "container": container,
+            "source_id": source_id,
+            "run_id": run_id,
+            "business_name": business_name,
+            **record,
+        })
 
     monkeypatch.setattr(telemetry, "write_audit_record", _fake_write)
     return records
@@ -118,6 +132,7 @@ def test_retire_prior_version_hard_deletes_and_audits_when_prior_ready_version_e
     assert records[0]["replacedDocumentKey"] == ref.document_key
     assert records[0]["container"] == "sentinel-container"
     assert records[0]["run_id"] == "source:run-new"
+    assert records[0]["business_name"] == "Contoso"
 
 
 def test_retire_prior_version_is_a_no_op_when_no_prior_version_exists(

@@ -3,7 +3,10 @@ title: Environment Variable Reference
 description: Deployment inputs and runtime configuration for ingestion and retrieval
 ---
 
-This is the single inventory for deployment inputs and runtime environment variables used by ingestion, the Function query gateway, ACA retrieval, and the temporary catalog publisher.
+This is the single inventory for deployment inputs and runtime environment variables used by ingestion, ACA retrieval, and the temporary catalog publisher.
+
+The evidence-backed producer/consumer classification and bounded cleanup plan
+are recorded in the [Function and Container Apps runtime setting audit](RUNTIME_SETTING_AUDIT.md).
 
 ## Ownership Rules
 
@@ -25,9 +28,10 @@ Cosmos data to bypass a bootstrap conflict.
 After that deployment, use Cosmos Data Explorer with approved data-plane access
 and private-network reachability to the configured retrieval-config container:
 
-Open the item with `id` equal to `runtime-catalog` in the deployment's
-`deploymentInstanceId` partition. Keep both fields and
-`type: retrieval-runtime-catalog` unchanged. Do not edit Cosmos system fields.
+Open the item with `id` equal to `runtime-catalog`; `/id` is the container
+partition key, so `runtime-catalog` is both the item ID and partition-key value.
+Keep `id` and `type: retrieval-runtime-catalog` unchanged. Do not edit Cosmos
+system fields.
 
 Retain a protected previous valid item outside the repository before editing.
 Edit only `config`: `retrieval`, `profiles`, `synonymMaps`, and optional
@@ -84,7 +88,7 @@ These values configure `infra/main.parameters.bicepparam` and `scripts/deploy.ps
 | --- | --- | --- | --- |
 | `AZURE_SUBSCRIPTION_ID` | Yes | Subscription GUID | azd target subscription. Must match the guarded `-SubscriptionId` argument and Azure CLI context. |
 | `AZURE_LOCATION` | Yes | Azure region such as `eastus2` | Resource deployment region. Must match guarded `-Location`. |
-| `DEPLOYMENT_INSTANCE_ID` | Yes | Stable value such as `client-prod` | Resource tag/name discriminator and retrieval catalog partition key. The controller sets this process variable from `-DeploymentInstanceId`. |
+| `DEPLOYMENT_INSTANCE_ID` | Yes | Stable value such as `client-prod` | Resource tag/name discriminator and guarded deployment target. The controller sets this process variable from `-DeploymentInstanceId`; it is not stored in the retrieval catalog. |
 | `COST_CENTER` | Yes | Organization-defined tag | Required resource tag. |
 | `CLEANUP_DATE` | Yes | `YYYY-MM-DD` | Required governance tag. It does not automatically delete resources. |
 
@@ -131,14 +135,14 @@ Content Understanding uses `prebuilt-documentSearch`. Microsoft can update a pre
 | Variable | Required | Default/example | Purpose |
 | --- | --- | --- | --- |
 | `ADMIN_API_CLIENT_ID` | Yes | Function API application client GUID | EasyAuth provider registration protecting Function routes. |
-| `FUNCTION_API_AUDIENCE` | Yes | Usually `api://<function-api-client-id>` | Exact audience accepted by EasyAuth and the query gateway. |
+| `FUNCTION_API_AUDIENCE` | Yes | Usually `api://<function-api-client-id>` | Exact audience accepted by Function EasyAuth. |
 | `FUNCTION_ALLOWED_CALLER_CLIENT_ID` | Yes | Approved client application GUID | Sole caller application inserted into the Function EasyAuth allowlist. |
 | `RETRIEVAL_API_CLIENT_ID` | Yes | Retrieval API client GUID | ACA Authentication application registration. |
-| `RETRIEVAL_API_AUDIENCE` | Yes | Usually `api://<retrieval-api-client-id>` | Scope base used to generate the Function setting `<value>/.default`. Active Bicep separately validates ACA tokens against `RETRIEVAL_API_CLIENT_ID`; keep both values consistent with the same app registration. |
+| `RETRIEVAL_ALLOWED_CALLER_CLIENT_ID` | Yes | Approved native/public client GUID | Sole delegated caller application inserted into the retrieval ACA Authentication allowlist. |
 | `RETRIEVAL_API_SERVICE_PRINCIPAL_ID` | Yes | Service-principal object GUID | External validation/evidence input for the retrieval API service principal. Active Bicep re-outputs it but does not create app-role assignments. |
 | `WEBHOOK_CLIENT_STATE` | Yes, secret | Cryptographically random value | Shared secret checked by `/api/webhook/sharepoint`. The lifecycle webhook currently does not validate it. |
 
-The Function UAMI must receive `Retrieval.Gateway` on the retrieval API application, and the retrieval UAMI requires its Graph application permissions. These are external Entra assignments.
+The retrieval UAMI requires its Graph application permissions. This is an external Entra assignment.
 
 ### Capacity and reliability
 
@@ -182,8 +186,9 @@ The active Function Bicep module injects the following settings. Values shown as
 | `AzureWebJobsStorage__tableServiceUri` | Generated private table endpoint | Durable/Functions table storage. |
 | `AzureWebJobsStorage__credential` | `managedidentity` | Selects managed-identity storage authentication. |
 | `AzureWebJobsStorage__clientId` | Function UAMI client ID | Identity used for host storage. |
-| `AZURE_CLIENT_ID` | Function UAMI client ID | User-assigned identity selected by `DefaultAzureCredential`. |
-| `MANAGED_IDENTITY_CLIENT_ID` | Function UAMI client ID | Identity used to obtain the retrieval service token. |
+| `AZURE_AUTH_MODE` | `managed_identity` | Selects the explicit Azure-hosted credential path. |
+| `AZURE_CLIENT_ID` | Function UAMI client ID | User-assigned identity selected by the shared credential factory. |
+| `MANAGED_IDENTITY_CLIENT_ID` | Function UAMI client ID | User-assigned identity selected by ingestion service clients. |
 | `APPLICATIONINSIGHTS_CONNECTION_STRING` | Generated, secret | Application Insights telemetry connection. Do not print. |
 | `APPLICATIONINSIGHTS_AUTHENTICATION_STRING` | `ClientId=<Function-UAMI>;Authorization=AAD` | Entra authentication for Application Insights ingestion. |
 | `INSTANCE_MEMORY_MB` | `2048` from current Bicep default | Informational Function instance-memory setting emitted by Bicep. Allowed Bicep values: 512, 1024, 2048, 4096. |
@@ -228,7 +233,7 @@ The deployed Durable Task Scheduler retains terminal orchestration history for 3
 | `CONTENT_UNDERSTANDING_ANALYZER_ID` | Client input/default `prebuilt-documentSearch` | Selected Content Understanding analyzer ID. Empty when Content Understanding is disabled; the prebuilt definition can change independently of the ID. |
 | `AZURE_LANGUAGE_ENDPOINT` | Generated | Enrichment endpoint; code requires it when any enrichment module is enabled. |
 | `OPENAI_ENDPOINT` | Generated | Azure OpenAI endpoint used by ingestion embeddings. |
-| `OPENAI_EMBEDDING_DEPLOYMENT_NAME` | Client input/default `text-embedding-3-large` | Embedding deployment recorded in Function settings. |
+| `OPENAI_EMBEDDING_DEPLOYMENT_NAME` | Required runtime setting; client input defaults to `text-embedding-3-large` | Existing 3,072-dimensional deployment passed explicitly to every ingestion embedding request. |
 | `OPENAI_CHAT_DEPLOYMENT_NAME` | Client input | Chat deployment used for bounded visual descriptions and recorded in Function settings. |
 
 ### Cosmos DB
@@ -239,8 +244,10 @@ The deployed Durable Task Scheduler retains terminal orchestration history for 3
 | `COSMOS_DATABASE_NAME` | Generated; active database is `rag-db` | Ingestion database name. Retrieval intentionally uses `COSMOS_DATABASE` instead. |
 | `COSMOS_INGESTION_RUNS_CONTAINER_NAME` | `ingestion-runs` | Runs/control container. |
 | `COSMOS_INGESTION_SOURCES_CONTAINER_NAME` | `ingestion-sources` | Common explicitly configured source registry. |
-| `COSMOS_SOURCE_DOCUMENTS_CONTAINER_NAME` | `source-documents` | Source manifest container. |
-| `COSMOS_SEARCH_CHUNKS_CONTAINER_NAME` | `search-chunks` | Chunk container. |
+
+Content container names are not Function application settings. Each accepted
+source plan supplies its validated chunks/manifests pair; unbound ingestion
+configuration has no content-container fallback.
 
 Retrieval additionally reads `COSMOS_INGESTION_SOURCES_CONTAINER` and
 `COSMOS_INGESTION_RUNS_CONTAINER` through its managed identity for source-policy
@@ -273,14 +280,38 @@ deployment.
 | `CHUNK_OVERLAP_TOKENS` | `100` | Token overlap between adjacent chunks. |
 | `ACL_MAX_PAGES` | `10` | Maximum permission/group paging calls per ACL read. |
 | `DOWNLOAD_TIMEOUT_SECONDS` | `120` | Source download HTTP timeout in seconds. |
-| `DELTA_MAX_PAGES` | `200` | Maximum Graph delta pages per tick. |
+| `DELTA_MAX_PAGES` | `200` | Maximum Graph delta pages per activity window. A sealed `nextLink` continues in the same Durable round; the committed cursor advances only after the terminal `deltaLink` settles. |
 | `EMBEDDING_BATCH_SIZE` | `100` | Ingestion embedding batch size. |
-| `MAX_PDF_PAGES` | Runtime setting `500`; effective application cap `300` | Configurable PDF page ceiling, bounded by the shared 300-document-unit application limit. |
+| `MAX_ELIGIBLE_SOURCES` | `10000` | Maximum eligible source documents admitted in one discovery run. |
+| `MAX_DRIVE_ITEMS` | `50000` | Maximum source items scanned in one discovery run. |
+| `MAX_FOLDERS` | `10000` | Maximum folders traversed in one discovery run. |
+| `MAX_FOLDER_DEPTH` | `32` | Maximum source folder depth traversed. |
+| `MAX_GRAPH_PAGES` | `20000` | Maximum Graph pages traversed during full discovery. |
+| `MAX_SOURCE_BYTES` | `524288000` | Maximum bytes accepted for one source file. |
+| `MAX_RENDERED_DERIVATIVE_BYTES` | `524288000` | Maximum bytes accepted for one rendered derivative. |
+| `MAX_PAGES_PER_SOURCE` | `2000` | Maximum physical pages accepted for one page-based source. This is application admission, not a declaration of provider capacity. |
+| `MAX_CONTENT_UNITS_PER_SOURCE` | `2000` | Maximum logical content units accepted for one non-page source processor. |
+| `MAX_OFFICE_CHARACTERS` | `8000000` | Maximum extracted Office characters accepted for one source. |
+| `MAX_VISUAL_ASSET_BYTES` | `2097152` | Maximum bytes accepted for one linked or extracted visual asset. |
+| `MAX_VISUAL_ASSETS_PER_SOURCE` | `60` | Maximum visual assets described for one source. |
+| `MAX_AUDIO_PHRASES_PER_SOURCE` | `20000` | Maximum transcript phrases accepted for one audio source. |
+| `MAX_AUDIO_WORDS_PER_SOURCE` | `400000` | Maximum transcript words accepted for one audio source. |
+| `MAX_CHUNKS_PER_SOURCE` | `2000` | Maximum chunks emitted for one source. |
 | `VISION_MAX_OUTPUT_TOKENS` | `400` | Maximum tokens returned for one bounded visual description. |
-| `VISION_MAX_IMAGE_BYTES` | `2097152` | Maximum bytes accepted for one linked Markdown image or extracted figure. |
-| `VISION_MAX_FIGURES` | `60` | Maximum figures described for one source document. |
 
-Shared application limits also reject source files over 100 MB and rendered Office-to-PDF derivatives over 200 MB. These limits are stricter than some provider-tier limits and apply before or around provider analysis. Document Intelligence S0 supports up to 500 MB and 2,000 PDF/TIFF pages; F0 supports 4 MB and processes only the first two pages. The effective limit is always the lowest applicable application, provider-tier, and format-specific limit.
+`SourceAdmissionConfig` owns the generic `MAX_*` source limits, while
+`ExecutionBatchConfig` owns ACL paging, download timeouts, delta paging,
+embedding batches, Speech request timeouts, audio batch TTL, orchestration wave
+size and timeout, processing retry policy, and reconciliation, audio-poll, and
+source-dispatch page sizes. The Function worker loads this execution policy
+once at startup so Durable replays use a stable snapshot. Timer expressions
+remain trigger-owned schedule strings. Algorithm settings such as chunk token
+windows and vision output tokens remain separate.
+Document Intelligence S0 currently supports up to 500 MB and 2,000 PDF/TIFF
+pages; F0 supports 4 MB and processes only the first two pages. Microsoft
+documentation and the deployed service remain authoritative. The effective
+limit is the lowest applicable application admission, provider-tier,
+format-specific, and regional limit.
 
 Audio is default-disabled and enabled per environment via `AUDIO_WRITER_ENABLED`.
 When disabled, the ingestion configuration validator is only a preparation step:
@@ -299,7 +330,7 @@ remain open; see [ADR 0001](adr/0001-audio-batch-transcription.md).
 No Speech client is created by configuration loading. These ingestion audio/Speech
 settings are not emitted by Bicep or the deployment controller.
 
-### Timers, webhooks, and query gateway
+### Timers and webhooks
 
 | Variable | Value/default | Purpose |
 | --- | --- | --- |
@@ -312,10 +343,7 @@ settings are not emitted by Bicep or the deployment controller.
 | `FUNCTION_PUBLIC_BASE_URL` | Generated Function HTTPS URL | Builds Graph notification/lifecycle URLs. |
 | `WEBHOOK_CLIENT_STATE` | Client secret | Validates SharePoint change notifications. Empty value disables processing with server error. |
 | `TENANT_ID` | SharePoint tenant input | Expected tenant in EasyAuth user claims. |
-| `FUNCTION_API_AUDIENCE` | Client input | Exact expected audience in query user claims. |
-| `RETRIEVAL_SERVICE_URL` | Generated ACA private URL | Function proxy target. Must be a bare HTTPS `azurecontainerapps.io` URL accepted by gateway validation. |
-| `RETRIEVAL_SERVICE_SCOPE` | Generated as `<RETRIEVAL_API_AUDIENCE>/.default` | Scope requested for the Function UAMI service token. |
-| `QUERY_PROXY_TIMEOUT_SECONDS` | `30` | Function-to-ACA HTTP timeout in seconds. |
+| `FUNCTION_API_AUDIENCE` | Client input | Exact expected audience in Function operator claims. Retrieval queries use `RETRIEVAL_API_AUDIENCE`. |
 
 ## ACA Retrieval Runtime
 
@@ -328,21 +356,46 @@ values come exclusively from the validated runtime catalog snapshot.
 | --- | --- | --- | --- |
 | `COSMOS_ENDPOINT` | Yes | Generated | Cosmos endpoint. |
 | `COSMOS_DATABASE` | Yes | Generated; `rag-db` | Retrieval database name. |
-| `COSMOS_CHUNKS_CONTAINER` | No | `search-chunks` | Chunk container. |
-| `COSMOS_MANIFESTS_CONTAINER` | No | `source-documents` | Ready-manifest container. |
 | `COSMOS_AUDIT_CONTAINER` | No | `service-audit` | Best-effort query audit container. |
 | `AZURE_OPENAI_ENDPOINT` | Yes | Generated | Retrieval OpenAI endpoint. |
 | `EMBEDDING_DEPLOYMENT` | No | `text-embedding-3-large` | Query embedding deployment. |
 | `CHAT_DEPLOYMENT` | Yes | Client input | Planning/generation/agent model deployment. |
 | `TENANT_ID` | Yes | Client input | Expected gateway tenant and Graph tenant. |
+| `AZURE_AUTH_MODE` | Yes | Generated; `managed_identity` | Selects the explicit Azure-hosted credential path. |
 | `MANAGED_IDENTITY_CLIENT_ID` | Yes | Retrieval UAMI client ID | Identity for Cosmos, OpenAI, Graph, and ACR. |
-| `RETRIEVAL_API_AUDIENCE` | Yes | Retrieval API client ID in active Bicep | Exact app-token audience expected by retrieval. |
-| `RETRIEVAL_GATEWAY_CLIENT_ID` | Yes | Function UAMI client ID | Expected service token `azp`. |
-| `RETRIEVAL_GATEWAY_PRINCIPAL_ID` | Yes | Function UAMI principal ID | Expected service token `oid`. |
-| `DEPLOYMENT_INSTANCE_ID` | Yes | Client target | Catalog partition key. |
+| `RETRIEVAL_API_AUDIENCE` | Yes | Retrieval API client ID in active Bicep | Exact delegated-user token audience expected by retrieval. |
 | `RETRIEVAL_CATALOG_POLL_SECONDS` | No | `7200` | Bounded runtime refresh interval; see direct-edit timing above. |
 | `RETRIEVAL_CONFIG_CONTAINER` | No | `retrieval-config` | Catalog container. |
 | `APPLICATIONINSIGHTS_CONNECTION_STRING` | No | Generated; empty skips Azure Monitor setup | Sensitive telemetry connection string. Do not print. GenAI suppression is independent of this value; see [observability](ARCHITECTURE.md#observability). |
+
+Local application execution instead requires
+`AZURE_AUTH_MODE=service_principal` with process-scoped `AZURE_TENANT_ID`,
+`AZURE_CLIENT_ID`, and `AZURE_CLIENT_SECRET`. The secret is local-only and
+must never appear in tracked settings or an Azure deployment. Missing,
+unknown, or incomplete mode-specific settings fail at startup; developer
+credential fallback is not supported.
+
+### Local application authentication
+
+| Variable | Required | Classification | Purpose |
+| --- | --- | --- | --- |
+| `AZURE_AUTH_MODE` | Yes | Non-secret; exact value `service_principal` | Selects direct local `ClientSecretCredential`. |
+| `AZURE_TENANT_ID` | Yes | Non-secret GUID | Tenant containing the generic development app. |
+| `AZURE_CLIENT_ID` | Yes | Non-secret GUID | Application/client ID for `developer-local-azure-access`; not its service-principal object ID. |
+| `AZURE_CLIENT_SECRET` | Yes | Secret | Current local credential, stored only in the Git-ignored local `app\local.settings.json` for non-production development. |
+
+Do not place these values in tracked configuration. Never place
+`AZURE_CLIENT_SECRET` in `.env`, PowerShell profiles, user/machine environment
+variables, shell history, deployment parameters, logs, or Azure application
+settings. The local exception is `app\local.settings.json` only; it must remain
+Git-ignored and must never be copied into a deployment. The secret expires in
+less than 12 months and follows the overlap-then-revoke procedure in
+[local development](LOCAL_DEVELOPMENT.md#rotate-or-revoke-the-local-credential).
+
+Azure deployments use `AZURE_AUTH_MODE=managed_identity` plus their existing
+user-assigned managed-identity client ID. They do not receive
+`AZURE_TENANT_ID` or `AZURE_CLIENT_SECRET`. Delegated users calling ACA are a
+separate Easy Auth/API contract and do not use this application credential.
 
 ### Retrieval behavior and limits
 
@@ -353,19 +406,27 @@ remove reference markers from generated answer text.
 
 | Variable | Required | Value/default | Accepted values and effect |
 | --- | --- | --- | --- |
-| `ACL_ENABLED` | No | `true` | `false`, `0`, or `no` disable group-based ACL filtering for document and transcript evidence; any other value enables it. Source lifecycle checks remain enforced. Never disable in a shared secure environment merely to make a test pass. |
 | `INCLUDE_CITATIONS` | No | `true` | Only literal `false` disables citations. |
 | `MAX_EVIDENCE_CHUNKS` | No | `5` | Default top-K when omitted by request; public request allows 1–20. |
 | `MAX_PLANNED_QUERIES` | No | `3` | Maximum planner queries used by retrieval. |
 | `RETRIEVAL_TIMEOUT_SECONDS` | No | `5.0` | Retrieval fan-out wait bound and query embedding timeout; not a Cosmos SDK query timeout. |
 | `GENERATION_TIMEOUT_SECONDS` | No | `15.0` | Standard answer-generation OpenAI timeout. |
-| `AGENT_TIMEOUT_SECONDS` | No | Runtime fallback `8.0`; active Bicep emits `20.0` | Agent path and tool deadline before standard fallback. |
-| `AGENT_MAX_ITERATIONS` | No | `5` | Loaded and emitted, but currently not passed to agent construction. Changing it has no runtime effect in current code. |
+| `AGENT_TIMEOUT_SECONDS` | No | `20.0` | Agent path and tool deadline before standard fallback. |
+| `AGENT_MAX_ITERATIONS` | No | `5` | Positive integer limiting Agent Framework model/tool roundtrips before one final no-tools response. |
 | `AGENT_OPENAI_API_VERSION` | No | `preview` | API-version value passed to the Agent Framework OpenAI client. |
 | `GRAPH_GROUP_TIMEOUT_SECONDS` | No | `10.0` | HTTP timeout for transitive security-group resolution. |
 | `OPENAI_API_VERSION` | No | `2024-10-21` | Azure OpenAI API version for standard embeddings/chat. |
 | `RETRIEVAL_OPERATION_TIMEOUT_SECONDS` | No | `27.0` | Wall-clock middleware deadline for `/api/query`. |
 | `RATE_LIMIT_RPM` | No | Runtime fallback `30` | Per-user requests per minute per ACA replica. Current Bicep does not emit an override. |
+
+A selected source with `retrievalAclEnabled=false` does not make the API
+anonymous. ACA still requires an approved delegated-user token, but retrieval
+omits the `allowedGroupIds` filter for that source, so every authenticated
+caller admitted by the API can see its eligible content. Ingestion still
+requires at least one verified Entra security group and persists
+`allowedGroupIds`; the source policy changes query filtering, not document
+admission. Use `false` only for content approved for the API's entire
+authenticated audience.
 
 The audio settings above are not yet emitted by the deployment controller or Bicep.
 They do not enable a Speech client or grant permission to process recordings.
@@ -387,7 +448,6 @@ each request captures one immutable snapshot before planning and retrieval.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `COSMOS_REGISTRY_JSON` | Empty | Optional nonempty JSON array of retrieval instance definitions. When empty, one instance is built from the default Cosmos settings. Invalid entries fail startup. This does not make ingestion multi-library. |
 | `INGESTION_SOURCE_ID` | `default` in retrieval registry construction | Source label for the default retrieval instance. Active retrieval Bicep does not currently emit it. |
 
 ## Temporary Catalog Publisher Runtime
@@ -404,7 +464,7 @@ The deployment controller sets the following process variables to parameterize t
 | `OPERATIONS_MANAGED_IDENTITY_ID` | Operations UAMI resource ID | Job identity assignment. |
 | `OPERATIONS_MANAGED_IDENTITY_CLIENT_ID` | Operations UAMI client ID | Identity selected inside the job. |
 | `COSMOS_ENDPOINT` | Discovered deployment Cosmos endpoint | Catalog publication endpoint. |
-| `DEPLOYMENT_INSTANCE_ID` | Guarded target | Catalog partition key. |
+| `DEPLOYMENT_INSTANCE_ID` | Guarded target | Selects and names the environment's temporary job resource; it is not injected into the catalog document. |
 
 The job container itself receives this runtime contract:
 
@@ -413,7 +473,6 @@ The job container itself receives this runtime contract:
 | `COSMOS_ENDPOINT` | Passed through from the controller | Catalog publication endpoint. |
 | `COSMOS_DATABASE` | `rag-db` | Catalog database. |
 | `RETRIEVAL_CONFIG_CONTAINER` | `retrieval-config` | Catalog container. |
-| `DEPLOYMENT_INSTANCE_ID` | Passed through from the controller | Catalog partition key. |
 | `EXPECTED_CATALOG_DIGEST` | `RETRIEVAL_CATALOG_DIGEST`, publish only | Checks seed integrity on create-only initialization; absent for read-only verification. |
 | `MANAGED_IDENTITY_CLIENT_ID` | Operations UAMI client ID | Selects the job identity for Cosmos access. |
 | `CATALOG_PATH` | Runtime fallback `/app/retrieval/catalog.example.json`, publish only | Seed path inside the reviewed image. Verification does not load a seed file. |

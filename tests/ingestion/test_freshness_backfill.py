@@ -1,27 +1,70 @@
 from __future__ import annotations
 
+from dataclasses import dataclass, field, replace
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
-
+from config import ExecutionBatchConfig
 from ingestion.graph import DiscoveredPdf, DiscoveryState, DiscoveryStep, VerifiedAcl
-from ingestion.models import DocumentStage, DocumentStatus, create_document_id, create_document_key
+from ingestion.models import (
+    AclFeedback,
+    AclStatus,
+    DocumentStage,
+    DocumentStatus,
+    SourceAdmissionConfig,
+    create_document_id,
+    create_document_key,
+)
 from ingestion.repository import VersionedRecord
 from ingestion.services import _processing_profile_digest, discover_all
 
 
-CONFIG = SimpleNamespace(
-    source_id="source",
-    drive_id="drive",
-    allowed_extensions=(".md", ".pdf", ".docx", ".pptx", ".xlsx"),
-    acl_max_pages=10,
-)
+@dataclass(frozen=True)
+class DiscoveryConfig:
+    source_id: str = "source"
+    drive_id: str = "drive"
+    business_name: str | None = None
+    allowed_extensions: tuple[str, ...] = (
+        ".md",
+        ".pdf",
+        ".docx",
+        ".pptx",
+        ".xlsx",
+    )
+    admission: SourceAdmissionConfig = field(default_factory=SourceAdmissionConfig)
+    execution: ExecutionBatchConfig = field(default_factory=ExecutionBatchConfig)
+    extraction_enabled: bool = False
+    content_understanding_analyzer_id: str = ""
+    chunk_max_tokens: int = 800
+    chunk_overlap_tokens: int = 100
+    enrichment_enabled: bool = False
+    summary_enabled: bool = False
+    key_phrases_enabled: bool = False
+    entities_enabled: bool = False
+    embedding_deployment: str = "test-embedding"
+    vision_deployment: str = ""
+    vision_max_output_tokens: int = 400
+    audio_writer_enabled: bool = False
+    audio_transcription_provider: str = "speech_fast"
+    audio_locale: str = ""
+
+    @property
+    def extraction_provider(self) -> None:
+        return None
+
+
+CONFIG = DiscoveryConfig()
 
 
 class FakeDiscoveryConnector:
-    def __init__(self, pdf: DiscoveredPdf) -> None:
+    def __init__(
+        self,
+        pdf: DiscoveredPdf,
+        acl: VerifiedAcl = VerifiedAcl(("group-a",), "acl-hash"),
+    ) -> None:
         self._pdf = pdf
+        self._acl = acl
 
     def discover_next_page(self, state, limits, allowed_extensions):
         return DiscoveryStep(DiscoveryState((), items_scanned=1, pdfs_discovered=1), (self._pdf,))
@@ -30,7 +73,7 @@ class FakeDiscoveryConnector:
         return {"id": item_id, "eTag": "etag-1"}
 
     def read_verified_acl(self, _item_id: str, _max_pages: int) -> VerifiedAcl:
-        return VerifiedAcl(("group-a",), "acl-hash")
+        return self._acl
 
 
 class FakeDiscoveryRepository:
@@ -47,6 +90,10 @@ class FakeDiscoveryRepository:
                 status=DocumentStatus.READY,
                 e_tag="etag-1",
                 source_modified_at=self.previous_modified,
+                allowed_group_ids=("group-a",),
+                acl_hash="acl-hash",
+                acl_status=AclStatus.VERIFIED,
+                acl_feedback=(),
             )
         )
 
@@ -197,7 +244,31 @@ def test_full_sync_registers_work_before_creating_legacy_discovered_document() -
     assert len(repository.created) == 1
 
 
-def test_full_sync_reuses_winner_only_after_current_source_and_acl_verification() -> None:
+@pytest.mark.parametrize(
+    ("previous_feedback", "current_feedback", "current_config", "should_reuse"),
+    [
+        ((), (), CONFIG, True),
+        ((), (AclFeedback.SHARED_LINK,), CONFIG, False),
+        (
+            (),
+            (),
+            replace(
+                CONFIG,
+                admission=replace(
+                    CONFIG.admission,
+                    max_pages_per_source=CONFIG.admission.max_pages_per_source - 1,
+                ),
+            ),
+            False,
+        ),
+    ],
+)
+def test_full_sync_reuses_winner_only_after_current_source_and_acl_verification(
+    previous_feedback: tuple[AclFeedback, ...],
+    current_feedback: tuple[AclFeedback, ...],
+    current_config: DiscoveryConfig,
+    should_reuse: bool,
+) -> None:
     source = _source("2026-08-01T00:00:00Z")
     document_id = create_document_id("source", "drive", "item-1")
     profile_digest = _processing_profile_digest(CONFIG)
@@ -213,7 +284,10 @@ def test_full_sync_reuses_winner_only_after_current_source_and_acl_verification(
         source_run_id="source:old",
         document_key=create_document_key("source", "old", document_id),
         lifecycle_generation=0,
+        allowed_group_ids=("group-a",),
         acl_hash="acl-hash",
+        acl_status=AclStatus.VERIFIED,
+        acl_feedback=previous_feedback,
         processing_profile_digest=profile_digest,
     )
     winner = {
@@ -239,21 +313,26 @@ def test_full_sync_reuses_winner_only_after_current_source_and_acl_verification(
             return winner
 
         def begin_document_operation(self, *_args, **_kwargs):
-            pytest.fail("verified same-version winner should be reused")
+            if should_reuse:
+                pytest.fail("verified same-version winner should be reused")
+            return {"status": "acquired", "operationId": "operation-1"}
 
     repository = Repository(previous_modified="2026-08-01T00:00:00Z")
     documents, _ = discover_all(
-        CONFIG,
+        current_config,
         "new",
         repository,
-        FakeDiscoveryConnector(source),
+        FakeDiscoveryConnector(
+            source,
+            VerifiedAcl(("group-a",), "acl-hash", current_feedback),
+        ),
         work_registry=WorkRegistry(),
         source_plan=SimpleNamespace(source_id="source"),
         owner_instance_id="owner",
     )
 
-    assert documents == []
-    assert repository.created == []
+    assert (documents == []) is should_reuse
+    assert (repository.created == []) is should_reuse
 
 
 def test_full_sync_reuses_winner_after_previous_skip_only_run() -> None:
@@ -272,7 +351,10 @@ def test_full_sync_reuses_winner_after_previous_skip_only_run() -> None:
         source_run_id="source:ready-run",
         document_key=create_document_key("source", "ready-run", document_id),
         lifecycle_generation=0,
+        allowed_group_ids=("group-a",),
         acl_hash="acl-hash",
+        acl_status=AclStatus.VERIFIED,
+        acl_feedback=(),
         processing_profile_digest=profile_digest,
     )
     winner = {

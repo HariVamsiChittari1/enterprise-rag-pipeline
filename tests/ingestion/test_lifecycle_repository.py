@@ -14,7 +14,12 @@ from ingestion.lifecycle_repository import (
     LifecycleConflictError,
     LifecycleRepositoryError,
 )
-from ingestion.models import DocumentStatus, create_audio_control_partition_id
+from ingestion.models import (
+    AclFeedback,
+    AclStatus,
+    DocumentStatus,
+    create_audio_control_partition_id,
+)
 from ingestion.services import run_source_retirement_page
 
 
@@ -154,6 +159,8 @@ class FakeContainer:
                 and stored.get("retiredReason") == "acl_revoked"
             )
             allowed_statuses = ("ready", "acl_refreshing")
+            if "OR c.status = 'retiring'" in filter_predicate:
+                allowed_statuses += ("retiring",)
             if "OR c.status = 'retired'" in filter_predicate:
                 allowed_statuses += ("retired",)
             if "OR c.status = 'failed'" in filter_predicate:
@@ -304,6 +311,8 @@ def _ready_document(document_id: str = "doc-1", **overrides: Any) -> dict[str, A
         "_ts": 1,
         "allowedGroupIds": ["group-a"],
         "aclHash": "hash-a",
+        "aclStatus": "Verified",
+        "aclFeedback": [],
         "_etag": "etag-1",
     }
     base.update(overrides)
@@ -420,6 +429,81 @@ def test_retire_document_flips_status_and_requires_ready_precondition() -> None:
     assert stored["retiredAt"]
 
 
+def test_retire_document_accepts_acl_refreshing_and_clears_pending_acl() -> None:
+    documents = FakeContainer("sourceRunId", {
+        ("source:run-a", "doc-1"): _ready_document(
+            status="acl_refreshing",
+            lifecycleGeneration=1,
+            pendingAllowedGroupIds=["group-b"],
+            pendingAclHash="hash-b",
+            pendingAclStatus="Verified",
+            pendingAclFeedback=[],
+        ),
+    })
+    chunks = FakeContainer("documentKey", {
+        ("source:run-a:doc-1", "chunk:000000"): {
+            "id": "chunk:000000",
+            "documentKey": "source:run-a:doc-1",
+            "allowedGroupIds": ["group-a"],
+            "isRetrievable": True,
+            "lifecycleGeneration": 1,
+        },
+    })
+    repo = DocumentLifecycleRepository(FakeContainer("sourceId"), documents, chunks)
+
+    repo.retire_document(
+        source_run_id="source:run-a",
+        document_id="doc-1",
+        document_key="source:run-a:doc-1",
+        etag="etag-1",
+        reason="acl_revoked",
+    )
+
+    stored = documents.items[("source:run-a", "doc-1")]
+    assert stored["status"] == "retired"
+    assert stored["retiredReason"] == "acl_revoked"
+    assert "pendingAllowedGroupIds" not in stored
+    assert "pendingAclHash" not in stored
+    assert "pendingAclStatus" not in stored
+    assert "pendingAclFeedback" not in stored
+    assert chunks.items[("source:run-a:doc-1", "chunk:000000")]["isRetrievable"] is False
+
+
+def test_retire_document_resume_clears_pending_acl_from_retiring_state() -> None:
+    documents = FakeContainer("sourceRunId", {
+        ("source:run-a", "doc-1"): _ready_document(
+            status="retiring",
+            lifecycleGeneration=2,
+            pendingRetiredReason="acl_revoked",
+            pendingAllowedGroupIds=["group-b"],
+            pendingAclHash="hash-b",
+            pendingAclStatus="Verified",
+            pendingAclFeedback=[],
+        ),
+    })
+    repo = DocumentLifecycleRepository(
+        FakeContainer("sourceId"),
+        documents,
+        FakeContainer("documentKey"),
+    )
+
+    repo.retire_document(
+        source_run_id="source:run-a",
+        document_id="doc-1",
+        document_key="source:run-a:doc-1",
+        etag="etag-1",
+        reason="acl_revoked",
+    )
+
+    stored = documents.items[("source:run-a", "doc-1")]
+    assert stored["status"] == "retired"
+    assert stored["retiredReason"] == "acl_revoked"
+    assert "pendingAllowedGroupIds" not in stored
+    assert "pendingAclHash" not in stored
+    assert "pendingAclStatus" not in stored
+    assert "pendingAclFeedback" not in stored
+
+
 def test_retire_document_rejects_unsupported_reason() -> None:
     documents = FakeContainer("sourceRunId", {("source:run-a", "doc-1"): _ready_document()})
     repo = DocumentLifecycleRepository(FakeContainer("sourceId"), documents, FakeContainer("documentKey"))
@@ -462,15 +546,38 @@ def test_refresh_document_acl_patches_document_and_every_chunk() -> None:
     repo.refresh_document_acl(
         source_run_id="source:run-a", document_id="doc-1", document_key="source:run-a:doc-1",
         etag="etag-1", allowed_group_ids=("group-a", "group-b"), acl_hash="hash-b",
+        acl_status=AclStatus.VERIFIED, acl_feedback=(AclFeedback.SHARED_LINK,),
     )
 
     assert documents.items[("source:run-a", "doc-1")]["allowedGroupIds"] == ["group-a", "group-b"]
     assert documents.items[("source:run-a", "doc-1")]["aclHash"] == "hash-b"
+    assert documents.items[("source:run-a", "doc-1")]["aclStatus"] == "Verified"
+    assert documents.items[("source:run-a", "doc-1")]["aclFeedback"] == ["SharedLink"]
     assert chunks.items[("source:run-a:doc-1", "chunk:000000")]["allowedGroupIds"] == ["group-a", "group-b"]
     assert chunks.items[("source:run-a:doc-1", "chunk:000001")]["allowedGroupIds"] == ["group-a", "group-b"]
     assert chunks.items[("source:run-a:doc-1", "chunk:000000")]["isRetrievable"] is True
     assert chunks.items[("source:run-a:doc-1", "chunk:000000")]["lifecycleGeneration"] == 1
     assert len(chunks.batch_calls) == 2
+
+
+def test_update_document_acl_feedback_does_not_touch_chunks_or_generation() -> None:
+    documents = FakeContainer("sourceRunId", {("source:run-a", "doc-1"): _ready_document()})
+    chunks = FakeContainer("documentKey")
+    repo = DocumentLifecycleRepository(FakeContainer("sourceId"), documents, chunks)
+
+    repo.update_document_acl_feedback(
+        source_run_id="source:run-a",
+        document_id="doc-1",
+        etag="etag-1",
+        acl_status=AclStatus.VERIFIED,
+        acl_feedback=(AclFeedback.SHARED_LINK,),
+    )
+
+    stored = documents.items[("source:run-a", "doc-1")]
+    assert stored["aclStatus"] == "Verified"
+    assert stored["aclFeedback"] == ["SharedLink"]
+    assert stored["lifecycleGeneration"] == 0
+    assert chunks.batch_calls == []
 
 
 def test_refresh_document_acl_restores_only_acl_revoked_document() -> None:
@@ -852,6 +959,7 @@ def test_source_retirement_deletes_each_document_state_and_audits(status: str) -
     record = audit.create_item.call_args.args[0]
     assert record["operation"] == "document_deleted"
     assert record["sourceId"] == "source"
+    assert record["businessName"] == "Business A"
     assert record["documentId"] == "doc-1"
     assert record["reason"] == "source_retired"
     assert record["method"] == "source_retirement"
@@ -865,6 +973,7 @@ def _delete_source_page(repo: DocumentLifecycleRepository, audit: Any = None) ->
         repo, audit if audit is not None else MagicMock(),
         source_id="source", page_size=1, work_registry=registry,
         owner_instance_id="retirement-owner",
+        business_name="Business A",
     )
 
 

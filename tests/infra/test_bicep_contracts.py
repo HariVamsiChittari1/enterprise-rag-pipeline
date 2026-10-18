@@ -39,6 +39,11 @@ def _resources(template: dict[str, Any], resource_type: str) -> list[dict[str, A
 
 
 def test_cosmos_container_topology_and_partition_keys() -> None:
+    content_container_pairs = json.loads(
+        (PROJECT_ROOT / "infra/content-container-pairs.json").read_text(
+            encoding="utf-8"
+        )
+    )
     template = _compile_bicep("infra/modules/cosmos.bicep")
     containers = _resources(
         template,
@@ -47,6 +52,7 @@ def test_cosmos_container_topology_and_partition_keys() -> None:
     containers_by_id = {
         container["properties"]["resource"]["id"]: container
         for container in containers
+        if not container["properties"]["resource"]["id"].startswith("[")
     }
 
     assert set(containers_by_id) == {
@@ -68,13 +74,168 @@ def test_cosmos_container_topology_and_partition_keys() -> None:
     ]["paths"] == ["/documentKey"]
     assert containers_by_id["retrieval-config"]["properties"]["resource"][
         "partitionKey"
-    ]["paths"] == ["/deploymentInstanceId"]
+    ]["paths"] == ["/id"]
     assert containers_by_id["ingestion-sources"]["properties"]["resource"][
         "partitionKey"
     ]["paths"] == ["/sourceId"]
     assert containers_by_id["service-audit"]["properties"]["resource"][
         "partitionKey"
     ]["paths"] == ["/id"]
+
+    topology = _compile_bicep("infra/modules/cosmos-content-topology.bicep")
+    assert content_container_pairs == [
+        {
+            "chunksContainer": "dev-business-a-search-chunks",
+            "manifestsContainer": "dev-business-a-source-documents",
+        },
+        {
+            "chunksContainer": "dev-business-b-search-chunks",
+            "manifestsContainer": "dev-business-b-source-documents",
+        },
+        {
+            "chunksContainer": "dev-common-search-chunks",
+            "manifestsContainer": "dev-common-source-documents",
+        },
+    ]
+    topology_source = (
+        PROJECT_ROOT / "infra/modules/cosmos-content-topology.bicep"
+    ).read_text(encoding="utf-8")
+    assert (
+        "var contentContainerPairs = "
+        "loadJsonContent('../content-container-pairs.json')"
+    ) in topology_source
+    copied_containers = {
+        container["copy"]["name"]: container
+        for container in _resources(
+            topology,
+            "Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers",
+        )
+        if "copy" in container
+    }
+    manifests = copied_containers["manifestsContainers"]
+    chunks = copied_containers["chunksContainers"]
+    assert manifests["copy"]["count"] == (
+        "[length(variables('contentContainerPairs'))]"
+    )
+    assert manifests["properties"]["resource"]["partitionKey"]["paths"] == [
+        "/sourceRunId"
+    ]
+    assert chunks["copy"]["count"] == (
+        "[length(variables('contentContainerPairs'))]"
+    )
+    assert chunks["properties"]["resource"]["partitionKey"]["paths"] == [
+        "/documentKey"
+    ]
+    assert chunks["properties"]["resource"]["indexingPolicy"]["vectorIndexes"] == [
+        {"path": "/embedding", "type": "diskANN"}
+    ]
+    assert chunks["properties"]["resource"]["indexingPolicy"]["fullTextIndexes"] == [
+        {"path": "/content"},
+        {"path": "/searchableText"},
+    ]
+    assert chunks["properties"]["resource"]["vectorEmbeddingPolicy"][
+        "vectorEmbeddings"
+    ][0] == {
+        "path": "/embedding",
+        "dataType": "float32",
+        "dimensions": 3072,
+        "distanceFunction": "cosine",
+    }
+    assert chunks["properties"]["resource"]["fullTextPolicy"]["fullTextPaths"] == [
+        {"path": "/content", "language": "en-US"},
+        {"path": "/searchableText", "language": "en-US"},
+    ]
+    main_template = _compile_bicep("infra/main.bicep")
+    assert "cosmosContentContainerPairs" in main_template["outputs"]
+
+
+def test_content_cosmos_roles_are_pair_scoped_and_least_privileged() -> None:
+    content_container_pairs = json.loads(
+        (PROJECT_ROOT / "infra/content-container-pairs.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    content_rbac = _compile_bicep("infra/modules/cosmos-content-rbac.bicep")
+    assignments = _resources(
+        content_rbac,
+        "Microsoft.DocumentDB/databaseAccounts/sqlRoleAssignments",
+    )
+
+    assert content_rbac["variables"]["copy"] == [
+        {
+            "name": "contentContainerNamesByPair",
+            "count": "[length(variables('contentContainerPairs'))]",
+            "input": (
+                "[createArray(variables('contentContainerPairs')[copyIndex("
+                "'contentContainerNamesByPair')].chunksContainer, "
+                "variables('contentContainerPairs')[copyIndex("
+                "'contentContainerNamesByPair')].manifestsContainer)]"
+            ),
+        }
+    ]
+    assert content_rbac["variables"]["contentContainerNames"] == (
+        "[flatten(variables('contentContainerNamesByPair'))]"
+    )
+    assert len(content_container_pairs) == 3
+    assert len(assignments) == 2
+
+    contributors = [
+        assignment
+        for assignment in assignments
+        if "content-contributor" in assignment["name"]
+    ]
+    readers = [
+        assignment
+        for assignment in assignments
+        if "content-reader" in assignment["name"]
+    ]
+    assert len(contributors) == 1
+    assert len(readers) == 1
+
+    for assignment, role_variable, expected_role_id, principal_name in (
+        (
+            contributors[0],
+            "dataContributorRoleId",
+            "00000000-0000-0000-0000-000000000002",
+            "functionPrincipalId",
+        ),
+        (
+            readers[0],
+            "dataReaderRoleId",
+            "00000000-0000-0000-0000-000000000001",
+            "retrievalPrincipalId",
+        ),
+    ):
+        assert assignment["copy"]["count"] == (
+            "[length(variables('contentContainerNames'))]"
+        )
+        assert content_rbac["variables"][role_variable] == expected_role_id
+        assert f"variables('{role_variable}')" in assignment["properties"][
+            "roleDefinitionId"
+        ]
+        assert assignment["properties"]["principalId"] == (
+            f"[parameters('{principal_name}')]"
+        )
+        assert "contentContainerNames" in assignment["properties"]["scope"]
+        assert "colls/{2}" in assignment["properties"]["scope"]
+
+    main_source = (PROJECT_ROOT / "infra/main.bicep").read_text(encoding="utf-8")
+    assert "module contentRbac './modules/cosmos-content-rbac.bicep'" in main_source
+    parameters_source = (
+        PROJECT_ROOT / "infra/content-rbac.parameters.bicepparam"
+    ).read_text(encoding="utf-8")
+    assert "contentContainerPairs" not in parameters_source
+    assert main_source.count("contentContainerPairs:") == 0
+    assert (
+        PROJECT_ROOT / "infra/modules/cosmos-content-topology.bicep"
+    ).read_text(encoding="utf-8").count(
+        "loadJsonContent('../content-container-pairs.json')"
+    ) == 1
+    assert (
+        PROJECT_ROOT / "infra/modules/cosmos-content-rbac.bicep"
+    ).read_text(encoding="utf-8").count(
+        "loadJsonContent('../content-container-pairs.json')"
+    ) == 1
 
 
 def test_ingestion_runs_indexes_order_by_paths() -> None:
@@ -170,25 +331,133 @@ def test_cosmos_search_policy_and_throughput_ownership() -> None:
     assert containers_by_id["retrieval-config"]["properties"]["options"] == {}
 
 
-def test_retrieval_catalog_and_gateway_env_contracts() -> None:
+def test_function_environment_names_are_exactly_locked_per_surface() -> None:
+    template = _compile_bicep("infra/modules/functions.bicep")
+    function_app = _resources(template, "Microsoft.Web/sites")[0]
+    env_names = {
+        setting["name"]
+        for setting in function_app["properties"]["siteConfig"]["appSettings"]
+    }
+    assert env_names == {
+        "FUNCTIONS_EXTENSION_VERSION",
+        "APPLICATIONINSIGHTS_CONNECTION_STRING",
+        "APPLICATIONINSIGHTS_AUTHENTICATION_STRING",
+        "AzureWebJobsStorage__blobServiceUri",
+        "AzureWebJobsStorage__queueServiceUri",
+        "AzureWebJobsStorage__tableServiceUri",
+        "AzureWebJobsStorage__credential",
+        "AzureWebJobsStorage__clientId",
+        "AZURE_AUTH_MODE",
+        "AZURE_CLIENT_ID",
+        "COSMOS_ENDPOINT",
+        "COSMOS_DATABASE_NAME",
+        "COSMOS_INGESTION_RUNS_CONTAINER_NAME",
+        "COSMOS_INGESTION_SOURCES_CONTAINER_NAME",
+        "DURABLE_TASK_SCHEDULER_CONNECTION_STRING",
+        "TASKHUB_NAME",
+        "OPENAI_ENDPOINT",
+        "OPENAI_EMBEDDING_DEPLOYMENT_NAME",
+        "OPENAI_CHAT_DEPLOYMENT_NAME",
+        "VISION_MAX_OUTPUT_TOKENS",
+        "DOCUMENT_INTELLIGENCE_ENDPOINT",
+        "DOCUMENT_INTELLIGENCE_ENABLED",
+        "CONTENT_UNDERSTANDING_ENDPOINT",
+        "CONTENT_UNDERSTANDING_ANALYZER_ID",
+        "CONTENT_UNDERSTANDING_ENABLED",
+        "AZURE_LANGUAGE_ENDPOINT",
+        "SPEECH_ENDPOINT",
+        "SPEECH_REGION",
+        "AUDIO_DEPLOYMENT_REGION",
+        "AUDIO_LOCALE",
+        "AUDIO_WRITER_ENABLED",
+        "AUDIO_TRANSCRIPTION_PROVIDER",
+        "AUDIO_STAGING_BLOB_ENDPOINT",
+        "AUDIO_STAGING_CONTAINER",
+        "AUDIO_BATCH_TTL_HOURS",
+        "KEY_VAULT_URI",
+        "SHAREPOINT_TENANT_ID",
+        "SHAREPOINT_APP_CLIENT_ID",
+        "INGESTION_SOURCE_ID",
+        "ALLOWED_FILE_EXTENSIONS",
+        "SHAREPOINT_ASSIGNED_DRIVE_ID",
+        "SHAREPOINT_CERTIFICATE_SECRET_NAME",
+        "FUNCTION_PUBLIC_BASE_URL",
+        "DELTA_SYNC_SCHEDULE",
+        "ACL_RESYNC_SCHEDULE",
+        "ACL_RESYNC_PAGE_SIZE",
+        "LIFECYCLE_RECONCILE_SCHEDULE",
+        "LIFECYCLE_RECONCILE_PAGE_SIZE",
+        "CHUNK_MAX_TOKENS",
+        "CHUNK_OVERLAP_TOKENS",
+        "ACL_MAX_PAGES",
+        "DOWNLOAD_TIMEOUT_SECONDS",
+        "DELTA_MAX_PAGES",
+        "EMBEDDING_BATCH_SIZE",
+        "MAX_PAGES_PER_SOURCE",
+        "WEBHOOK_CLIENT_STATE",
+        "SUBSCRIPTION_RENEW_SCHEDULE",
+        "SHAREPOINT_SITE_URL",
+    }
+
+
+def test_retrieval_environment_names_are_exactly_locked_per_surface() -> None:
+    template = _compile_bicep("infra/modules/retrieval-config.bicep")
+    env_names = {item["name"] for item in template["variables"]["envVars"]}
+    assert template["parameters"]["agentTimeoutSeconds"]["defaultValue"] == "20.0"
+    assert env_names == {
+        "COSMOS_ENDPOINT",
+        "COSMOS_DATABASE",
+        "COSMOS_AUDIT_CONTAINER",
+        "COSMOS_INGESTION_SOURCES_CONTAINER",
+        "COSMOS_INGESTION_RUNS_CONTAINER",
+        "AZURE_OPENAI_ENDPOINT",
+        "EMBEDDING_DEPLOYMENT",
+        "CHAT_DEPLOYMENT",
+        "TENANT_ID",
+        "AZURE_AUTH_MODE",
+        "MANAGED_IDENTITY_CLIENT_ID",
+        "RETRIEVAL_API_AUDIENCE",
+        "RETRIEVAL_CATALOG_POLL_SECONDS",
+        "INCLUDE_CITATIONS",
+        "MAX_EVIDENCE_CHUNKS",
+        "MAX_PLANNED_QUERIES",
+        "RETRIEVAL_TIMEOUT_SECONDS",
+        "GENERATION_TIMEOUT_SECONDS",
+        "AGENT_TIMEOUT_SECONDS",
+        "AGENT_MAX_ITERATIONS",
+        "AGENT_OPENAI_API_VERSION",
+        "GRAPH_GROUP_TIMEOUT_SECONDS",
+        "OPENAI_API_VERSION",
+        "APPLICATIONINSIGHTS_CONNECTION_STRING",
+        "RETRIEVAL_CONFIG_CONTAINER",
+        "RETRIEVAL_OPERATION_TIMEOUT_SECONDS",
+    }
+
+
+def test_retrieval_catalog_and_direct_auth_env_contracts() -> None:
     config_source = (PROJECT_ROOT / "infra/modules/retrieval-config.bicep").read_text(
         encoding="utf-8"
     )
     for name in (
-        "DEPLOYMENT_INSTANCE_ID",
         "RETRIEVAL_CATALOG_POLL_SECONDS",
         "RETRIEVAL_CONFIG_CONTAINER",
         "RETRIEVAL_API_AUDIENCE",
-        "RETRIEVAL_GATEWAY_CLIENT_ID",
-        "RETRIEVAL_GATEWAY_PRINCIPAL_ID",
         "RETRIEVAL_OPERATION_TIMEOUT_SECONDS",
         "COSMOS_INGESTION_SOURCES_CONTAINER",
         "COSMOS_INGESTION_RUNS_CONTAINER",
     ):
         assert name in config_source
+    assert "RETRIEVAL_GATEWAY_CLIENT_ID" not in config_source
+    assert "RETRIEVAL_GATEWAY_PRINCIPAL_ID" not in config_source
 
     assert "RETRIEVAL_CATALOG_DIGEST" not in config_source
     template = _compile_bicep("infra/modules/retrieval-config.bicep")
+    retrieval_env = {
+        item["name"]: item["value"]
+        for item in template["variables"]["envVars"]
+    }
+    assert retrieval_env["AZURE_AUTH_MODE"] == "managed_identity"
+    assert "AZURE_CLIENT_SECRET" not in retrieval_env
     assert template["parameters"]["catalogPollSeconds"] == {
         "type": "int", "defaultValue": 7200, "minValue": 60, "maxValue": 86400,
         "metadata": {"description": "Runtime catalog poll interval in seconds"},
@@ -224,12 +493,25 @@ def test_retrieval_catalog_and_gateway_env_contracts() -> None:
     )
 
     publisher = _compile_bicep("infra/modules/retrieval-config-publisher-rbac.bicep")
-    publisher_role = _resources(
+    publisher_roles = _resources(
         publisher, "Microsoft.DocumentDB/databaseAccounts/sqlRoleAssignments"
-    )[0]
+    )
+    publisher_role = next(
+        role for role in publisher_roles
+        if role["name"].endswith("create-read'))]")
+    )
     assert publisher_role["condition"] == "[not(empty(parameters('publisherPrincipalId')))]"
     assert publisher_role["properties"]["scope"] == "[variables('containerScope')]"
     assert "catalog-bootstrap-create-read" in publisher_role["properties"]["roleDefinitionId"]
+    function_writer = next(
+        role for role in publisher_roles
+        if "function-writer" in role["name"]
+    )
+    assert function_writer["condition"] == (
+        "[not(empty(parameters('functionWriterPrincipalId')))]"
+    )
+    assert function_writer["properties"]["scope"] == "[variables('containerScope')]"
+    assert "catalog-guarded-writer" in function_writer["properties"]["roleDefinitionId"]
 
 
 def test_catalog_roles_have_no_delete_upsert_or_wildcard_actions():
@@ -246,8 +528,7 @@ def test_catalog_roles_have_no_delete_upsert_or_wildcard_actions():
     assert publisher["variables"]["editActions"] == (
         "[concat(variables('readActions'), createArray("
         "'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/items/replace', "
-        "'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/executeQuery', "
-        "'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/readChangeFeed'))]"
+        "'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/executeQuery'))]"
     )
     assert "items/create" in json.dumps(roles[0]["properties"]["permissions"])
     assert roles[1]["properties"]["permissions"] == [{"dataActions": "[variables('editActions')]"}]
@@ -311,6 +592,17 @@ def test_main_has_no_active_aks_or_directory_mutation_path() -> None:
     assert "param deployServing bool = false" in main_source
     assert "module aca './modules/aca.bicep' = if (deployServing)" in main_source
     assert "module functions './modules/functions.bicep' = if (deployServing)" in main_source
+
+
+def test_retrieval_configuration_has_no_legacy_routing_authority() -> None:
+    template = _compile_bicep("infra/modules/retrieval-config.bicep")
+    config_map = template["outputs"]["configMap"]["value"]
+    serialized = json.dumps(config_map)
+
+    assert "ACL_ENABLED" not in serialized
+    assert "COSMOS_CHUNKS_CONTAINER" not in serialized
+    assert "COSMOS_MANIFESTS_CONTAINER" not in serialized
+    assert "COSMOS_REGISTRY_JSON" not in serialized
 
 
 def test_content_understanding_account_and_model_contract() -> None:
@@ -418,29 +710,85 @@ def test_content_understanding_composition_is_private_and_identity_scoped() -> N
     )
 
 
-def test_aca_requires_immutable_inputs_and_exact_gateway_auth() -> None:
+def test_aca_requires_immutable_inputs_and_direct_user_auth() -> None:
     main_source = (PROJECT_ROOT / "infra/main.bicep").read_text(encoding="utf-8")
+    environment_template = _compile_bicep("infra/modules/aca-environment.bicep")
     aca_path = PROJECT_ROOT / "infra/modules/aca.bicep"
     aca_source = aca_path.read_text(encoding="utf-8")
     aca_template = _compile_bicep("infra/modules/aca.bicep")
 
     assert "param retrievalImageReference string = ''" in main_source
     assert "param retrievalCatalogDigest string = ''" in main_source
+    assert "param entraApiTenantId string" in main_source
+    assert (
+        "entraIssuer: "
+        "'${environment().authentication.loginEndpoint}${entraApiTenantId}/v2.0'"
+    ) in main_source
+    assert (
+        "entraIssuer: "
+        "'${environment().authentication.loginEndpoint}${sharePointTenantId}/v2.0'"
+    ) not in main_source
     assert "take(replace(prefix, '-', ''), 18)" in main_source
     assert main_source.count("retrievalApiAudience: retrievalApiClientId") == 2
-    assert "retrievalServiceScope: '${retrievalApiAudience}/.default'" in main_source
+    assert "param retrievalApiAudience" not in main_source
     assert aca_template["parameters"]["containerAppName"]["maxLength"] == 32
-    assert "imageName: retrievalImageReference" in main_source
-    assert "param imageName string" in aca_source
+    assert "imageDigest: last(split(retrievalImageReference, '@sha256:'))" in main_source
+    assert "param imageDigest string" in aca_source
+    assert "'${acrLoginServer}/rag-retrieval@sha256:${imageDigest}'" in aca_source
     assert "quickstart" not in aca_source
     assert "@sha256:" in main_source
-    assert "allowedApplications: [gatewayClientId]" in aca_source
-    assert "identities: [gatewayPrincipalId]" in aca_source
+    assert "gatewayClientId" not in aca_source
+    assert "gatewayPrincipalId" not in aca_source
+    assert "param allowedApplicationClientIds array" in aca_source
+    assert "allowedApplications: allowedApplicationClientIds" in aca_source
+    assert (
+        "allowedApplicationClientIds: retrievalAllowedApplicationClientIds"
+        in main_source
+    )
+    assert "allowedPrincipals" not in aca_source
     assert "excludedPaths" not in aca_source
     assert "unauthenticatedClientAction: 'Return401'" in aca_source
+    assert "allowInsecure: false" in aca_source
     assert "clientSecretSettingName" not in aca_source
     assert "retrieval-auth-client-secret" not in aca_source
     assert "output retrievalContainerAppName string" in main_source
+    managed_environment = _resources(
+        environment_template,
+        "Microsoft.App/managedEnvironments",
+    )[0]
+    assert managed_environment["properties"]["vnetConfiguration"]["internal"] is False
+    assert "publicNetworkAccess" not in managed_environment["properties"]
+    assert "module acaDns " not in main_source
+    assert not (PROJECT_ROOT / "infra/modules/aca-dns.bicep").exists()
+    assert "output publicUrl string" in aca_source
+    assert "output queryUrl string" in aca_source
+    assert "aca.?outputs.?publicUrl" in main_source
+    assert "aca.?outputs.?queryUrl" in main_source
+
+    external_environment_path = (
+        PROJECT_ROOT / "infra/modules/external-aca-environment.bicep"
+    )
+    external_environment_source = external_environment_path.read_text(encoding="utf-8")
+    external_environment = _compile_bicep(
+        "infra/modules/external-aca-environment.bicep"
+    )
+    assert "name: 'external-aca-environment-resource'" in external_environment_source
+    assert len(
+        _resources(external_environment, "Microsoft.Resources/deployments")
+    ) == 1
+    external_serving = _compile_bicep("infra/modules/external-aca-serving.bicep")
+    deployments = _resources(external_serving, "Microsoft.Resources/deployments")
+    assert len(deployments) == 2
+    assert set(external_serving["outputs"]) == {
+        "retrievalFqdn",
+        "retrievalPublicUrl",
+        "retrievalQueryUrl",
+    }
+    serving_source = (
+        PROJECT_ROOT / "infra/modules/external-aca-serving.bicep"
+    ).read_text(encoding="utf-8")
+    assert "tenantId: sharePointTenantId" in serving_source
+    assert "${entraApiTenantId}/v2.0" in serving_source
 
 
 def test_audio_staging_account_is_deny_gated_to_speech_resource_instance() -> None:
@@ -555,7 +903,6 @@ def test_private_catalog_job_is_manual_identity_only_and_secretless() -> None:
         "COSMOS_ENDPOINT",
         "COSMOS_DATABASE",
         "RETRIEVAL_CONFIG_CONTAINER",
-        "DEPLOYMENT_INSTANCE_ID",
         "EXPECTED_CATALOG_DIGEST",
         "MANAGED_IDENTITY_CLIENT_ID",
     }
@@ -601,15 +948,23 @@ def test_function_settings_match_full_sync_contract() -> None:
         for setting in function_app["properties"]["siteConfig"]["appSettings"]
     }
 
+    assert settings["AZURE_AUTH_MODE"] == "managed_identity"
+    assert settings["AZURE_CLIENT_ID"] == "[parameters('managedIdentityClientId')]"
+    assert "AZURE_CLIENT_SECRET" not in settings
+    for redundant_name in (
+        "MANAGED_IDENTITY_CLIENT_ID",
+        "TENANT_ID",
+        "FUNCTION_API_AUDIENCE",
+        "VISION_MAX_IMAGE_BYTES",
+        "VISION_MAX_FIGURES",
+        "INSTANCE_MEMORY_MB",
+    ):
+        assert redundant_name not in settings
     assert settings["COSMOS_INGESTION_RUNS_CONTAINER_NAME"] == (
         "[parameters('cosmosContainerNames').ingestionRuns]"
     )
-    assert settings["COSMOS_SOURCE_DOCUMENTS_CONTAINER_NAME"] == (
-        "[parameters('cosmosContainerNames').sourceDocuments]"
-    )
-    assert settings["COSMOS_SEARCH_CHUNKS_CONTAINER_NAME"] == (
-        "[parameters('cosmosContainerNames').searchChunks]"
-    )
+    assert "COSMOS_SOURCE_DOCUMENTS_CONTAINER_NAME" not in settings
+    assert "COSMOS_SEARCH_CHUNKS_CONTAINER_NAME" not in settings
     assert settings["TASKHUB_NAME"] == "[parameters('durableTaskHubName')]"
     assert settings["CONTENT_UNDERSTANDING_ENDPOINT"] == (
         "[parameters('contentUnderstandingEndpoint')]"
@@ -623,11 +978,16 @@ def test_function_settings_match_full_sync_contract() -> None:
     assert settings["CONTENT_UNDERSTANDING_ENABLED"] == (
         "[string(parameters('contentUnderstandingEnabled'))]"
     )
+    assert settings["MAX_PAGES_PER_SOURCE"] == "2000"
+    assert "MAX_PDF_PAGES" not in settings
     assert settings["DURABLE_TASK_SCHEDULER_CONNECTION_STRING"] == (
         "[format('Endpoint={0};Authentication=ManagedIdentity;ClientID={1}', "
         "parameters('durableTaskSchedulerEndpoint'), "
         "parameters('managedIdentityClientId'))]"
     )
+    assert function_app["properties"]["functionAppConfig"][
+        "scaleAndConcurrency"
+    ]["instanceMemoryMB"] == "[parameters('instanceMemoryMB')]"
     site_url_parameter = template["parameters"]["sharePointSiteUrl"]
     assert site_url_parameter["minLength"] == 1
     assert "defaultValue" not in site_url_parameter

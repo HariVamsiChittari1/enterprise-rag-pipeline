@@ -8,6 +8,8 @@ if TYPE_CHECKING:
     from azure.core.credentials import TokenCredential
     from azure.cosmos import CosmosClient
 
+from azure_credentials import create_azure_credential
+
 
 def create_cosmos_client(
     endpoint: str,
@@ -15,12 +17,9 @@ def create_cosmos_client(
     *,
     credential: TokenCredential | None = None,
 ) -> CosmosClient:
-    """Create an Azure Cosmos DB client with supplied or default Entra credentials."""
+    """Create an Azure Cosmos DB client with supplied or explicit credentials."""
     from azure.cosmos import CosmosClient
-    from azure.identity import DefaultAzureCredential
 
     if credential is None:
-        credential = DefaultAzureCredential(
-            managed_identity_client_id=managed_identity_client_id
-        )
+        credential = create_azure_credential(managed_identity_client_id)
     return CosmosClient(endpoint, credential=credential)

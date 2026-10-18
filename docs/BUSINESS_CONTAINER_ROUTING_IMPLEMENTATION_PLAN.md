@@ -1853,21 +1853,30 @@ replace deployed workload identities or ACA delegated-user authentication.
 
 #### T22 - Review and hand off [P0]
 
-- Status: NOT STARTED
+- Status: COMPLETE (2026-10-18)
 - Depends on: T21
 - Surfaces: implementation diff, deployment evidence, operational docs
 - Work:
-  - review for source/container leakage, hidden fallback, broad RBAC, stale
-    gateway behavior, and unsafe cutover paths;
-  - update directly affected API, architecture, deployment, and runbook docs;
-  - record rollback steps and residual risks; and
-  - leave production capacity and agent/OBO work on hold.
+  - reviewed the remaining dirty worktree and confirmed the no-go boundary:
+    the runtime handoff and IaC wiring were split across a partial commit and
+    required a single final T22 batch to preserve source-aware routing, direct
+    ACA auth, and container policy consistency;
+  - cleaned stale scratch artifacts and malformed local cache ignore entries;
+  - updated the handoff plan, rollback notes, and residual-risk evidence;
+  - recorded the approved exclusions: no temporary catalog-job retirement,
+    no capacity pilot/tuning, and no external Agent/OBO auth in this gate.
 - Acceptance:
   - review has no unresolved must-fix findings;
   - docs describe the deployed behavior;
-  - implementation status tracker is complete and archived.
-- Evidence: approved milestone exclusions and repository documentation
-  conventions.
+  - implementation status tracker is complete and archived;
+  - direct ACA retrieval, source registry, and runtime catalog contract remain
+    consistent with the reviewed evidence.
+- Evidence:
+  - review identified the partial-commit defect and required final T22 batch
+    recovery before handoff;
+  - all remaining review findings were validated against the code and config
+    boundaries, with only scratch cleanup and documentation/plan closure left;
+  - git diff checks and syntax validation pass in the final handoff batch.
 
 ## Dependency path
 

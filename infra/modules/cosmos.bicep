@@ -258,7 +258,7 @@ resource retrievalConfigContainer 'Microsoft.DocumentDB/databaseAccounts/sqlData
     resource: {
       id: 'retrieval-config'
       partitionKey: {
-        paths: ['/deploymentInstanceId']
+        paths: ['/id']
         kind: 'Hash'
         version: 2
       }

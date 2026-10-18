@@ -14,7 +14,7 @@ from ingestion.graph import (
     resolve_source_format,
     validate_source_signature,
 )
-from ingestion.models import ScaleLimits
+from ingestion.models import SourceAdmissionConfig
 from ingestion.source_connector import SharePointConnector
 
 
@@ -30,7 +30,9 @@ def test_discover_next_page_delegates_with_bound_drive_id() -> None:
 
     client, connector = _connector(handler)
     with client:
-        step = connector.discover_next_page(DiscoveryState.initial(), ScaleLimits())
+        step = connector.discover_next_page(
+            DiscoveryState.initial(), SourceAdmissionConfig()
+        )
 
     assert step.state.complete is True
 

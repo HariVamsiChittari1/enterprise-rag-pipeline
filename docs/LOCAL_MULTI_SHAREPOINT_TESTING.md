@@ -23,7 +23,8 @@ Functions state. Do not use production resources.
 
 Direct retrieval can run on localhost against approved Azure development
 Cosmos DB, Azure OpenAI, Microsoft Graph, and the runtime catalog. This uses
-Azure CLI developer credentials and localhost-only emulation of the trusted
+the explicit non-production service principal configured by
+`AZURE_AUTH_MODE=service_principal` and localhost-only emulation of the trusted
 Function-to-retrieval headers. It validates retrieval, ACL, lifecycle, and
 citations, but it does not validate EasyAuth or managed-identity token exchange;
 that identity chain remains an Azure deployment test.
@@ -49,7 +50,10 @@ You need:
 - Python 3.12 in `C:\DevEnvs\enterprise-rag-pipeline\.venv`;
 - Azure Functions Core Tools;
 - Docker Desktop with Azurite running;
-- Azure CLI signed into the approved development tenant and subscription;
+- the explicit service-principal variables loaded through
+  [local Stage 5](LOCAL_DEVELOPMENT.md#stage-5-load-the-approved-local-application-identity);
+- optionally, Azure CLI signed into the approved development target only for
+  deployed-configuration discovery; it is not an application credential;
 - an ignored `app\local.settings.json` with approved development settings;
 - two SharePoint site URLs and document-library drive IDs; and
 - permission to read the SharePoint drives and required Azure resources.
@@ -106,7 +110,8 @@ Open PowerShell in the repository root:
 
 ```powershell
 Set-Location 'C:\Users\hchittari\OneDrive - Microsoft\Work\Project\BFL\enterprise-rag-pipeline'
-$devRoot = 'C:\DevEnvs\enterprise-rag-pipeline'
+.\scripts\initialize-dev-environment.ps1
+$devRoot = $env:DEV_ARTIFACTS_ROOT
 $python = "$devRoot\.venv\Scripts\python.exe"
 ```
 
@@ -128,7 +133,6 @@ environment.
 ## Stage 2: Run the focused automated gate
 
 ```powershell
-$env:PYTHONPYCACHEPREFIX = "$devRoot\pycache"
 & $python -m pytest `
   tests\app_runtime\test_source_routes.py `
   tests\app_runtime\test_source_full_sync_route.py `
@@ -136,11 +140,11 @@ $env:PYTHONPYCACHEPREFIX = "$devRoot\pycache"
   tests\app_runtime\test_operator_routes.py `
   tests\app_runtime\test_query_gateway.py `
   tests\retrieval\test_source_policy.py `
-  -q -p no:cacheprovider
+  -q
 ```
 
 This gate covers source registration and state changes, source-specific sync,
-parent dispatch, operator authorization, the query gateway, and retrieval
+parent dispatch, operator authorization, direct ACA query authentication, and retrieval
 source policy.
 
 **Checkpoint 2:** all tests must pass before starting an Azure-connected local
@@ -263,7 +267,7 @@ Open terminal 2 in the repository root:
 $base = 'http://localhost:7071'
 $settings = Get-Content .\app\local.settings.json -Raw | ConvertFrom-Json
 $tenantId = $settings.Values.SHAREPOINT_TENANT_ID
-$operatorObjectId = (az ad signed-in-user show --query id -o tsv --only-show-errors).Trim()
+$operatorObjectId = '<approved-local-operator-object-id>'
 
 $claims = @{ claims = @(
   @{ typ = 'tid'; val = $tenantId },
@@ -433,11 +437,14 @@ function Wait-Ingestion {
 Capture bounded document counts without copying content:
 
 ```powershell
-$before = Invoke-RestMethod -Method Get `
-  -Uri "$base/api/ingestion/inspect?container=source-documents&limit=200" `
+$beforeA = Invoke-RestMethod -Method Get `
+  -Uri "$base/api/ingestion/inspect?container=source-documents&sourceId=$($sourceA.sourceId)&limit=200" `
+  -Headers $operator
+$beforeB = Invoke-RestMethod -Method Get `
+  -Uri "$base/api/ingestion/inspect?container=source-documents&sourceId=$($sourceB.sourceId)&limit=200" `
   -Headers $operator
 
-$before.rows |
+@($beforeA.rows) + @($beforeB.rows) |
   Group-Object sourceId |
   Select-Object Name, Count
 ```
@@ -483,11 +490,14 @@ instance ID and outcome.
 ## Stage 14: Verify source isolation
 
 ```powershell
-$after = Invoke-RestMethod -Method Get `
-  -Uri "$base/api/ingestion/inspect?container=source-documents&limit=200" `
+$afterA = Invoke-RestMethod -Method Get `
+  -Uri "$base/api/ingestion/inspect?container=source-documents&sourceId=$($sourceA.sourceId)&limit=200" `
+  -Headers $operator
+$afterB = Invoke-RestMethod -Method Get `
+  -Uri "$base/api/ingestion/inspect?container=source-documents&sourceId=$($sourceB.sourceId)&limit=200" `
   -Headers $operator
 
-$after.rows |
+@($afterA.rows) + @($afterB.rows) |
   Group-Object sourceId |
   Select-Object Name, Count
 ```
@@ -610,7 +620,7 @@ Run the same order as the PowerShell workflow:
 
 The focused automated gate validates:
 
-- delegated-user query gateway claims;
+- delegated-user ACA query claims;
 - source lifecycle eligibility;
 - cited-source ETag revalidation; and
 - source isolation policy.
@@ -622,16 +632,14 @@ query result as cloud retrieval evidence.
 ### Run retrieval locally against Azure resources
 
 Use the deployed retrieval configuration as the source of truth rather than
-copying environment values by hand:
+copying environment values by hand. Complete local Stage 5 in this same
+terminal first. Azure CLI reads non-secret deployed configuration only; the
+loop must not import Azure workload identity settings into the local process.
 
 ```powershell
 $resourceGroup = 'rg-rag-aca-e2e-20260827'
 $containerApp = 'ragacae2e20260827-retr-jztu542h'
-$functionIdentity = 'rag-aca-e2e-20260827-functions-mi'
 $python = 'C:\DevEnvs\enterprise-rag-pipeline\.venv\Scripts\python.exe'
-
-Remove-Item Env:AZURE_CLIENT_ID,Env:AZURE_CLIENT_SECRET,Env:AZURE_TENANT_ID `
-  -ErrorAction SilentlyContinue
 
 $settings = az containerapp show `
   --resource-group $resourceGroup `
@@ -640,11 +648,38 @@ $settings = az containerapp show `
   --output json | ConvertFrom-Json
 
 foreach ($setting in $settings) {
-  if ($null -ne $setting.value) {
+  $azureOnlyIdentitySettings = @(
+    'AZURE_AUTH_MODE',
+    'AZURE_CLIENT_ID',
+    'AZURE_CLIENT_SECRET',
+    'AZURE_TENANT_ID',
+    'MANAGED_IDENTITY_CLIENT_ID'
+  )
+  if ($null -ne $setting.value -and
+      $setting.name -notin $azureOnlyIdentitySettings) {
     Set-Item -Path "Env:$($setting.name)" -Value $setting.value
   }
 }
 
+$localIdentity = (
+  Get-Content .\app\local.settings.json -Raw |
+  ConvertFrom-Json
+).Values
+
+foreach ($name in @(
+  'AZURE_AUTH_MODE',
+  'AZURE_TENANT_ID',
+  'AZURE_CLIENT_ID',
+  'AZURE_CLIENT_SECRET'
+)) {
+  $value = [string]$localIdentity.$name
+  if ([string]::IsNullOrWhiteSpace($value) -or $value -match '^<.*>$') {
+    throw "Missing or placeholder local identity setting: $name"
+  }
+  Set-Item -Path "Env:$name" -Value $value
+}
+
+Remove-Item Env:MANAGED_IDENTITY_CLIENT_ID -ErrorAction SilentlyContinue
 $env:APPLICATIONINSIGHTS_CONNECTION_STRING = ''
 $env:PYTHONPYCACHEPREFIX = 'C:\DevEnvs\enterprise-rag-pipeline\pycache'
 
@@ -667,53 +702,34 @@ Invoke-RestMethod http://127.0.0.1:8080/health/live
 Invoke-RestMethod http://127.0.0.1:8080/health/ready
 ```
 
-In a second terminal, build localhost-only gateway headers for the signed-in
-developer and execute a query:
+In a second terminal, build a localhost-only ACA principal header for the
+signed-in developer and execute a query. Never send this synthesized header to
+a deployed endpoint; ACA injects it after validating the delegated token:
 
 ```powershell
-$resourceGroup = 'rg-rag-aca-e2e-20260827'
-$functionIdentity = 'rag-aca-e2e-20260827-functions-mi'
 $tenantId = 'e140e1f9-c7cb-4d87-a943-e16669bcb80a'
 $retrievalAudience = '1fe3217b-c48f-4953-bec2-f56ace50a9d8'
 
-$gateway = az identity show `
-  --resource-group $resourceGroup `
-  --name $functionIdentity `
-  --query '{clientId:clientId,principalId:principalId}' `
-  --output json | ConvertFrom-Json
-
-$userId = az ad signed-in-user show --query id --output tsv
+$userId = '<approved-test-user-object-id>'
 
 $claims = @{ claims = @(
-  @{ typ = 'oid';   val = $gateway.principalId },
+  @{ typ = 'oid';   val = $userId },
   @{ typ = 'tid';   val = $tenantId },
   @{ typ = 'aud';   val = $retrievalAudience },
-  @{ typ = 'idtyp'; val = 'app' },
-  @{ typ = 'azp';   val = $gateway.clientId },
-  @{ typ = 'roles'; val = 'Retrieval.Gateway' }
+  @{ typ = 'idtyp'; val = 'user' },
+  @{ typ = 'scp';   val = 'user_impersonation' }
 ) } | ConvertTo-Json -Compress -Depth 4
 
-$servicePrincipal = [Convert]::ToBase64String(
+$userPrincipal = [Convert]::ToBase64String(
   [Text.Encoding]::UTF8.GetBytes($claims)
 )
 
-$contextJson = @{
-  v = 1
-  oid = $userId
-  tid = $tenantId
-} | ConvertTo-Json -Compress
-
-$context = [Convert]::ToBase64String(
-  [Text.Encoding]::ASCII.GetBytes($contextJson)
-).TrimEnd('=').Replace('+', '-').Replace('/', '_')
-
 $headers = @{
-  'X-MS-CLIENT-PRINCIPAL' = $servicePrincipal
-  'X-RAG-GATEWAY-CONTEXT' = $context
-  'X-RAG-REQUEST-ID' = [guid]::NewGuid().ToString()
+  'X-MS-CLIENT-PRINCIPAL' = $userPrincipal
 }
 
 $body = @{
+  sourceId = 'source-a'
   question = 'What are the Northstar access requirements?'
   mode = 'hybrid'
   top_k = 5
@@ -736,27 +752,30 @@ service.
 
 ### What waits for Azure
 
-End-to-end identity testing waits for an approved deployment because only the
-deployed Function gateway:
-
-1. validates real delegated-user EasyAuth claims;
-2. obtains a managed-identity service token;
-3. sends signed user context to the private retrieval service; and
-4. lets retrieval resolve the user's transitive security groups.
+End-to-end identity testing waits for an approved deployment because ACA
+built-in authentication must validate a real delegated-user token and inject
+the principal consumed by the retrieval application. Retrieval then resolves
+that user's transitive security groups only when the selected source enables
+ACL filtering. The Function App is ingestion-only and is not a query gateway.
 
 Do not use the localhost header emulation as a substitute for this end-to-end
 identity validation.
 
-After deployment, run:
+After deployment, call the ACA retrieval FQDN with a delegated token whose
+audience is `RETRIEVAL_API_AUDIENCE` and whose scope contains
+`user_impersonation`. Do not send `X-MS-CLIENT-PRINCIPAL`; ACA owns that header.
 
 ```powershell
-& $python .\tools\script_query_retrieval.py `
-  --function-app '<deployed-function-app-name>' `
-  --client-id '<function-api-client-id>' `
-  --question '<question answerable only from source A>' `
-  --mode hybrid `
-  --top-k 5 `
-  --json
+$token = '<delegated retrieval API token acquired without printing it>'
+$headers = @{ Authorization = "******"; 'Content-Type' = 'application/json' }
+$body = @{
+  sourceId = 'source-a'
+  question = '<question answerable only from source A>'
+  mode = 'hybrid'
+  top_k = 5
+} | ConvertTo-Json
+Invoke-RestMethod -Method Post -Uri 'https://<retrieval-fqdn>/api/query' `
+  -Headers $headers -Body $body
 ```
 
 Repeat with:
@@ -770,17 +789,26 @@ Repeat with:
 Verify citation source, URL, lifecycle exclusion, ACL exclusion, and the
 grounded no-evidence response.
 
-The Azure development validation on 2026-10-09 used one real delegated identity
-sequentially because the tenant did not have four safe ordinary test users.
-After each Reader/Editor membership change, verify the live transitive
-membership before querying. The observed Neither state failed closed with
-gateway HTTP 502 (`retrieval_auth_failed`) because the user had no eligible
-security groups; it did not return a grounded answer. Restore the original
-memberships and repeat both allowed-source queries before closing the test.
+The final T31 development validation used two real delegated identities against
+the same source and document. The authorized member received the target
+citation; the verified outside-group guest received HTTP 200 with the canonical
+no-evidence answer and zero citations. A successful Graph resolution with zero
+security-group memberships is a valid no-authority result, not an authentication
+or dependency failure. Restore any temporary membership changes before closing
+the test.
 
 ## Stop and recovery
 
-Stop the Functions host with `Ctrl+C`.
+Stop the Functions and retrieval hosts with `Ctrl+C`. In every terminal that
+loaded the local application credential, clear it after the child process
+stops:
+
+```powershell
+'AZURE_AUTH_MODE', 'AZURE_TENANT_ID', 'AZURE_CLIENT_ID',
+  'AZURE_CLIENT_SECRET' | ForEach-Object {
+    Remove-Item "Env:$_" -ErrorAction SilentlyContinue
+  }
+```
 
 Do not automatically abandon unresolved work. If a run leaves a source
 coordinator draining, inspect the status and host logs first. Use the

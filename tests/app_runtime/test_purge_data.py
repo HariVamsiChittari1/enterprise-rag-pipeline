@@ -1,8 +1,8 @@
 """Regression test for function_app.purge_data: a failing audit write must never mask
 an already-completed purge as a failure to the caller.
 
-Monkeypatches azure.cosmos.CosmosClient / azure.identity.DefaultAzureCredential (the
-SDK classes purge_data imports locally), with a fake service-audit container whose
+Monkeypatches the Cosmos client and shared credential factory, with a fake
+service-audit container whose
 create_item always raises, simulating a transient Cosmos write failure during audit
 logging. Production code is never modified by this test.
 """
@@ -15,7 +15,7 @@ from typing import Any
 from types import SimpleNamespace
 
 import azure.cosmos
-import azure.identity
+import cosmos_connection
 import pytest
 
 import config as config_module
@@ -47,8 +47,10 @@ class FakeDatabase:
     def __init__(self) -> None:
         self.source_documents = FakeSourceDocumentsContainer()
         self.audit = FailingAuditContainer()
+        self.requested_containers: list[str] = []
 
     def get_container_client(self, name: str) -> Any:
+        self.requested_containers.append(name)
         return self.audit if name == "service-audit" else self.source_documents
 
 
@@ -83,7 +85,11 @@ class FakeRequest:
 @pytest.fixture(autouse=True)
 def patch_cosmos_sdk(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(azure.cosmos, "CosmosClient", FakeCosmosClient)
-    monkeypatch.setattr(azure.identity, "DefaultAzureCredential", lambda **kwargs: object())
+    monkeypatch.setattr(
+        cosmos_connection,
+        "create_azure_credential",
+        lambda *_args: object(),
+    )
 
 
 def _principal_header(role: str) -> str:
@@ -134,7 +140,10 @@ def test_purge_route_rejects_missing_operator_role_before_cosmos_access(
 
 def test_purge_data_succeeds_even_when_audit_write_fails(monkeypatch: pytest.MonkeyPatch) -> None:
     registry = _FakePurgeRegistry()
-    config = object()
+    config = SimpleNamespace(
+        cosmos_search_chunks_container="default-search-chunks",
+        cosmos_source_documents_container="default-source-documents",
+    )
     monkeypatch.setattr(config_module, "load_config", lambda: config)
     monkeypatch.setattr(function_app, "_build_source_registry_repository", lambda _config: registry)
     monkeypatch.setattr(function_app, "_require_ingestion_operator", lambda _req: None)
@@ -157,7 +166,16 @@ class _FakePurgeRegistry:
     def __init__(self) -> None:
         self.events: list[str] = []
         self.plan = type("Plan", (), {
-            "source": type("Source", (), {"desired_state": "active"})(),
+            "source": type("Source", (), {
+                "source_id": "source-a",
+                "site_id": "site-a",
+                "site_url": "https://tenant.sharepoint.com/sites/a",
+                "drive_id": "drive-a",
+                "desired_state": "active",
+                "business_name": "Business A",
+                "chunks_container": "business-a-search-chunks",
+                "manifests_container": "business-a-source-documents",
+            })(),
         })()
 
     def read_source_plan(self, source_id: str):
@@ -176,13 +194,12 @@ class _FakePurgeRegistry:
         self.events.append("settle")
 
 
-def test_purge_data_catalog_deletes_within_deployment_partition(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_purge_data_catalog_deletes_with_item_id_partition(monkeypatch: pytest.MonkeyPatch) -> None:
     database = FakeDatabase()
     monkeypatch.setattr(azure.cosmos, "CosmosClient", _fake_cosmos_client_factory(database))
     monkeypatch.setattr(function_app, "_require_ingestion_operator", lambda _req: None)
     request = FakeRequest({
         "container": "retrieval-config",
-        "deploymentInstanceId": "deploy-1",
         "ids": ["runtime-catalog"],
         "confirm": "yes",
     })
@@ -194,7 +211,55 @@ def test_purge_data_catalog_deletes_within_deployment_partition(monkeypatch: pyt
     assert body["deleted"] == 1
     assert body["failed"] == 0
     assert database.source_documents.deleted == ["runtime-catalog"]
-    assert database.source_documents.deleted_partition_keys == ["deploy-1"]
+    assert database.source_documents.deleted_partition_keys == ["runtime-catalog"]
+
+
+@pytest.mark.parametrize(
+    ("requested_role", "expected_container"),
+    [
+        ("source-documents", "business-a-source-documents"),
+        ("search-chunks", "business-a-search-chunks"),
+    ],
+)
+def test_ingestion_purge_uses_registered_source_container_pair(
+    monkeypatch: pytest.MonkeyPatch,
+    requested_role: str,
+    expected_container: str,
+) -> None:
+    database = FakeDatabase()
+    database.audit = _RecordingAuditContainer()
+    config = SimpleNamespace(
+        cosmos_search_chunks_container="default-search-chunks",
+        cosmos_source_documents_container="default-source-documents",
+    )
+    monkeypatch.setattr(
+        azure.cosmos,
+        "CosmosClient",
+        _fake_cosmos_client_factory(database),
+    )
+    monkeypatch.setattr(config_module, "load_config", lambda: config)
+    monkeypatch.setattr(
+        function_app,
+        "_build_source_registry_repository",
+        lambda _config: _FakePurgeRegistry(),
+    )
+    monkeypatch.setattr(
+        function_app,
+        "_require_ingestion_operator",
+        lambda _req: None,
+    )
+
+    response = function_app.purge_data(FakeRequest({
+        "container": requested_role,
+        "sourceId": "source-a",
+        "ids": ["doc-1"],
+        "confirm": "yes",
+    }))
+
+    assert response.status_code == 200
+    assert expected_container in database.requested_containers
+    assert requested_role not in database.requested_containers
+    assert database.audit.items[0]["businessName"] == "Business A"
 
 
 class _RecordingAuditContainer:
@@ -213,7 +278,6 @@ def test_purge_audit_records_operator_object_id_and_name(monkeypatch: pytest.Mon
     oid = "11111111-2222-3333-4444-555555555555"
     request = FakeRequest({
         "container": "retrieval-config",
-        "deploymentInstanceId": "deploy-1",
         "ids": ["runtime-catalog"],
         "confirm": "yes",
     })
@@ -230,8 +294,13 @@ def test_purge_audit_records_operator_object_id_and_name(monkeypatch: pytest.Mon
     assert database.audit.items[0]["operator"] == "operator@contoso.com"
 
 
-def test_purge_data_catalog_requires_deployment_instance() -> None:
-    request = FakeRequest({"container": "retrieval-config", "ids": ["runtime-catalog"], "confirm": "yes"})
+def test_purge_data_catalog_rejects_caller_supplied_deployment_instance() -> None:
+    request = FakeRequest({
+        "container": "retrieval-config",
+        "ids": ["runtime-catalog"],
+        "confirm": "yes",
+        "deploymentInstanceId": "deploy-1",
+    })
 
     response = function_app.purge_data(request)
 
@@ -243,7 +312,6 @@ def test_purge_data_catalog_rejects_purge_all() -> None:
         "container": "retrieval-config",
         "purgeAll": True,
         "confirm": "yes",
-        "deploymentInstanceId": "deploy-1",
     })
 
     response = function_app.purge_data(request)
@@ -252,7 +320,7 @@ def test_purge_data_catalog_rejects_purge_all() -> None:
 
 
 def test_purge_data_catalog_requires_confirm() -> None:
-    request = FakeRequest({"container": "retrieval-config", "ids": ["runtime-catalog"], "deploymentInstanceId": "deploy-1"})
+    request = FakeRequest({"container": "retrieval-config", "ids": ["runtime-catalog"]})
 
     response = function_app.purge_data(request)
 
@@ -299,7 +367,14 @@ def test_ingestion_purge_refuses_an_active_source_coordinator(
 
     database = FakeDatabase()
     monkeypatch.setattr(azure.cosmos, "CosmosClient", _fake_cosmos_client_factory(database))
-    monkeypatch.setattr(config_module, "load_config", lambda: object())
+    monkeypatch.setattr(
+        config_module,
+        "load_config",
+        lambda: SimpleNamespace(
+            cosmos_search_chunks_container="default-search-chunks",
+            cosmos_source_documents_container="default-source-documents",
+        ),
+    )
     monkeypatch.setattr(function_app, "_build_source_registry_repository", lambda _config: BusyRegistry())
     monkeypatch.setattr(function_app, "_require_ingestion_operator", lambda _req: None)
     request = FakeRequest({

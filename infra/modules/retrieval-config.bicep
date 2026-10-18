@@ -25,34 +25,15 @@ param managedIdentityClientId string
 @minLength(1)
 param retrievalApiAudience string
 
-@description('Function managed identity application/client ID allowed to call retrieval')
-param gatewayClientId string
-
-@description('Function managed identity service-principal object ID allowed to call retrieval')
-param gatewayPrincipalId string
-
-@description('Unique deployment instance and Cosmos retrieval-config partition key')
-@minLength(1)
-param deploymentInstanceId string
-
 @description('Runtime catalog poll interval in seconds')
 @minValue(60)
 @maxValue(86400)
 param catalogPollSeconds int = 7200
 
-@description('Enable ACL filtering at retrieval time')
-param aclEnabled bool = true
-
 @description('Application Insights connection string (empty to disable tracing)')
 param appInsightsConnectionString string = ''
 
 // --- Tuning knobs (sensible defaults, override per environment) ---
-
-@description('Cosmos container name for search chunks')
-param cosmosChunksContainer string = 'search-chunks'
-
-@description('Cosmos container name for source document manifests')
-param cosmosManifestsContainer string = 'source-documents'
 
 @description('Cosmos container name for audit records')
 param cosmosAuditContainer string = 'service-audit'
@@ -105,8 +86,6 @@ param operationTimeoutSeconds string = '27.0'
 var envVars = [
   { name: 'COSMOS_ENDPOINT', value: cosmosEndpoint }
   { name: 'COSMOS_DATABASE', value: cosmosDatabaseName }
-  { name: 'COSMOS_CHUNKS_CONTAINER', value: cosmosChunksContainer }
-  { name: 'COSMOS_MANIFESTS_CONTAINER', value: cosmosManifestsContainer }
   { name: 'COSMOS_AUDIT_CONTAINER', value: cosmosAuditContainer }
   { name: 'COSMOS_INGESTION_SOURCES_CONTAINER', value: ingestionSourcesContainer }
   { name: 'COSMOS_INGESTION_RUNS_CONTAINER', value: ingestionRunsContainer }
@@ -114,13 +93,10 @@ var envVars = [
   { name: 'EMBEDDING_DEPLOYMENT', value: embeddingDeploymentName }
   { name: 'CHAT_DEPLOYMENT', value: chatDeploymentName }
   { name: 'TENANT_ID', value: tenantId }
+  { name: 'AZURE_AUTH_MODE', value: 'managed_identity' }
   { name: 'MANAGED_IDENTITY_CLIENT_ID', value: managedIdentityClientId }
   { name: 'RETRIEVAL_API_AUDIENCE', value: retrievalApiAudience }
-  { name: 'RETRIEVAL_GATEWAY_CLIENT_ID', value: gatewayClientId }
-  { name: 'RETRIEVAL_GATEWAY_PRINCIPAL_ID', value: gatewayPrincipalId }
-  { name: 'DEPLOYMENT_INSTANCE_ID', value: deploymentInstanceId }
   { name: 'RETRIEVAL_CATALOG_POLL_SECONDS', value: string(catalogPollSeconds) }
-  { name: 'ACL_ENABLED', value: string(aclEnabled) }
   { name: 'INCLUDE_CITATIONS', value: string(includeCitations) }
   { name: 'MAX_EVIDENCE_CHUNKS', value: maxEvidenceChunks }
   { name: 'MAX_PLANNED_QUERIES', value: maxPlannedQueries }

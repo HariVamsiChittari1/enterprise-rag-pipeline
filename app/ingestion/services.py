@@ -37,6 +37,7 @@ from ingestion.extraction import (
 )
 from ingestion.graph import (
     DeltaResetRequired,
+    GraphPageLimitExceeded,
     DiscoveryState,
     ResolvedMarkdownImage,
     VerifiedAcl,
@@ -68,9 +69,7 @@ from ingestion.models import (
     RunStage,
     RunStatus,
     SafeError,
-    ScaleLimits,
     SearchChunkRecord,
-    Settings,
     SUPPORTED_AUDIO_MIME_TYPES,
     SourceControlRecord,
     SourceDocumentRecord,
@@ -211,7 +210,6 @@ def discover_next_page(
         source_plan is None or not isinstance(owner_instance_id, str) or not owner_instance_id
     ):
         raise ValueError("discovery_work_context_required")
-    settings = Settings(source_id=config.source_id, drive_id=config.drive_id, code_version="durable-sync")
     documents: list[SourceDocumentRecord] = []
     skipped = 0
 
@@ -219,7 +217,7 @@ def discover_next_page(
     prev_run_id = control.record.last_completed_run_id if control else None
     prev_source_run_id = create_source_run_id(config.source_id, prev_run_id) if prev_run_id else None
     step = connector.discover_next_page(
-        state, settings.limits, allowed_extensions=config.allowed_extensions,
+        state, config.admission, allowed_extensions=config.allowed_extensions,
     )
     for pdf in step.pdfs:
         doc_id = create_document_id(config.source_id, config.drive_id, pdf.item_id)
@@ -256,19 +254,19 @@ def discover_next_page(
                         source_etag=pdf.e_tag,
                         profile_digest=_processing_profile_digest(config),
                     ):
-                        if work_registry is None:
-                            skipped += 1
-                            continue
                         try:
                             current_item = connector.read_item(pdf.item_id)
                             current_acl = connector.read_verified_acl(
                                 pdf.item_id,
-                                config.acl_max_pages,
+                                config.execution.acl_max_pages,
                             )
                             reusable = (
                                 current_item is not None
                                 and current_item.get("eTag") == pdf.e_tag
-                                and current_acl.acl_hash == prev.record.acl_hash
+                                and _verified_acl_matches_document(
+                                    current_acl,
+                                    prev.record,
+                                )
                             )
                         except Exception:
                             logger.warning(
@@ -334,6 +332,18 @@ def _winner_matches_document_record(
     )
 
 
+def _verified_acl_matches_document(
+    acl: VerifiedAcl,
+    record: Any,
+) -> bool:
+    return (
+        getattr(record, "acl_status", None) is acl.acl_status
+        and getattr(record, "acl_feedback", None) == acl.acl_feedback
+        and getattr(record, "allowed_group_ids", None) == acl.allowed_group_ids
+        and getattr(record, "acl_hash", None) == acl.acl_hash
+    )
+
+
 def process_document(
     config: IngestionConfig,
     document: SourceDocumentRecord,
@@ -373,16 +383,18 @@ def process_document(
     current_doc = processing.record
     current_etag = processing.etag
     try:
-        limits = ScaleLimits()
+        admission = config.admission
         source_snapshot = _read_and_validate_source_snapshot(connector, current_doc)
         source_format = source_snapshot.source_format
-        acl = connector.read_verified_acl(current_doc.item_id, config.acl_max_pages)
+        acl = connector.read_verified_acl(
+            current_doc.item_id, config.execution.acl_max_pages
+        )
         authorized_images: list[_AuthorizedImage] = []
 
         content = connector.download_content_sync(
             current_doc.item_id,
-            limits.max_source_bytes,
-            config.download_timeout_seconds,
+            admission.max_source_bytes,
+            config.execution.download_timeout_seconds,
         )
         validate_source_signature(source_format, content)
 
@@ -407,9 +419,9 @@ def process_document(
                     content_urls=[content_url],
                     locale=config.audio_locale,
                     display_name=current_doc.document_id,
-                    time_to_live_hours=config.audio_batch_ttl_hours,
+                    time_to_live_hours=config.execution.audio_batch_ttl_hours,
                     token_provider=speech_token_provider,
-                    timeout_seconds=config.speech_request_timeout_seconds,
+                    timeout_seconds=config.execution.speech_request_timeout_seconds,
                 )
                 submitted = replace(
                     current_doc, stage=DocumentStage.TRANSCRIBING,
@@ -434,7 +446,7 @@ def process_document(
                 locale=config.audio_locale,
                 token_provider=speech_token_provider,
                 max_response_bytes=config.audio_max_response_bytes,
-                timeout_seconds=config.speech_request_timeout_seconds,
+                timeout_seconds=config.execution.speech_request_timeout_seconds,
             )
             audio, segments = build_transcript(
                 response,
@@ -443,8 +455,8 @@ def process_document(
                 source_version=current_doc.e_tag,
                 source_content_hash=source_content_hash,
                 max_response_bytes=config.audio_max_response_bytes,
-                max_phrases=config.audio_max_phrases,
-                max_words=config.audio_max_words,
+                max_phrases=admission.max_audio_phrases_per_source,
+                max_words=admission.max_audio_words_per_source,
             )
             written = _finalize_audio_document(
                 config, current_doc, current_etag, audio, segments, acl, source_snapshot,
@@ -465,22 +477,19 @@ def process_document(
             vision_config = VisionExtractionConfig(
                 deployment=config.vision_deployment,
                 max_output_tokens=config.vision_max_output_tokens,
-                max_image_bytes=config.vision_max_image_bytes,
-                max_figures=min(
-                    config.vision_max_figures,
-                    limits.max_visual_descriptions,
-                ),
+                max_image_bytes=admission.max_visual_asset_bytes,
+                max_figures=admission.max_visual_assets_per_source,
             )
             if source_format == ".md":
                 def load_markdown_image(path: str) -> bytes:
                     image = connector.resolve_relative_markdown_image_sync(
                         current_doc.parent_item_id,
                         path,
-                        config.vision_max_image_bytes,
+                        admission.max_visual_asset_bytes,
                     )
                     image_acl = connector.read_verified_acl(
                         image.item_id,
-                        config.acl_max_pages,
+                        config.execution.acl_max_pages,
                     )
                     if not set(acl.allowed_group_ids).issubset(
                         image_acl.allowed_group_ids
@@ -490,8 +499,8 @@ def process_document(
                         )
                     image_content = connector.download_content_sync(
                         image.item_id,
-                        config.vision_max_image_bytes,
-                        config.download_timeout_seconds,
+                        admission.max_visual_asset_bytes,
+                        config.execution.download_timeout_seconds,
                     )
                     authorized_images.append(_AuthorizedImage(image, image_acl))
                     return image_content
@@ -513,7 +522,7 @@ def process_document(
                         cu_client,
                         content,
                         source_snapshot.mime_type,
-                        max_pages=min(config.max_pdf_pages, limits.max_document_units),
+                        max_pages=admission.max_pages_per_source,
                         analyzer_id=config.content_understanding_analyzer_id,
                     )
                     extraction_provider = ExtractionProvider.CONTENT_UNDERSTANDING.value
@@ -526,10 +535,7 @@ def process_document(
                     extraction = extract_pdf(
                         di_client,
                         content,
-                        max_pdf_pages=min(
-                            config.max_pdf_pages,
-                            limits.max_document_units,
-                        ),
+                        max_pdf_pages=admission.max_pages_per_source,
                         openai_client=openai_client,
                         vision_config=vision_config,
                     )
@@ -539,9 +545,9 @@ def process_document(
                 inventory = inventory_office_visuals(
                     content,
                     source_snapshot.mime_type,
-                    max_content_units=limits.max_document_units,
+                    max_content_units=admission.max_content_units_per_source,
                 )
-                if len(inventory.required) > limits.max_visual_descriptions:
+                if len(inventory.required) > admission.max_visual_assets_per_source:
                     raise TerminalDocumentError(
                         "visual_description_limit_exceeded"
                     )
@@ -552,8 +558,8 @@ def process_document(
                         )
                     analysis_content = connector.download_content_as_pdf_sync(
                         current_doc.item_id,
-                        limits.max_rendered_pdf_bytes,
-                        config.download_timeout_seconds,
+                        admission.max_rendered_derivative_bytes,
+                        config.execution.download_timeout_seconds,
                     )
                     analysis_content_type = "application/pdf"
                     derivative_used = True
@@ -561,7 +567,7 @@ def process_document(
                         cu_client,
                         analysis_content,
                         analysis_content_type,
-                        max_pages=min(config.max_pdf_pages, limits.max_document_units),
+                        max_pages=admission.max_pages_per_source,
                         analyzer_id=config.content_understanding_analyzer_id,
                     )
                     if (
@@ -589,23 +595,20 @@ def process_document(
                         di_client,
                         content,
                         source_snapshot.mime_type,
-                        max_pages=min(config.max_pdf_pages, limits.max_document_units),
+                        max_pages=admission.max_pages_per_source,
                     )
                     native_segment_count = len(native_extraction.segments)
                     rendered_visuals = ()
                     if inventory.required:
                         rendered_pdf = connector.download_content_as_pdf_sync(
                             current_doc.item_id,
-                            limits.max_rendered_pdf_bytes,
-                            config.download_timeout_seconds,
+                            admission.max_rendered_derivative_bytes,
+                            config.execution.download_timeout_seconds,
                         )
                         rendered_visuals = extract_rendered_pdf_visuals(
                             di_client,
                             rendered_pdf,
-                            max_pdf_pages=min(
-                                config.max_pdf_pages,
-                                limits.max_document_units,
-                            ),
+                            max_pdf_pages=admission.max_pages_per_source,
                             openai_client=openai_client,
                             vision_config=vision_config,
                         )
@@ -628,12 +631,12 @@ def process_document(
                 native_segment_count = len(extraction.segments)
             if (
                 extraction.visual_coverage.described_count
-                > limits.max_visual_descriptions
+                > admission.max_visual_assets_per_source
             ):
                 raise TerminalDocumentError("visual_description_limit_exceeded")
             if source_format not in {".md", ".pdf"} and sum(
                 len(segment.text) for segment in extraction.segments
-            ) > limits.max_office_characters:
+            ) > admission.max_office_characters:
                 raise TerminalDocumentError("office_character_limit_exceeded")
             pages = _pages_from_extraction(extraction)
             if sum(len(page.text) for page in pages) < MIN_TEXT_CHARACTERS:
@@ -666,11 +669,16 @@ def process_document(
                     "unsupportedReasons": unsupported_reasons,
                     "latency_ms": int((time.perf_counter() - extraction_start) * 1000),
                     "documentId": current_doc.document_id, "sourceName": current_doc.source_name,
-                })
+                }, business_name=current_doc.business_name)
         else:
             raise TerminalDocumentError("extraction_disabled_no_alternative")
 
-        chunks = chunk_pages(pages)
+        chunks = chunk_pages(
+            pages,
+            max_chunks_per_source=config.admission.max_chunks_per_source,
+            max_tokens=config.chunk_max_tokens,
+            overlap_tokens=config.chunk_overlap_tokens,
+        )
 
         if config.enrichment_enabled and language_client is not None:
             enrichment_start = time.perf_counter()
@@ -688,7 +696,7 @@ def process_document(
                     "entities": "succeeded" if any(s.entities.value == "succeeded" for s in statuses) else "failed",
                     "summary": "succeeded" if config.summary_enabled and any(s.summary.value == "succeeded" for s in statuses) else "not_requested",
                     "latency_ms": int((time.perf_counter() - enrichment_start) * 1000),
-                })
+                }, business_name=current_doc.business_name)
         else:
             enrichments = enrich_chunks(None, [chunk.content for chunk in chunks])
 
@@ -699,10 +707,12 @@ def process_document(
 
         embeddings = embed_texts(
             openai_client, searchable_texts,
+            deployment=config.embedding_deployment,
             audit_container=audit_container,
             source_id=config.source_id,
             run_id=current_doc.source_run_id,
-            batch_size=config.embedding_batch_size,
+            business_name=current_doc.business_name,
+            batch_size=config.execution.embedding_batch_size,
         )
 
         now = _fmt(_utc_now())
@@ -734,7 +744,7 @@ def process_document(
         )
         final_acl = connector.read_verified_acl(
             current_doc.item_id,
-            config.acl_max_pages,
+            config.execution.acl_max_pages,
         )
         if final_acl != acl:
             raise TerminalDocumentError("source_acl_changed_during_processing")
@@ -745,7 +755,7 @@ def process_document(
             )
             final_image_acl = connector.read_verified_acl(
                 authorized_image.image.item_id,
-                config.acl_max_pages,
+                config.execution.acl_max_pages,
             )
             if final_image_acl != authorized_image.acl:
                 raise TerminalDocumentError(
@@ -762,6 +772,8 @@ def process_document(
             stage=DocumentStage.VERIFYING,
             allowed_group_ids=acl.allowed_group_ids,
             acl_hash=acl.acl_hash,
+            acl_status=acl.acl_status,
+            acl_feedback=acl.acl_feedback,
             acl_evaluated_at=_fmt(_utc_now()),
             expected_chunk_count=len(chunk_records),
             written_chunk_count=written,
@@ -789,7 +801,13 @@ def process_document(
 
     except TerminalDocumentError as error:
         _fail_document(current_doc, current_etag, error, repository)
-        return ActivityOutcome(document_id=document.document_id, status=ActivityStatus.FAILED, chunks_written=0, retry_count=document.attempt_count, error=SafeError(str(error), current_doc.stage.value, False))
+        return ActivityOutcome(
+            document_id=document.document_id,
+            status=ActivityStatus.QUARANTINED,
+            chunks_written=0,
+            retry_count=document.attempt_count,
+            error=SafeError(str(error), current_doc.stage.value, False),
+        )
     except RepositoryConflictError:
         return ActivityOutcome(document_id=document.document_id, status=ActivityStatus.SKIPPED, chunks_written=0, retry_count=document.attempt_count)
     except Exception as error:
@@ -822,7 +840,13 @@ def _finalize_audio_document(
     audit_container: Any | None,
 ) -> int:
     """Chunk, enrich, embed, persist, admit, and mark ready a transcribed audio document."""
-    chunks = chunk_audio_segments(segments, audio)
+    chunks = chunk_audio_segments(
+        segments,
+        audio,
+        max_chunks_per_source=config.admission.max_chunks_per_source,
+        max_tokens=config.chunk_max_tokens,
+        overlap_tokens=config.chunk_overlap_tokens,
+    )
     if config.enrichment_enabled and language_client is not None:
         enrichments = enrich_chunks(
             language_client, [chunk.content for chunk in chunks],
@@ -838,10 +862,12 @@ def _finalize_audio_document(
     ]
     embeddings = embed_texts(
         openai_client, searchable_texts,
+        deployment=config.embedding_deployment,
         audit_container=audit_container,
         source_id=config.source_id,
         run_id=current_doc.source_run_id,
-        batch_size=config.embedding_batch_size,
+        business_name=current_doc.business_name,
+        batch_size=config.execution.embedding_batch_size,
     )
     now = _fmt(_utc_now())
     chunk_records = _build_chunk_records(
@@ -858,12 +884,15 @@ def _finalize_audio_document(
     current_doc, current_etag = updated.record, updated.etag
     written = repository.write_chunks(chunk_records)
     _read_and_validate_source_snapshot(connector, current_doc, expected_snapshot=source_snapshot)
-    final_acl = connector.read_verified_acl(current_doc.item_id, config.acl_max_pages)
+    final_acl = connector.read_verified_acl(
+        current_doc.item_id, config.execution.acl_max_pages
+    )
     if final_acl != acl:
         raise TerminalDocumentError("source_acl_changed_during_processing")
     admitting_doc = replace(
         current_doc, status=DocumentStatus.ADMITTING, stage=DocumentStage.VERIFYING,
         allowed_group_ids=acl.allowed_group_ids, acl_hash=acl.acl_hash,
+        acl_status=acl.acl_status, acl_feedback=acl.acl_feedback,
         acl_evaluated_at=_fmt(_utc_now()), expected_chunk_count=len(chunk_records),
         written_chunk_count=written, source_verified_at=_fmt(_utc_now()),
         updated_at=_fmt(_utc_now()),
@@ -913,7 +942,7 @@ def finalize_audio_transcription(
     try:
         job = get_transcription(
             transcription_url=job_url, token_provider=speech_token_provider,
-            timeout_seconds=config.speech_request_timeout_seconds,
+            timeout_seconds=config.execution.speech_request_timeout_seconds,
         )
     except TimeoutError:
         return "pending"
@@ -928,9 +957,12 @@ def finalize_audio_transcription(
                 source_version=current_doc.e_tag,
                 source_content_hash=current_doc.content_hash or "",
                 max_response_bytes=config.audio_max_response_bytes,
-                max_phrases=config.audio_max_phrases, max_words=config.audio_max_words,
+                max_phrases=config.admission.max_audio_phrases_per_source,
+                max_words=config.admission.max_audio_words_per_source,
             )
-            acl = connector.read_verified_acl(current_doc.item_id, config.acl_max_pages)
+            acl = connector.read_verified_acl(
+                current_doc.item_id, config.execution.acl_max_pages
+            )
             source_snapshot = _read_and_validate_source_snapshot(connector, current_doc)
             _finalize_audio_document(
                 config, current_doc, current_etag, audio, segments, acl, source_snapshot,
@@ -968,7 +1000,7 @@ def _download_batch_transcript(config: IngestionConfig, job: Any, token_provider
         raise TerminalDocumentError("audio_batch_files_link_missing")
     files = list_transcription_files(
         files_url=job.files_url, token_provider=token_provider,
-        timeout_seconds=config.speech_request_timeout_seconds,
+        timeout_seconds=config.execution.speech_request_timeout_seconds,
     )
     transcript = next((entry for entry in files if entry.kind == "Transcription"), None)
     if transcript is None:
@@ -976,7 +1008,7 @@ def _download_batch_transcript(config: IngestionConfig, job: Any, token_provider
     return download_transcription_result(
         content_url=transcript.content_url,
         max_response_bytes=config.audio_max_response_bytes,
-        timeout_seconds=config.speech_request_timeout_seconds,
+        timeout_seconds=config.execution.speech_request_timeout_seconds,
     )
 
 
@@ -988,7 +1020,7 @@ def _cleanup_batch_job(
     try:
         delete_transcription(
             transcription_url=job_url, token_provider=token_provider,
-            timeout_seconds=config.speech_request_timeout_seconds,
+            timeout_seconds=config.execution.speech_request_timeout_seconds,
         )
     except Exception:
         logger.warning("failed to delete batch transcription job", exc_info=True)
@@ -1082,6 +1114,7 @@ class DeltaSyncOutcome:
     created_or_updated: int = 0
     deleted: int = 0
     acl_resynced: int = 0
+    quarantined: int = 0
     failed: int = 0
     pending: int = 0
     items_seen: int = 0
@@ -1165,28 +1198,70 @@ def run_delta_sync(
         work_registry.delta_page_capture(source_plan, owner_instance_id, delta_execution_id)
         if work_registry is not None else None
     )
+    if processing_phase not in {"enumerating", "items", "baseline", "acl"}:
+        raise ValueError("delta_processing_phase_invalid")
+    resume_state = None
+    if page_capture is not None:
+        resume_reader = getattr(page_capture, "resume_state", None)
+        if callable(resume_reader):
+            resume_state = resume_reader()
+            resume_url = (
+                resume_state.get("requestUrl")
+                if resume_state.get("deltaLink")
+                else resume_state.get("nextLink") or resume_state.get("roundStartUrl")
+            )
+            if (
+                processing_phase == "enumerating"
+                and phase_continuation_token is not None
+                and phase_continuation_token != resume_url
+            ):
+                raise RepositoryConflictError("delta_round_resume_token_mismatch")
+            if isinstance(resume_url, str) and resume_url:
+                request_cursor = resume_url
     try:
-        if page_capture is None:
-            delta = connector.read_drive_delta(config.delta_max_pages, delta_link=request_cursor)
-        else:
-            delta = connector.read_drive_delta(
-                config.delta_max_pages, delta_link=request_cursor, page_capture=page_capture,
-            )
-    except DeltaResetRequired as reset:
-        logger.warning("delta_cursor_invalidated, following explicit reset location")
-        if page_capture is None:
-            delta = connector.read_drive_delta(
-                config.delta_max_pages,
-                delta_link=reset.location,
-            )
-        else:
-            delta = connector.read_drive_delta(
-                config.delta_max_pages,
-                delta_link=reset.location,
-                page_capture=page_capture,
-            )
+        try:
+            if page_capture is None:
+                delta = connector.read_drive_delta(
+                    config.execution.delta_max_pages, delta_link=request_cursor,
+                )
+            else:
+                delta = connector.read_drive_delta(
+                    config.execution.delta_max_pages,
+                    delta_link=request_cursor,
+                    page_capture=page_capture,
+                )
+        except DeltaResetRequired as reset:
+            logger.warning("delta_cursor_invalidated, following explicit reset location")
+            if page_capture is None:
+                delta = connector.read_drive_delta(
+                    config.execution.delta_max_pages,
+                    delta_link=reset.location,
+                )
+            else:
+                delta = connector.read_drive_delta(
+                    config.execution.delta_max_pages,
+                    delta_link=reset.location,
+                    page_capture=page_capture,
+                )
+            delta = replace(delta, is_full_baseline=True)
+    except GraphPageLimitExceeded as limit:
+        if page_capture is None or not limit.next_link:
+            raise
+        accepted = page_capture.resume_state()
+        if accepted.get("nextLink") != limit.next_link:
+            raise RepositoryConflictError("delta_round_resume_token_mismatch")
+        return DeltaSyncOutcome(
+            bootstrapped=accepted.get("roundStartKind") in {"initial", "reset"},
+            items_seen=page_capture.count_observed_entries(),
+            continuation_token=limit.next_link,
+            continuation_phase="enumerating",
+        )
+    if resume_state is not None and resume_state.get("roundStartKind") in {"initial", "reset"}:
         delta = replace(delta, is_full_baseline=True)
-    if page_capture is not None and processing_phase == "items" and not enumerate_only:
+    if processing_phase == "enumerating":
+        processing_phase = "items"
+        phase_continuation_token = None
+    if page_capture is not None and processing_phase in {"items", "enumerating"} and not enumerate_only:
         reduced_page = page_capture.list_reduced_items_page(
             page_size=reduced_items_page_size,
             continuation_token=reduced_items_continuation_token,
@@ -1197,8 +1272,6 @@ def run_delta_sync(
         delta = replace(delta, items=[])
     else:
         reduced_items_continuation_token = None
-    if processing_phase not in {"items", "baseline", "acl"}:
-        raise ValueError("delta_processing_phase_invalid")
     if enumerate_only:
         if work_registry is None or page_capture is None or not delta.delta_link:
             raise RepositoryConflictError("full_sync_baseline_capture_required")
@@ -1208,6 +1281,7 @@ def run_delta_sync(
             "created_or_updated": 0,
             "deleted": 0,
             "acl_resynced": 0,
+            "quarantined": 0,
             "failed": 0,
             "pending": 0,
             "items_seen": observed_entries,
@@ -1234,6 +1308,7 @@ def run_delta_sync(
     created_or_updated = 0
     deleted = 0
     acl_resynced = 0
+    quarantined = 0
     failed = 0
     pending = 0
     delta_source_run_id = create_source_run_id(config.source_id, run_id)
@@ -1335,7 +1410,7 @@ def run_delta_sync(
                         write_audit_record(audit_container, config.source_id, run_id, {
                             "operation": "document_deleted", "documentId": document_id,
                             "reason": "deleted", "method": "delta_sync",
-                        })
+                        }, business_name=config.business_name)
                 if cleanup_ok:
                     settle_delta_item(
                         claim, document_id, "completed",
@@ -1394,7 +1469,7 @@ def run_delta_sync(
                         "operation": "acl_resynced", "documentId": document_id,
                         "result": result, "method": "delta_sync",
                         "previousGroupIds": old_groups,
-                    })
+                    }, business_name=config.business_name)
             except Exception:
                 logger.error("delta_sync acl_resync failed for item %s", item_id, exc_info=True)
                 failed += 1
@@ -1588,6 +1663,8 @@ def run_delta_sync(
                     prior = claim.get("outcome") or {}
                     if prior.get("status") == "succeeded":
                         created_or_updated += 1
+                    elif prior.get("status") == "quarantined":
+                        quarantined += 1
                     elif prior.get("status") == "pending":
                         pending += 1
                     else:
@@ -1609,6 +1686,8 @@ def run_delta_sync(
                     prior = started.get("outcome") or {}
                     if prior.get("status") == "succeeded":
                         created_or_updated += 1
+                    elif prior.get("status") == "quarantined":
+                        quarantined += 1
                     elif prior.get("status") == "pending":
                         pending += 1
                     else:
@@ -1638,6 +1717,140 @@ def run_delta_sync(
                     outcome={"documentId": document.document_id, "status": "pending"},
                 )
                 pending += 1
+                continue
+            if outcome.status is ActivityStatus.QUARANTINED:
+                try:
+                    if outcome.error is None:
+                        raise RepositoryConflictError(
+                            "terminal_quarantine_error_missing"
+                        )
+                    quarantine_error = outcome.error
+                    failed_replacement = repository.get_document(
+                        document.source_run_id,
+                        document.document_id,
+                    )
+                    if (
+                        failed_replacement is None
+                        or failed_replacement.record.status is not DocumentStatus.FAILED
+                        or failed_replacement.record.stage is not DocumentStage.TERMINAL
+                        or failed_replacement.record.error is None
+                        or failed_replacement.record.error.retryable
+                        or failed_replacement.record.source_id != config.source_id
+                        or failed_replacement.record.drive_id != config.drive_id
+                        or failed_replacement.record.item_id != item_id
+                    ):
+                        raise RepositoryConflictError(
+                            "terminal_quarantine_record_unverified"
+                        )
+                    retired_versions = 0
+                    for previous in _iter_ready_document_versions(
+                        lifecycle_repository,
+                        config.source_id,
+                        document_id,
+                    ):
+                        if (
+                            previous.source_id != config.source_id
+                            or previous.drive_id != config.drive_id
+                            or previous.item_id != item_id
+                            or _document_version_has_unsettled_mutation(previous)
+                        ):
+                            raise RepositoryConflictError(
+                                "terminal_quarantine_previous_identity_invalid"
+                            )
+                        winner = (
+                            work_registry.get_document_winner(
+                                config.source_id,
+                                previous.document_id,
+                            )
+                            if work_registry is not None
+                            else None
+                        )
+                        winner_matches_previous = (
+                            winner is not None
+                            and winner.get("sourceRunId") == previous.source_run_id
+                            and winner.get("documentKey") == previous.document_key
+                        )
+                        winner_cleared = _clear_winner_if_points_to(
+                            work_registry,
+                            config.source_id,
+                            owner_instance_id,
+                            previous.document_id,
+                            previous.source_run_id,
+                            previous.document_key,
+                        )
+                        if winner_matches_previous and not winner_cleared:
+                            raise RepositoryConflictError(
+                                "terminal_quarantine_winner_clear_failed"
+                            )
+                        lifecycle_repository.retire_document(
+                            source_run_id=previous.source_run_id,
+                            document_id=previous.document_id,
+                            document_key=previous.document_key,
+                            etag=previous.etag,
+                            reason="replacement_failed",
+                        )
+                        retired_versions += 1
+                    if audit_container is not None:
+                        write_audit_record(
+                            audit_container,
+                            config.source_id,
+                            run_id,
+                            {
+                                "operation": "document_quarantined",
+                                "documentId": document_id,
+                                "sourceName": document.source_name,
+                                "sourceUrl": document.source_url,
+                                "method": "delta_sync",
+                                "errorCode": quarantine_error.code,
+                                "retiredPreviousVersions": retired_versions,
+                            },
+                            business_name=config.business_name,
+                        )
+                    if work_registry is not None:
+                        work_registry.settle_document_operation(
+                            config.source_id,
+                            owner_instance_id,
+                            operation_id,
+                            physical_run_id=document.source_run_id,
+                            item_id=document.document_id,
+                            operation_kind="delta-sync",
+                            status="quarantined",
+                            outcome={
+                                "documentId": document.document_id,
+                                "status": "quarantined",
+                                "error": quarantine_error.code,
+                                "retiredPreviousVersions": retired_versions,
+                            },
+                        )
+                    quarantined += 1
+                except Exception:
+                    logger.exception(
+                        "delta_sync terminal quarantine failed for item %s",
+                        item_id,
+                    )
+                    if work_registry is not None:
+                        try:
+                            work_registry.settle_document_operation(
+                                config.source_id,
+                                owner_instance_id,
+                                operation_id,
+                                physical_run_id=document.source_run_id,
+                                item_id=document.document_id,
+                                operation_kind="delta-sync",
+                                status="failed",
+                                outcome={
+                                    "documentId": document.document_id,
+                                    "status": "failed",
+                                    "error": "terminal_quarantine_settlement_failed",
+                                },
+                            )
+                        except Exception:
+                            logger.exception(
+                                "delta_sync failed to settle quarantine failure "
+                                "for item %s",
+                                item_id,
+                            )
+                    failed += 1
                 continue
             if work_registry is not None and outcome.status is not ActivityStatus.SUCCEEDED:
                 work_registry.settle_document_operation(
@@ -1689,7 +1902,7 @@ def run_delta_sync(
                 "sourceName": document.source_name, "sourceUrl": document.source_url,
                 "method": "delta_sync", "action": "updated" if prev_ref else "created",
                 "chunks": outcome.chunks_written,
-            })
+            }, business_name=config.business_name)
         try:
             cleanup_failed = False
             versions = _iter_ready_document_versions(
@@ -1715,7 +1928,7 @@ def run_delta_sync(
                         "replacedDocumentKey": previous.document_key,
                         "newDocumentKey": document.document_key,
                         "sourceName": document.source_name,
-                    })
+                    }, business_name=config.business_name)
         except LifecycleConflictError:
             failed += 1
             cleanup_failed = True
@@ -1744,6 +1957,7 @@ def run_delta_sync(
             created_or_updated=created_or_updated,
             deleted=deleted,
             acl_resynced=acl_resynced,
+            quarantined=quarantined,
             failed=failed,
             pending=pending,
             items_seen=observed_entries,
@@ -1930,6 +2144,7 @@ def run_delta_sync(
                     created_or_updated=created_or_updated,
                     deleted=deleted,
                     acl_resynced=acl_resynced,
+                    quarantined=quarantined,
                     failed=failed,
                     pending=pending,
                     items_seen=observed_entries,
@@ -1963,6 +2178,7 @@ def run_delta_sync(
                     created_or_updated=created_or_updated,
                     deleted=deleted,
                     acl_resynced=acl_resynced,
+                    quarantined=quarantined,
                     failed=failed,
                     pending=pending,
                     items_seen=observed_entries,
@@ -1981,6 +2197,7 @@ def run_delta_sync(
         created_or_updated=created_or_updated,
         deleted=deleted,
         acl_resynced=acl_resynced,
+        quarantined=quarantined,
         failed=failed,
         pending=pending,
         items_seen=observed_entries,
@@ -1997,6 +2214,7 @@ def run_delta_sync(
                     "created_or_updated": outcome.created_or_updated,
                     "deleted": outcome.deleted,
                     "acl_resynced": outcome.acl_resynced,
+                    "quarantined": outcome.quarantined,
                     "failed": outcome.failed,
                     "pending": outcome.pending,
                     "items_seen": outcome.items_seen,
@@ -2342,6 +2560,7 @@ def run_source_retirement_page(
     page_size: int,
     work_registry: Any,
     owner_instance_id: str,
+    business_name: str | None = None,
 ) -> int:
     """Delete a bounded source page using the existing document-deletion and audit path."""
     page = lifecycle_repository.list_source_documents_for_deletion_page(
@@ -2366,13 +2585,15 @@ def run_source_retirement_page(
             "documentKey": ref.document_key,
             "reason": "source_retired",
             "method": "source_retirement",
-        })
+        }, business_name=business_name)
     return len(page.items)
 
 
 def run_lifecycle_reconciliation_page(
+    config: IngestionConfig,
     repository: IngestionRepository,
     lifecycle_repository: DocumentLifecycleRepository,
+    connector_provider: Callable[[], SourceConnector],
     *,
     source_id: str,
     page_size: int,
@@ -2405,7 +2626,13 @@ def run_lifecycle_reconciliation_page(
             failed += 1
             continue
         try:
-            _reconcile_lifecycle_document(repository, lifecycle_repository, ref)
+            _reconcile_lifecycle_document(
+                config,
+                repository,
+                lifecycle_repository,
+                connector_provider,
+                ref,
+            )
             if ref.status in {DocumentStatus.RETIRING, DocumentStatus.DELETING}:
                 _clear_winner_if_points_to(
                     work_registry,
@@ -2729,8 +2956,10 @@ def run_orphan_chunk_reconciliation_page(
 
 
 def _reconcile_lifecycle_document(
+    config: IngestionConfig,
     repository: IngestionRepository,
     lifecycle_repository: DocumentLifecycleRepository,
+    connector_provider: Callable[[], SourceConnector],
     ref: LifecycleDocumentRef,
 ) -> None:
     if ref.status is DocumentStatus.ADMITTING:
@@ -2759,15 +2988,40 @@ def _reconcile_lifecycle_document(
         )
         return
     if ref.status is DocumentStatus.ACL_REFRESHING:
-        if ref.pending_allowed_group_ids is None or not ref.pending_acl_hash:
+        if (
+            ref.pending_allowed_group_ids is None
+            or not ref.pending_acl_hash
+            or ref.pending_acl_status is None
+            or ref.pending_acl_feedback is None
+        ):
             raise RepositoryConflictError("ACL refresh intent is incomplete")
-        lifecycle_repository.refresh_document_acl(
-            source_run_id=ref.source_run_id,
-            document_id=ref.document_id,
-            document_key=ref.document_key,
-            etag=ref.etag,
-            allowed_group_ids=ref.pending_allowed_group_ids,
-            acl_hash=ref.pending_acl_hash,
+        stored = repository.get_document(ref.source_run_id, ref.document_id)
+        if (
+            stored is None
+            or stored.etag != ref.etag
+            or stored.record.status is not DocumentStatus.ACL_REFRESHING
+        ):
+            raise RepositoryConflictError(
+                "ACL-refreshing document changed during reconciliation"
+            )
+        resync_document_acl(
+            config,
+            ReadyDocumentRef(
+                document_id=ref.document_id,
+                source_run_id=ref.source_run_id,
+                document_key=ref.document_key,
+                item_id=stored.record.item_id,
+                allowed_group_ids=ref.allowed_group_ids,
+                acl_hash=ref.acl_hash,
+                etag=stored.etag,
+                acl_status=stored.record.acl_status,
+                acl_feedback=stored.record.acl_feedback,
+                source_etag=stored.record.e_tag,
+                lifecycle_generation=ref.lifecycle_generation,
+                status=ref.status,
+            ),
+            lifecycle_repository,
+            connector_provider(),
         )
         return
     if ref.status is DocumentStatus.RETIRING:
@@ -2801,7 +3055,9 @@ def resync_document_acl(
 ) -> str:
     """Re-verify one ACL-eligible document. Returns unchanged, updated, or retired."""
     try:
-        acl = connector.read_verified_acl(ref.item_id, config.acl_max_pages)
+        acl = connector.read_verified_acl(
+            ref.item_id, config.execution.acl_max_pages
+        )
     except TerminalDocumentError:
         if ref.status is DocumentStatus.RETIRED:
             return "unchanged"
@@ -2822,11 +3078,27 @@ def resync_document_acl(
                     "retiredReason": "acl_revoked",
                     "sourceName": getattr(ref, "source_name", ""),
                     "sourceUrl": getattr(ref, "source_url", ""),
-                })
+                }, business_name=config.business_name)
         return "retired"
 
-    if acl.acl_hash == ref.acl_hash and ref.status is DocumentStatus.READY:
-        return "unchanged"
+    authorization_unchanged = (
+        acl.acl_hash == ref.acl_hash
+        and acl.allowed_group_ids == ref.allowed_group_ids
+    )
+    if authorization_unchanged and ref.status is DocumentStatus.READY:
+        if (
+            acl.acl_status is ref.acl_status
+            and acl.acl_feedback == ref.acl_feedback
+        ):
+            return "unchanged"
+        lifecycle_repository.update_document_acl_feedback(
+            source_run_id=ref.source_run_id,
+            document_id=ref.document_id,
+            etag=ref.etag,
+            acl_status=acl.acl_status,
+            acl_feedback=acl.acl_feedback,
+        )
+        return "updated"
     if ref.status is DocumentStatus.RETIRED:
         source_item = connector.read_item(ref.item_id)
         source_etag = source_item.get("eTag") if source_item is not None else None
@@ -2847,6 +3119,8 @@ def resync_document_acl(
             etag=ref.etag,
             allowed_group_ids=acl.allowed_group_ids,
             acl_hash=acl.acl_hash,
+            acl_status=acl.acl_status,
+            acl_feedback=acl.acl_feedback,
         )
     except LifecycleConflictError:
         raise
@@ -3011,6 +3285,7 @@ def _source_to_document(source: Any, config: IngestionConfig, run_id: str, inges
         source_modified_at=getattr(source, "last_modified_date_time", None),
         ingestion_mode=ingestion_mode,
         processing_profile_digest=_processing_profile_digest(config),
+        business_name=config.business_name,
         id=document_id, document_id=document_id,
         source_run_id=create_source_run_id(config.source_id, run_id),
         document_key=create_document_key(config.source_id, run_id, document_id),
@@ -3018,16 +3293,71 @@ def _source_to_document(source: Any, config: IngestionConfig, run_id: str, inges
 
 
 def _processing_profile_digest(config: IngestionConfig) -> str:
+    extraction_provider = config.extraction_provider
     payload = {
         "profileVersion": 1,
-        "settings": vars(config),
+        "extraction": {
+            "enabled": config.extraction_enabled,
+            "provider": (
+                extraction_provider.value
+                if extraction_provider is not None
+                else None
+            ),
+            "contentUnderstandingAnalyzerId": (
+                config.content_understanding_analyzer_id
+                if extraction_provider is ExtractionProvider.CONTENT_UNDERSTANDING
+                else None
+            ),
+        },
+        "chunking": {
+            "maxTokens": config.chunk_max_tokens,
+            "overlapTokens": config.chunk_overlap_tokens,
+        },
+        "enrichment": {
+            "enabled": config.enrichment_enabled,
+            "summaryEnabled": config.summary_enabled,
+            "keyPhrasesEnabled": config.key_phrases_enabled,
+            "entitiesEnabled": config.entities_enabled,
+        },
+        "embedding": {
+            "deployment": config.embedding_deployment,
+        },
+        "vision": {
+            "deployment": config.vision_deployment,
+            "maxOutputTokens": config.vision_max_output_tokens,
+        },
+        "audio": {
+            "enabled": config.audio_writer_enabled,
+            "provider": config.audio_transcription_provider,
+            "locale": config.audio_locale,
+        },
+        "processingAdmission": {
+            "maxRenderedDerivativeBytes": (
+                config.admission.max_rendered_derivative_bytes
+            ),
+            "maxPagesPerSource": config.admission.max_pages_per_source,
+            "maxContentUnitsPerSource": (
+                config.admission.max_content_units_per_source
+            ),
+            "maxOfficeCharacters": config.admission.max_office_characters,
+            "maxVisualAssetBytes": config.admission.max_visual_asset_bytes,
+            "maxVisualAssetsPerSource": (
+                config.admission.max_visual_assets_per_source
+            ),
+            "maxAudioPhrasesPerSource": (
+                config.admission.max_audio_phrases_per_source
+            ),
+            "maxAudioWordsPerSource": (
+                config.admission.max_audio_words_per_source
+            ),
+            "maxChunksPerSource": config.admission.max_chunks_per_source,
+        },
     }
     encoded = json.dumps(
         payload,
         ensure_ascii=True,
         sort_keys=True,
         separators=(",", ":"),
-        default=str,
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 

@@ -47,6 +47,7 @@ def _call(route_name: str, request: func.HttpRequest, client: Any) -> func.HttpR
 ROUTES = [
     ("start_full_sync", "POST", "ingestion/full-sync", {}),
     ("start_source_full_sync", "POST", "ingestion/sources/full-sync", {}),
+    ("preflight_source", "POST", "ingestion/sources/preflight", {}),
     ("get_status", "GET", "ingestion/status", {}),
     ("retry_failed", "POST", "ingestion/retry-failed", {}),
     ("inspect_data", "GET", "ingestion/inspect", {"container": "invalid"}),

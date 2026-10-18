@@ -59,7 +59,8 @@ application image.
 
 ## Required Post-Deployment Gates
 
-- Verify Function and ACA health, revision, traffic, image digest, catalog ETag/digest, and `ACL_ENABLED`.
+- Verify Function and ACA health, revision, traffic, image digest, catalog
+  ETag/digest, and each tested source's accepted `retrievalAclEnabled` value.
 - Prove private Entra-authenticated Data Explorer read/edit with keys disabled, effective editor/writer/reader denials, and separately approved removal of obsolete broad grants.
 - Prove valid-edit adoption, rejected-edit last-known-good behavior, recovery and restart behavior across a stable ready replica cohort, with target telemetry and Cosmos actor/request correlation.
 - Run authenticated and unauthenticated gateway tests.
@@ -81,7 +82,7 @@ application image.
 | --- | --- | --- |
 | Function client allowlist | Required in Bicep | Verify exact approved caller before release |
 | Per-user admin authorization | Not enforced on destructive Function endpoints | Production release requires risk acceptance or implementation of app-role checks |
-| Lifecycle webhook | Excluded from EasyAuth and does not validate `clientState` | Security gap requiring risk acceptance or remediation |
+| Lifecycle webhook | Excluded from EasyAuth; validates `clientState` and requires a persisted subscription match before source-state actions | Verify protected secret delivery and invalid-state rejection before release |
 | Retrieval gateway | ACA and application code restrict calls to Function UAMI | Verify app-role assignment externally because Bicep does not mutate Entra |
 | ACL model | Entra security groups only | Direct user shares are unsupported |
 | Permission-change metadata | Connector requests a Graph header documented with `Sites.FullControl.All`, which is absent from the approved prerequisite set | Resolve through separate security approval or an implementation change; do not grant as a diagnostic shortcut |

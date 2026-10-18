@@ -18,7 +18,11 @@ from retrieval.catalog import (
     RuntimeCatalogSnapshot,
     build_catalog_item,
 )
-from retrieval.config import load_retrieval_config, parse_catalog_poll_seconds
+from retrieval.config import (
+    load_retrieval_config,
+    parse_agent_max_iterations,
+    parse_catalog_poll_seconds,
+)
 from retrieval.runtime_catalog import RuntimeCatalogProvider
 from retrieval.telemetry import CATALOG_LOGGER_NAME, catalog_event_emitter
 
@@ -70,7 +74,7 @@ def test_export_failure_is_visible_without_blocking_refresh(caplog) -> None:
 
 def _snapshot(etag: str = "etag-a", operation: str = "operation-a") -> RuntimeCatalogSnapshot:
     return RuntimeCatalogSnapshot(
-        deployment_instance_id="test", catalog_id="runtime-catalog", etag=etag,
+        catalog_id="runtime-catalog", etag=etag,
         digest="sha256:" + "a" * 64, operation_id=operation,
         changed_at="2026-09-08T00:00:00Z", accepted_at=datetime(2026, 9, 8, tzinfo=timezone.utc),
         over_fetch_factor=3, hybrid_weights=(2, 1), full_text_score_scope="Global",
@@ -87,7 +91,6 @@ def _real_item(etag: str = "etag-real") -> dict:
             },
             "profiles": [], "synonymMaps": [],
         }},
-        "test",
     )
     item["_etag"] = etag
     return item
@@ -97,7 +100,7 @@ def test_start_succeeds_when_catalog_absent() -> None:
     async def exercise() -> None:
         container = Mock()
         container.read_item.side_effect = CosmosResourceNotFoundError(status_code=404, message="missing")
-        provider = RuntimeCatalogProvider(RuntimeCatalogLoader(container, "test"), 60)
+        provider = RuntimeCatalogProvider(RuntimeCatalogLoader(container), 60)
         try:
             await provider.start()
             assert provider.snapshot.etag == BASELINE_ETAG
@@ -116,7 +119,7 @@ def test_runtime_deletion_transitions_to_baseline() -> None:
             _real_item(),
             CosmosResourceNotFoundError(status_code=404, message="missing"),
         ]
-        provider = RuntimeCatalogProvider(RuntimeCatalogLoader(container, "test"), 60)
+        provider = RuntimeCatalogProvider(RuntimeCatalogLoader(container), 60)
         try:
             assert await provider.refresh()
             assert provider.snapshot.etag == "etag-real"
@@ -132,7 +135,7 @@ def test_baseline_is_stable_across_repeated_polls() -> None:
     async def exercise() -> None:
         container = Mock()
         container.read_item.side_effect = CosmosResourceNotFoundError(status_code=404, message="missing")
-        provider = RuntimeCatalogProvider(RuntimeCatalogLoader(container, "test"), 60)
+        provider = RuntimeCatalogProvider(RuntimeCatalogLoader(container), 60)
         try:
             assert await provider.refresh()
             first = provider.snapshot
@@ -152,7 +155,7 @@ def test_baseline_transitions_to_real_when_item_appears() -> None:
             CosmosResourceNotFoundError(status_code=404, message="missing"),
             _real_item(),
         ]
-        provider = RuntimeCatalogProvider(RuntimeCatalogLoader(container, "test"), 60)
+        provider = RuntimeCatalogProvider(RuntimeCatalogLoader(container), 60)
         try:
             assert await provider.refresh()
             assert provider.snapshot.etag == BASELINE_ETAG
@@ -210,7 +213,7 @@ def test_given_direct_config_edit_when_refreshed_then_adopted_without_new_operat
                 },
                 "profiles": [], "synonymMaps": [],
             }},
-            "test", operation_id="b14c1a67-9fc4-4e78-a818-e5951473d15b",
+            operation_id="b14c1a67-9fc4-4e78-a818-e5951473d15b",
             changed_at=now, reason="Synthetic direct edit",
         )
         if not with_writer_metadata:
@@ -218,7 +221,7 @@ def test_given_direct_config_edit_when_refreshed_then_adopted_without_new_operat
         item["_etag"] = "etag-a"
         container = Mock()
         container.read_item.return_value = item
-        provider = RuntimeCatalogProvider(RuntimeCatalogLoader(container, "test"), 60)
+        provider = RuntimeCatalogProvider(RuntimeCatalogLoader(container), 60)
         try:
             assert await provider.refresh()
             original = provider.snapshot
@@ -296,7 +299,7 @@ def test_given_interleaved_rejected_generations_when_retried_then_deduplicated_a
                 },
                 "profiles": [], "synonymMaps": [],
             }},
-            "test", operation_id="b14c1a67-9fc4-4e78-a818-e5951473d15b",
+            operation_id="b14c1a67-9fc4-4e78-a818-e5951473d15b",
             changed_at=now, reason="Synthetic rejection test",
         )
         item["_etag"] = "etag-a"
@@ -304,7 +307,7 @@ def test_given_interleaved_rejected_generations_when_retried_then_deduplicated_a
         container.read_item.return_value = item
         events = []
         provider = RuntimeCatalogProvider(
-            RuntimeCatalogLoader(container, "test"), 60,
+            RuntimeCatalogLoader(container), 60,
             emit=lambda *event: events.append(event), utcnow=lambda: now,
         )
         try:
@@ -452,22 +455,77 @@ def test_given_invalid_poll_setting_when_parsed_then_rejected(raw: str) -> None:
         parse_catalog_poll_seconds(raw)
 
 
+@pytest.mark.parametrize("raw,expected", [(None, 5), ("1", 1), ("5", 5), ("100", 100)])
+def test_given_valid_agent_iteration_setting_when_parsed_then_returned(
+    raw: str | None, expected: int,
+) -> None:
+    assert parse_agent_max_iterations(raw) == expected
+
+
+@pytest.mark.parametrize("raw", ["", " ", " 5", "5 ", "5.0", "+5", "1e2", "0", "-1", "nan"])
+def test_given_invalid_agent_iteration_setting_when_parsed_then_rejected(raw: str) -> None:
+    with pytest.raises(ValueError, match="AGENT_MAX_ITERATIONS"):
+        parse_agent_max_iterations(raw)
+
+
 def test_given_environment_when_loaded_then_no_digest_or_relevance_override_required(monkeypatch: pytest.MonkeyPatch) -> None:
     for name in (
         "COSMOS_ENDPOINT", "COSMOS_DATABASE", "AZURE_OPENAI_ENDPOINT", "CHAT_DEPLOYMENT", "TENANT_ID",
-        "MANAGED_IDENTITY_CLIENT_ID", "RETRIEVAL_API_AUDIENCE", "RETRIEVAL_GATEWAY_CLIENT_ID",
-        "RETRIEVAL_GATEWAY_PRINCIPAL_ID", "DEPLOYMENT_INSTANCE_ID",
+        "MANAGED_IDENTITY_CLIENT_ID", "RETRIEVAL_API_AUDIENCE",
     ):
         monkeypatch.setenv(name, "test")
     monkeypatch.delenv("RETRIEVAL_CATALOG_DIGEST", raising=False)
     monkeypatch.delenv("RETRIEVAL_CATALOG_POLL_SECONDS", raising=False)
     monkeypatch.setenv("RETRIEVAL_OVER_FETCH_FACTOR", "ignored")
     monkeypatch.setenv("RETRIEVAL_HYBRID_RRF_WEIGHTS", "ignored")
+    monkeypatch.setenv("ACL_ENABLED", "false")
+    monkeypatch.setenv("COSMOS_CHUNKS_CONTAINER", "legacy-chunks")
+    monkeypatch.setenv("COSMOS_MANIFESTS_CONTAINER", "legacy-manifests")
     config = load_retrieval_config()
     assert config.catalog_poll_seconds == 7200
     assert not hasattr(config, "catalog_digest")
+    assert not hasattr(config, "acl_enabled")
+    assert not hasattr(config, "cosmos_chunks_container")
+    assert not hasattr(config, "cosmos_manifests_container")
     monkeypatch.setenv("RETRIEVAL_CATALOG_POLL_SECONDS", "86400")
     assert load_retrieval_config().catalog_poll_seconds == 86400
+
+
+def test_agent_timeout_defaults_to_deployed_value_and_allows_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in (
+        "COSMOS_ENDPOINT",
+        "COSMOS_DATABASE",
+        "AZURE_OPENAI_ENDPOINT",
+        "CHAT_DEPLOYMENT",
+        "TENANT_ID",
+        "RETRIEVAL_API_AUDIENCE",
+    ):
+        monkeypatch.setenv(name, "test")
+    monkeypatch.delenv("AGENT_TIMEOUT_SECONDS", raising=False)
+
+    assert load_retrieval_config().agent_timeout_seconds == 20.0
+
+    monkeypatch.setenv("AGENT_TIMEOUT_SECONDS", "12.5")
+    assert load_retrieval_config().agent_timeout_seconds == 12.5
+
+
+def test_service_principal_config_does_not_require_managed_identity_client_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in (
+        "COSMOS_ENDPOINT",
+        "COSMOS_DATABASE",
+        "AZURE_OPENAI_ENDPOINT",
+        "CHAT_DEPLOYMENT",
+        "TENANT_ID",
+        "RETRIEVAL_API_AUDIENCE",
+    ):
+        monkeypatch.setenv(name, "test")
+    monkeypatch.delenv("MANAGED_IDENTITY_CLIENT_ID", raising=False)
+
+    assert load_retrieval_config().managed_identity_client_id == ""
 
 
 def test_given_read_duration_when_polling_then_start_to_start_interval(monkeypatch: pytest.MonkeyPatch) -> None:

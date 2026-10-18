@@ -30,7 +30,7 @@ def _mock_agent_framework(monkeypatch):
 def test_agent_has_correct_name(_mock_agent_framework):
     from retrieval.agent import create_rag_agent
 
-    agent = create_rag_agent(MagicMock(), lambda q: "result")
+    create_rag_agent(MagicMock(), lambda q: "result")
     # Agent() was called once
     _mock_agent_framework.assert_called_once()
     call_kwargs = _mock_agent_framework.call_args[1]
@@ -112,6 +112,51 @@ def _sdk_message(text: str) -> dict:
         "status": "completed",
         "content": [{"type": "output_text", "text": text, "annotations": []}],
     }
+
+
+@pytest.mark.asyncio
+async def test_configured_max_iterations_bounds_tool_roundtrips(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import retrieval.agent as agent_module
+
+    requests: list[dict] = []
+    tool_calls: list[str] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        requests.append(payload)
+        if payload.get("tool_choice") == "none":
+            return httpx.Response(200, json=_sdk_response([_sdk_message("Bounded answer")]))
+        index = len(requests)
+        return httpx.Response(200, json=_sdk_response([{
+            "id": f"tool-{index}",
+            "type": "function_call",
+            "call_id": f"call-{index}",
+            "name": "search_knowledge_base",
+            "arguments": '{"query":"synthetic"}',
+            "status": "completed",
+        }]))
+
+    async def search_knowledge_base(query: str) -> str:
+        tool_calls.append(query)
+        return "Synthetic evidence"
+
+    monkeypatch.setattr(agent_module, "Agent", Agent)
+    async with AsyncOpenAI(
+        api_key="synthetic-test-key",
+        base_url="https://sdk-test.invalid/v1",
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(respond)),
+    ) as sdk:
+        client = OpenAIChatClient(model="synthetic-model", async_client=sdk)
+        client.function_invocation_configuration["max_iterations"] = 1
+        agent = agent_module.create_rag_agent(client, search_knowledge_base)
+        response = await agent.run("Synthetic question")
+
+    assert str(response) == "Bounded answer"
+    assert tool_calls == ["synthetic"]
+    assert len(requests) == 2
+    assert requests[1]["tool_choice"] == "none"
 
 
 @pytest.mark.asyncio

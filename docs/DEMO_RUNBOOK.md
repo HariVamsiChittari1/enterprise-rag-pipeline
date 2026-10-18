@@ -1,6 +1,6 @@
 # Enterprise RAG Pipeline Demo and E2E Runbook
 
-This runbook validates the deployed Function gateway, ACA retrieval service, ingestion lifecycle, ACL trimming, scoring profiles, freshness, synonyms, telemetry, and cleanup. Use only an approved non-production test site and disposable fixtures.
+This runbook validates the ingestion Function, direct delegated-user ACA retrieval service, ingestion lifecycle, ACL trimming, scoring profiles, freshness, synonyms, telemetry, and cleanup. Use only an approved non-production test site and disposable fixtures.
 
 ## Current validated development demo (2026-10-09)
 
@@ -44,7 +44,7 @@ Store generated rehearsal reports under `C:\DevEnvs\enterprise-rag-pipeline\repo
 ## Preconditions
 
 - The deployed Function, ACA revision, image digest, and current catalog ETag/digest are known.
-- The caller can obtain a delegated token for `FUNCTION_API_AUDIENCE` with `user_impersonation`.
+- The caller can obtain a delegated token for `RETRIEVAL_API_AUDIENCE` with `user_impersonation` through the approved public client.
 - Disposable SharePoint fixtures inherit the target site's permissions.
 - The image is immutable; coordinate catalog editors so the expected generation remains stable during each evidence window.
 
@@ -62,11 +62,11 @@ Never print the token or persist it in reports.
 
 Capture:
 
-- Function App name and gateway target.
+- Function App name for ingestion operations.
 - ACA latest ready revision and 100% traffic assignment.
 - Full `repository@sha256:<digest>` image reference.
 - `DEPLOYMENT_INSTANCE_ID` and the inspected current catalog ETag/digest.
-- `ACL_ENABLED=true`.
+- Each tested source's accepted `retrievalAclEnabled` value.
 
 Any relevant Function deployment, ACA revision/traffic, image, catalog, profile, synonym, or timeout change invalidates affected live evidence.
 
@@ -102,17 +102,12 @@ The inspect endpoint is capped at 200 rows. If an exact audit is absent from tha
 
 ## Retrieval Matrix
 
-Run the repository tool against the Function gateway:
-
-```powershell
-python tools/script_query_retrieval.py `
-  --function-app $funcApp `
-  --client-id $clientId `
-  --scenario-matrix `
-  --expected-catalog-sha 'sha256:<catalog-digest>' `
-  --expected-catalog-etag '<exact-cosmos-etag>' `
-  --report C:\DevEnvs\enterprise-rag-pipeline\reports\retrieval-scenario-matrix.json
-```
+Run the retrieval matrix directly against the ACA endpoint with real delegated
+users. The legacy `script_query_retrieval.py` Function-gateway interface does
+not prove the current direct ACA contract and must not be used for acceptance
+until its interface is migrated. Acquire tokens without printing them and call
+`https://<retrieval-fqdn>/api/query`; never supply
+`X-MS-CLIENT-PRINCIPAL` yourself.
 
 Required coverage:
 
@@ -137,15 +132,10 @@ and preserve protected generation-bound evidence after restoration.
 
 ## Scoring Profiles
 
-Use the existing `tools/script_query_retrieval.py` helper; no separate scoring demo script is required. For a quick interactive query, pass `--scoring-profile` without `--scenario-matrix`. When `--question` is omitted, the helper prompts for a question; press Enter to use the displayed verified default. It writes no report and prints the question, request parameters, answer, and citations; add `--json` only when the raw response is needed. For auditable evidence, use the matrix command below so the helper verifies path, mode, degradation, citations, selected profile, and catalog digest.
-
-```powershell
-python tools/script_query_retrieval.py `
-  --function-app $funcApp `
-  --client-id $clientId `
-  --mode hybrid `
-  --scoring-profile 'hr-relevance'
-```
+Send `scoring_profile` in the direct ACA query body. Preserve the query
+`request_id`, inspect the corresponding audit record through the approved
+operator path, and verify the effective profile and catalog generation. Do not
+use the legacy Function-gateway helper for current acceptance evidence.
 
 Run the matrix separately for each deployed profile:
 
@@ -156,7 +146,10 @@ Run the matrix separately for each deployed profile:
 | `hr-relevance-minimum` | `minimum` | none |
 | `hr-relevance-maximum` | `maximum` | none |
 
-For each run pass both `--scoring-profile` and `--expected-scoring-profile`. Require six passing scenarios, at least one citation per scenario, the exact catalog digest, and no degraded retrieval. HTTP 200 alone does not prove profile selection.
+For each run assert the requested and audited effective profile. Require six
+passing scenarios, at least one citation per scenario, the exact catalog
+digest, and no degraded retrieval. HTTP 200 alone does not prove profile
+selection.
 
 ## Freshness
 
@@ -235,8 +228,8 @@ Validate:
 - Authorized group membership returns evidence.
 - A denied principal returns no citations.
 - Public callers cannot call ACA directly; ACA Authentication accepts only the Function UAMI application/principal.
-- SharePoint notifications with an invalid `clientState` return 403.
-- The lifecycle webhook is excluded from EasyAuth and currently does not validate `clientState`; record this known gap rather than treating it as a passing security control.
+- SharePoint change and lifecycle notifications with an invalid `clientState` return 403.
+- Lifecycle notifications with valid `clientState` still require a persisted subscription match before any source-state action.
 
 ## Telemetry Checks
 

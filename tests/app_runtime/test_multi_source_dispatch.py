@@ -3,18 +3,20 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import SimpleNamespace
 from typing import Any
 
 import azure.functions as func
-import pytest
-
 import config as config_module
 import function_app
-from ingestion.source_registry import SourcePlan, SourceRegistryConflictError, SourceRegistryError
+import pytest
+from ingestion.source_registry import (
+    SourcePlan,
+    SourceRegistryConflictError,
+    SourceRegistryError,
+)
 from source_registry import SharePointSource, source_binding_digest
-
 
 TENANT_ID = "tenant-id"
 
@@ -30,6 +32,11 @@ def _plan(source_id: str, site_id: str, site_path: str, drive_id: str, state: st
         site_url=f"https://tenant.sharepoint.com/sites/{site_path}",
         drive_id=drive_id,
         desired_state=state,
+        content_scope="business",
+        chunks_container="business-a-search-chunks",
+        manifests_container="business-a-source-documents",
+        retrieval_acl_enabled=True,
+        business_name=f"Business {source_id}",
     )
     return SourcePlan(
         source,
@@ -46,7 +53,7 @@ def test_source_preflight_checks_acceptance_without_graph_and_stages_a_bounded_p
         _plan("source-b", "graph-site-a", "a", "drive-b", "paused"),
         _plan("source-c", "graph-site-b", "b", "drive-c", "retired"),
     )
-    config = SimpleNamespace(acl_max_pages=7)
+    config = SimpleNamespace(execution=SimpleNamespace(acl_max_pages=7))
     staged: list[tuple[str, str, dict[str, str] | None]] = []
 
     class Registry:
@@ -54,7 +61,10 @@ def test_source_preflight_checks_acceptance_without_graph_and_stages_a_bounded_p
             return None
 
         def list_source_inventory_page(self, **kwargs):
-            assert kwargs == {"page_size": function_app.SOURCE_DISPATCH_PAGE_SIZE, "continuation_token": None}
+            assert kwargs == {
+                "page_size": function_app.EXECUTION_CONFIG.source_dispatch_page_size,
+                "continuation_token": None,
+            }
             return SimpleNamespace(
                 plans=plans, rejected_source_ids=(), unattributed_errors=0,
                 duplicate_drive_source_ids=(), continuation_token=None,
@@ -109,7 +119,11 @@ def test_source_preflight_duplicate_drive_fails_only_the_duplicate_source(
         def fail_source_dispatch(self, *_args):
             pytest.fail("a duplicate drive must not fail the whole dispatch")
 
-    monkeypatch.setattr(config_module, "load_config", lambda: SimpleNamespace(acl_max_pages=7))
+    monkeypatch.setattr(
+        config_module,
+        "load_config",
+        lambda: SimpleNamespace(execution=SimpleNamespace(acl_max_pages=7)),
+    )
     monkeypatch.setattr(function_app, "_build_source_registry_repository", lambda _config: Registry())
     monkeypatch.setattr(function_app, "_build_graph_client", lambda _config: object())
     monkeypatch.setattr("ingestion.graph.validate_sharepoint_drive_site", _no_graph)
@@ -155,7 +169,11 @@ def test_source_plan_loader_scans_inventory_once_and_checks_acceptance_without_g
     monkeypatch.setattr(function_app, "_build_graph_client", lambda _config: object())
     monkeypatch.setattr("ingestion.graph.validate_sharepoint_drive_site", _no_graph)
 
-    plans = tuple(function_app._load_validated_source_plans(SimpleNamespace(acl_max_pages=5)))
+    plans = tuple(
+        function_app._load_validated_source_plans(
+            SimpleNamespace(execution=SimpleNamespace(acl_max_pages=5))
+        )
+    )
 
     assert [plan.source_id for plan in plans] == ["source-a", "source-b"]
     assert scans == [None, "page-2"]
@@ -187,7 +205,11 @@ def test_source_plan_loader_skips_duplicate_drive_source_and_yields_others(
     monkeypatch.setattr(function_app, "_build_graph_client", lambda _config: object())
     monkeypatch.setattr("ingestion.graph.validate_sharepoint_drive_site", _no_graph)
 
-    plans = tuple(function_app._load_validated_source_plans(SimpleNamespace(acl_max_pages=5)))
+    plans = tuple(
+        function_app._load_validated_source_plans(
+            SimpleNamespace(execution=SimpleNamespace(acl_max_pages=5))
+        )
+    )
 
     assert [plan.source_id for plan in plans] == ["source-a", "source-c"]
 
@@ -214,7 +236,11 @@ def test_source_plan_loader_skips_unaccepted_source_without_graph(
     monkeypatch.setattr(function_app, "_build_graph_client", _no_graph)
     monkeypatch.setattr("ingestion.graph.validate_sharepoint_drive_site", _no_graph)
 
-    plans = tuple(function_app._load_validated_source_plans(SimpleNamespace(acl_max_pages=5)))
+    plans = tuple(
+        function_app._load_validated_source_plans(
+            SimpleNamespace(execution=SimpleNamespace(acl_max_pages=5))
+        )
+    )
 
     assert plans == (accepted,)
 
@@ -315,6 +341,36 @@ def test_lifecycle_webhook_ignores_unknown_subscription_and_handles_known_one(
     assert renewed == ["subscription-a"]
 
 
+def test_lifecycle_webhook_rejects_invalid_client_state_before_source_routing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(function_app, "WEBHOOK_CLIENT_STATE", "client-state")
+    monkeypatch.setattr(
+        config_module,
+        "load_config",
+        lambda: pytest.fail("invalid clientState must fail before source routing"),
+    )
+    body = {
+        "value": [
+            {
+                "subscriptionId": "subscription-a",
+                "lifecycleEvent": "reauthorizationRequired",
+                "clientState": "wrong-state",
+            }
+        ]
+    }
+    request = func.HttpRequest(
+        method="POST",
+        url="https://function.invalid/api/webhook/lifecycle",
+        body=json.dumps(body).encode(),
+    )
+
+    handler = inspect.unwrap(function_app.webhook_lifecycle._function._func)
+    response = asyncio.run(handler(request))
+
+    assert response.status_code == 403
+
+
 def test_one_unaccepted_source_stages_failure_without_blocking_other_sources(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -322,7 +378,7 @@ def test_one_unaccepted_source_stages_failure_without_blocking_other_sources(
         _plan("source-a", "site-a", "a", "drive-a"),
         _plan("source-b", "site-b", "b", "drive-b"),
     )
-    config = SimpleNamespace(acl_max_pages=7)
+    config = SimpleNamespace(execution=SimpleNamespace(acl_max_pages=7))
 
     staged: list[tuple[str, str]] = []
 
@@ -383,7 +439,11 @@ def test_invalid_catalog_record_isolated_and_activity_output_stays_bounded(
         def stage_source_dispatch_item(self, _dispatch_id, source_id, *, status, **_kwargs):
             staged.append((source_id, status))
 
-    monkeypatch.setattr(config_module, "load_config", lambda: SimpleNamespace(acl_max_pages=7))
+    monkeypatch.setattr(
+        config_module,
+        "load_config",
+        lambda: SimpleNamespace(execution=SimpleNamespace(acl_max_pages=7)),
+    )
     monkeypatch.setattr(function_app, "_build_source_registry_repository", lambda _config: Registry())
     monkeypatch.setattr(function_app, "_build_graph_client", lambda _config: object())
     monkeypatch.setattr("ingestion.graph.validate_sharepoint_drive_site", _no_graph)
@@ -856,12 +916,16 @@ def test_failed_source_is_recorded_without_blocking_other_sources() -> None:
         "dispatchId": "root-instance",
         "inventory": context.input_value["inventoryCounts"],
         "drives": {"completed": 1, "failed": 1, "pending": 0},
-        "outcomePageSize": function_app.SOURCE_DISPATCH_PAGE_SIZE,
+        "outcomePageSize": function_app.EXECUTION_CONFIG.source_dispatch_page_size,
     }
 
 
 def test_dispatch_fan_out_is_bounded_by_page_size(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(function_app, "SOURCE_DISPATCH_PAGE_SIZE", 2)
+    monkeypatch.setattr(
+        function_app,
+        "EXECUTION_CONFIG",
+        replace(function_app.EXECUTION_CONFIG, source_dispatch_page_size=2),
+    )
     context = _dispatch_context()
     orchestrator = function_app.multi_source_full_sync_orchestrator._function._func.orchestrator_function(context)
     assert next(orchestrator).name == "list_source_dispatch_page_activity"
@@ -949,6 +1013,7 @@ def test_delta_orchestrator_compacts_each_reduced_item_page() -> None:
             "createdOrUpdated": 2,
             "deleted": 1,
             "aclResynced": 0,
+            "quarantined": 1,
             "failed": 0,
             "pending": 0,
             "itemsSeen": 90,
@@ -965,6 +1030,7 @@ def test_delta_orchestrator_compacts_each_reduced_item_page() -> None:
             "createdOrUpdated": 2,
             "deleted": 1,
             "aclResynced": 0,
+            "quarantined": 1,
             "failed": 0,
             "pending": 0,
             "bootstrapped": True,
@@ -983,6 +1049,7 @@ def test_delta_orchestrator_compacts_each_reduced_item_page() -> None:
             "createdOrUpdated": 1,
             "deleted": 0,
             "aclResynced": 3,
+            "quarantined": 2,
             "failed": 0,
             "pending": 0,
             "itemsSeen": 90,
@@ -996,6 +1063,7 @@ def test_delta_orchestrator_compacts_each_reduced_item_page() -> None:
         "createdOrUpdated": 3,
         "deleted": 1,
         "aclResynced": 3,
+        "quarantined": 3,
         "failed": 0,
         "pending": 0,
         "bootstrapped": True,
@@ -1124,6 +1192,54 @@ def test_audio_poll_orchestrator_reports_failed_job_as_failed() -> None:
     assert stopped.value.value["failed"] == 1
 
 
+def test_delta_orchestrator_continues_bounded_enumeration_from_next_link() -> None:
+    source_plan = _plan("source-a", "site-a", "a", "drive-a").to_payload()
+    next_link = "https://graph.microsoft.com/v1.0/drives/drive-a/root/delta?skip=200"
+    context = _Context(source_plan)
+    orchestrator = function_app.delta_sync_orchestrator._function._func.orchestrator_function(context)
+
+    first_window = next(orchestrator)
+    assert first_window.name == "delta_sync_activity"
+    with pytest.raises(StopIteration):
+        orchestrator.send({
+            "bootstrapped": False,
+            "createdOrUpdated": 0,
+            "deleted": 0,
+            "aclResynced": 0,
+            "quarantined": 0,
+            "failed": 0,
+            "pending": 0,
+            "itemsSeen": 200,
+            "continuationPhase": "enumerating",
+            "phaseContinuationToken": next_link,
+        })
+
+    assert context.continued_input == {
+        "orchestrationPhase": "delta",
+        "sourcePlan": source_plan,
+        "deltaPhase": "enumerating",
+        "phaseContinuationToken": next_link,
+        "totals": {
+            "createdOrUpdated": 0,
+            "deleted": 0,
+            "aclResynced": 0,
+            "quarantined": 0,
+            "failed": 0,
+            "pending": 0,
+            "bootstrapped": False,
+            "itemsSeen": 200,
+        },
+    }
+    resumed_context = _Context(context.continued_input)
+    resumed = function_app.delta_sync_orchestrator._function._func.orchestrator_function(
+        resumed_context,
+    )
+    resumed_window = next(resumed)
+    assert resumed_window.payload["processingPhase"] == "enumerating"
+    assert resumed_window.payload["phaseContinuationToken"] == next_link
+    assert resumed_window.payload["deltaExecutionId"] == resumed_context.instance_id
+
+
 def test_delta_orchestrator_reuses_instance_id_as_stable_work_run_key() -> None:
     class Task:
         def __init__(self, name: str, payload: dict[str, Any]) -> None:
@@ -1187,7 +1303,7 @@ def test_delta_activity_passes_registry_owner_and_stable_run_identity(
         service_calls.append(kwargs)
         return SimpleNamespace(
             bootstrapped=False, created_or_updated=0, deleted=0,
-            acl_resynced=0, failed=0, pending=1, items_seen=1,
+            acl_resynced=0, quarantined=2, failed=0, pending=1, items_seen=1,
             continuation_token=None, continuation_phase=None,
         )
 
@@ -1200,6 +1316,7 @@ def test_delta_activity_passes_registry_owner_and_stable_run_identity(
     })
 
     assert result["pending"] == 1
+    assert result["quarantined"] == 2
     assert acquired == [(plan, {"owner_instance_id": "durable-owner", "operation": "delta-sync"})]
     assert service_calls[0]["work_registry"] is registry
     assert service_calls[0]["source_plan"] == plan
@@ -1652,6 +1769,10 @@ def test_source_retirement_activity_uses_maintenance_and_deletes_orphans_last(
 ) -> None:
     plan = _plan("source-a", "site-a", "a", "drive-a", "retired")
     calls = []
+    deployment_config = SimpleNamespace(
+        cosmos_search_chunks_container="default-search-chunks",
+        cosmos_source_documents_container="default-source-documents",
+    )
 
     class Registry:
         def begin_operator_maintenance(self, received, **kwargs):
@@ -1674,9 +1795,15 @@ def test_source_retirement_activity_uses_maintenance_and_deletes_orphans_last(
         calls.append("documents")
         return deleted_count
 
-    monkeypatch.setattr(config_module, "load_config", lambda: SimpleNamespace())
+    def build_lifecycle_repository(config):
+        assert config.cosmos_search_chunks_container == plan.source.chunks_container
+        assert config.cosmos_source_documents_container == plan.source.manifests_container
+        assert config is not deployment_config
+        return Lifecycle()
+
+    monkeypatch.setattr(config_module, "load_config", lambda: deployment_config)
     monkeypatch.setattr(function_app, "_build_source_registry_repository", lambda _config: Registry())
-    monkeypatch.setattr(function_app, "_build_lifecycle_repository", lambda _config: Lifecycle())
+    monkeypatch.setattr(function_app, "_build_lifecycle_repository", build_lifecycle_repository)
     monkeypatch.setattr(function_app, "_build_audit_container", lambda _config: object())
     monkeypatch.setattr("ingestion.services.run_source_retirement_page", delete_page)
     result = function_app.source_retirement_page_activity({
@@ -1687,6 +1814,31 @@ def test_source_retirement_activity_uses_maintenance_and_deletes_orphans_last(
         "hasMore": True,
     }
     assert calls == (["maintenance", "documents"] if deleted_count else ["maintenance", "documents", "chunks"])
+
+
+def test_source_retirement_rejects_invalid_pair_before_repository_creation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = _plan(
+        "source-a", "site-a", "a", "drive-a", "retired",
+    ).to_payload()
+    payload["chunksContainer"] = "invalid/name"
+
+    monkeypatch.setattr(
+        config_module,
+        "load_config",
+        lambda: pytest.fail("invalid routing must fail before loading configuration"),
+    )
+    monkeypatch.setattr(
+        function_app,
+        "_build_lifecycle_repository",
+        lambda _config: pytest.fail("invalid routing must not create a repository"),
+    )
+
+    assert function_app.source_retirement_page_activity({
+        "sourcePlan": payload,
+        "coordinatorOwnerId": "owner",
+    }) == {"error": "source_retirement_failed"}
 
 
 @pytest.mark.parametrize("result", [

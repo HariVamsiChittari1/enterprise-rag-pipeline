@@ -34,9 +34,9 @@ The current connector also requests permission-change metadata whose documented 
 ### Retrieval API Application
 
 - Single-tenant API application.
-- Client ID/audience supplied as `RETRIEVAL_API_CLIENT_ID` and `RETRIEVAL_API_AUDIENCE`.
-- Application role `Retrieval.Gateway`.
-- Function UAMI service principal assigned to that role.
+- Client ID supplied as `RETRIEVAL_API_CLIENT_ID`.
+- Delegated scope `user_impersonation`.
+- Approved native/public client authorized for that scope.
 - Retrieval API service-principal object ID supplied as `RETRIEVAL_API_SERVICE_PRINCIPAL_ID` for external validation and deployment evidence.
 
 Active Bicep does not create or consent these directory objects.
@@ -70,8 +70,14 @@ Default storage redundancy is ZRS. Cosmos defaults to serverless but supports pr
 | `ingestion-runs` | `/sourceId` |
 | `source-documents` | `/sourceRunId` |
 | `search-chunks` | `/documentKey` |
-| `retrieval-config` | `/deploymentInstanceId` |
+| `retrieval-config` | `/id` |
 | `service-audit` | `/id` |
+
+Assign the Function App managed identity the repository-defined guarded-writer
+Cosmos data-plane role scoped only to `retrieval-config`. The role requires
+metadata/read, conditional replace, query/change-feed, and create for bootstrap,
+history, and outcome records; it must not include delete, upsert, wildcard
+actions, or account-wide Cosmos contributor access.
 
 ## Deployment Inputs
 

@@ -244,6 +244,60 @@ def test_every_ranked_query_filters_acl_before_ranking(mode: RetrievalMode) -> N
     )
 
 
+def test_shared_link_feedback_never_authorizes_retrieval() -> None:
+    class AclFilteringChunks:
+        def __init__(self) -> None:
+            self.row = candidate() | {
+                "allowedGroupIds": ["allowed-group"],
+                "aclFeedback": ["SharedLink"],
+            }
+            self.queries: list[str] = []
+
+        def query_items(
+            self,
+            *,
+            query: str,
+            parameters: list[dict[str, object]],
+            enable_cross_partition_query: bool,
+        ) -> list[dict[str, object]]:
+            assert enable_cross_partition_query is True
+            self.queries.append(query)
+            parameter_values = {
+                parameter["name"]: parameter["value"]
+                for parameter in parameters
+            }
+            principal_ids = set(parameter_values["@principalIds"])
+            return (
+                [self.row]
+                if principal_ids.intersection(self.row["allowedGroupIds"])
+                else []
+            )
+
+    chunks = AclFilteringChunks()
+    manifests = Mock()
+    manifests.read_item.return_value = active_manifest(
+        allowedGroupIds=["allowed-group"],
+        aclStatus="Verified",
+        aclFeedback=["SharedLink"],
+    )
+    retriever = SecureCosmosRetriever(chunks, manifests)
+
+    allowed = retriever.retrieve("policy", [0.1], ["allowed-group"])
+    denied = retriever.retrieve("policy", [0.1], ["outside-group"])
+
+    assert [result.content for result in allowed] == ["authorized content"]
+    assert denied == []
+    assert all("aclFeedback" not in query for query in chunks.queries)
+    assert all(
+        "ARRAY_CONTAINS(@principalIds, gid)" in query
+        for query in chunks.queries
+    )
+    manifests.read_item.assert_called_once_with(
+        item="document",
+        partition_key="sharepoint-drive:run1",
+    )
+
+
 def test_non_ready_document_is_not_returned() -> None:
     chunks = Mock()
     chunks.query_items.return_value = [candidate()]
@@ -527,6 +581,31 @@ def test_acl_disabled_omits_filter_and_accepts_empty_principals() -> None:
     query = chunks.query_items.call_args.kwargs["query"]
     assert "allowedGroupIds" not in query
     assert "@principalIds" not in query
+
+
+def test_request_acl_policy_overrides_retriever_default() -> None:
+    chunks = Mock()
+    chunks.query_items.return_value = []
+    retriever = SecureCosmosRetriever(chunks, Mock())
+
+    retriever.retrieve(
+        "policy",
+        [0.1],
+        [],
+        eligible_source_ids=["source-a"],
+        acl_enabled=False,
+    )
+
+    query = chunks.query_items.call_args.kwargs["query"]
+    parameters = {
+        parameter["name"]: parameter["value"]
+        for parameter in chunks.query_items.call_args.kwargs["parameters"]
+    }
+    assert "c.isRetrievable = true" in query
+    assert "ARRAY_CONTAINS(@eligibleSourceIds, c.sourceId)" in query
+    assert "allowedGroupIds" not in query
+    assert parameters["@eligibleSourceIds"] == ["source-a"]
+    assert "@principalIds" not in parameters
 
 
 def test_projection_includes_source_modified_at_and_returns_field() -> None:

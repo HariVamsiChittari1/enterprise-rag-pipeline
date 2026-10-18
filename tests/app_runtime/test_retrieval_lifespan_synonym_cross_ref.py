@@ -23,8 +23,6 @@ def _base_config() -> RetrievalConfig:
     return RetrievalConfig(
         cosmos_endpoint="https://cosmos.example/",
         cosmos_database="rag",
-        cosmos_chunks_container="search-chunks",
-        cosmos_manifests_container="source-documents",
         cosmos_audit_container="service-audit",
         openai_endpoint="https://openai.example/",
         embedding_deployment="text-embedding-3-large",
@@ -32,9 +30,6 @@ def _base_config() -> RetrievalConfig:
         tenant_id="11111111-1111-4111-8111-111111111111",
         managed_identity_client_id="55555555-5555-4555-8555-555555555555",
         retrieval_audience="api://retrieval-api",
-        gateway_client_id="33333333-3333-4333-8333-333333333333",
-        gateway_principal_id="44444444-4444-4444-8444-444444444444",
-        deployment_instance_id="instance-a",
         retrieval_timeout_seconds=5.0,
         generation_timeout_seconds=15.0,
         agent_timeout_seconds=8.0,
@@ -46,14 +41,12 @@ def _base_config() -> RetrievalConfig:
         openai_api_version="2024-10-21",
         app_insights_connection_string=None,
         include_citations=True,
-        acl_enabled=True,
     )
 
 
 def _catalog() -> RuntimeCatalogSnapshot:
     synonym_map = SynonymMap.parse("geo-map", ["dog, puppy"])
     return RuntimeCatalogSnapshot(
-        deployment_instance_id="instance-a",
         catalog_id="runtime-catalog",
         etag="etag-a",
         digest=DIGEST,
@@ -71,8 +64,7 @@ def _catalog() -> RuntimeCatalogSnapshot:
 
 
 def _patch_azure_sdks(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(retrieval_main, "DefaultAzureCredential", lambda **_: MagicMock())
-    monkeypatch.setattr(retrieval_main, "load_cosmos_instance_configs", lambda **_: [])
+    monkeypatch.setattr(retrieval_main, "create_azure_credential", lambda *_: MagicMock())
     monkeypatch.setattr(retrieval_main, "build_cosmos_registry", lambda *_a, **_k: MagicMock())
     monkeypatch.setattr(retrieval_main, "create_cosmos_client", lambda *_a, **_k: MagicMock())
     monkeypatch.setattr(retrieval_main, "AzureOpenAI", lambda **_: MagicMock())
@@ -90,17 +82,17 @@ def test_lifespan_loads_singleton_and_applies_snapshot(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _patch_azure_sdks(monkeypatch)
-    captured: list[str] = []
+    loaded: list[bool] = []
 
-    def _loader(_container: object, instance_id: str) -> object:
-        captured.append(instance_id)
+    def _loader(_container: object) -> object:
+        loaded.append(True)
         return SimpleNamespace(load=_catalog)
 
     monkeypatch.setattr(retrieval_main, "RuntimeCatalogLoader", _loader)
 
     asyncio.run(_enter_lifespan())
 
-    assert captured == ["instance-a"]
+    assert loaded == [True]
     policy = retrieval_main._state.rag_service.capture_policy()
     assert policy.snapshot.digest == DIGEST
     assert policy.snapshot.over_fetch_factor == 3
@@ -133,8 +125,7 @@ def test_lifespan_catalog_failure_closes_acquired_resources(
     registry = MagicMock()
     cosmos = MagicMock()
     openai_client = MagicMock()
-    monkeypatch.setattr(retrieval_main, "DefaultAzureCredential", lambda **_: credential)
-    monkeypatch.setattr(retrieval_main, "load_cosmos_instance_configs", lambda **_: [])
+    monkeypatch.setattr(retrieval_main, "create_azure_credential", lambda *_: credential)
     monkeypatch.setattr(retrieval_main, "build_cosmos_registry", lambda *_a, **_k: registry)
     monkeypatch.setattr(retrieval_main, "create_cosmos_client", lambda *_a, **_k: cosmos)
     monkeypatch.setattr(retrieval_main, "AzureOpenAI", lambda **_: openai_client)
