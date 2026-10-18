@@ -131,10 +131,6 @@ param adminApiClientId string
 @minLength(1)
 param functionApiAudience string
 
-@description('Managed-identity scope for the retrieval API')
-@minLength(1)
-param retrievalServiceScope string
-
 @description('NCRONTAB schedule for the reconciliation timer (daily safety-net delta query; webhooks are the primary trigger)')
 param deltaSyncSchedule string = '0 0 4 * * *'
 
@@ -153,9 +149,6 @@ param lifecycleReconcileSchedule string = '0 */10 * * * *'
 @minValue(1)
 @maxValue(100)
 param lifecycleReconcilePageSize int = 50
-
-@description('Internal URL of the retrieval service for query proxy')
-param retrievalServiceUrl string = ''
 
 @secure()
 @description('Shared secret for Microsoft Graph webhook clientState validation')
@@ -247,24 +240,12 @@ resource functionApp 'Microsoft.Web/sites@2025-03-01' = {
           value: 'ClientId=${managedIdentityClientId};Authorization=AAD'
         }
         {
+          name: 'AZURE_AUTH_MODE'
+          value: 'managed_identity'
+        }
+        {
           name: 'AZURE_CLIENT_ID'
           value: managedIdentityClientId
-        }
-        {
-          name: 'MANAGED_IDENTITY_CLIENT_ID'
-          value: managedIdentityClientId
-        }
-        {
-          name: 'TENANT_ID'
-          value: entraTenantId
-        }
-        {
-          name: 'FUNCTION_API_AUDIENCE'
-          value: functionApiAudience
-        }
-        {
-          name: 'RETRIEVAL_SERVICE_SCOPE'
-          value: retrievalServiceScope
         }
         {
           name: 'COSMOS_ENDPOINT'
@@ -281,14 +262,6 @@ resource functionApp 'Microsoft.Web/sites@2025-03-01' = {
         {
           name: 'COSMOS_INGESTION_SOURCES_CONTAINER_NAME'
           value: cosmosContainerNames.ingestionSources
-        }
-        {
-          name: 'COSMOS_SOURCE_DOCUMENTS_CONTAINER_NAME'
-          value: cosmosContainerNames.sourceDocuments
-        }
-        {
-          name: 'COSMOS_SEARCH_CHUNKS_CONTAINER_NAME'
-          value: cosmosContainerNames.searchChunks
         }
         {
           name: 'DURABLE_TASK_SCHEDULER_CONNECTION_STRING'
@@ -313,14 +286,6 @@ resource functionApp 'Microsoft.Web/sites@2025-03-01' = {
         {
           name: 'VISION_MAX_OUTPUT_TOKENS'
           value: '400'
-        }
-        {
-          name: 'VISION_MAX_IMAGE_BYTES'
-          value: '2097152'
-        }
-        {
-          name: 'VISION_MAX_FIGURES'
-          value: '60'
         }
         {
           name: 'DOCUMENT_INTELLIGENCE_ENDPOINT'
@@ -459,16 +424,8 @@ resource functionApp 'Microsoft.Web/sites@2025-03-01' = {
           value: '100'
         }
         {
-          name: 'MAX_PDF_PAGES'
-          value: '500'
-        }
-        {
-          name: 'QUERY_PROXY_TIMEOUT_SECONDS'
-          value: '30'
-        }
-        {
-          name: 'RETRIEVAL_SERVICE_URL'
-          value: retrievalServiceUrl
+          name: 'MAX_PAGES_PER_SOURCE'
+          value: '2000'
         }
         {
           name: 'WEBHOOK_CLIENT_STATE'
@@ -481,10 +438,6 @@ resource functionApp 'Microsoft.Web/sites@2025-03-01' = {
         {
           name: 'SHAREPOINT_SITE_URL'
           value: sharePointSiteUrl
-        }
-        {
-          name: 'INSTANCE_MEMORY_MB'
-          value: string(instanceMemoryMB)
         }
       ]
       ftpsState: 'Disabled'

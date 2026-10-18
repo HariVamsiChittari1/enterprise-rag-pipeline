@@ -2,29 +2,26 @@
 
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass
 from typing import Any
 
-from source_registry import SOURCE_RECORD_TYPE, SharePointSource
-
-logger = logging.getLogger(__name__)
-
-_SOURCE_LIST_QUERY = (
-    "SELECT c.id, c.sourceId, c.recordType, c.schemaVersion, c.sourceKind, "
-    "c.desiredState, c.config, c._etag FROM c WHERE c.recordType = @recordType"
-)
+from source_registry import SharePointSource, validate_source_id
 
 
 class SourcePolicyReadError(RuntimeError):
-    """The complete source registry could not be enumerated."""
+    """The requested source policy could not be read safely."""
 
 
 @dataclass(frozen=True)
 class SourceEligibility:
     source_id: str
     catalog_etag: str
-
+    desired_state: str
+    content_scope: str
+    chunks_container: str
+    manifests_container: str
+    retrieval_acl_enabled: bool
+    business_name: str
 
 @dataclass(frozen=True)
 class SourcePolicySnapshot:
@@ -49,35 +46,13 @@ class SourcePolicyReader:
     ) -> None:
         self._sources = sources
 
-    def capture(self) -> SourcePolicySnapshot:
+    def capture(self, source_id: str) -> SourcePolicySnapshot:
         try:
-            rows = list(
-                self._sources.query_items(
-                    query=_SOURCE_LIST_QUERY,
-                    parameters=[{"name": "@recordType", "value": SOURCE_RECORD_TYPE}],
-                    enable_cross_partition_query=True,
-                    max_item_count=100,
-                )
-            )
+            normalized_source_id = validate_source_id(source_id)
+            current = self._read_eligibility(normalized_source_id)
         except Exception as error:
-            raise SourcePolicyReadError("source_registry_enumeration_failed") from error
-
-        eligible: list[SourceEligibility] = []
-        for item in rows:
-            try:
-                current = _eligibility_from_item(item)
-            except Exception as error:
-                logger.warning(
-                    "source_policy_denied",
-                    extra={
-                        "source_id": item.get("sourceId") if isinstance(item, dict) else None,
-                        "reason": type(error).__name__,
-                    },
-                )
-                continue
-            if current is not None:
-                eligible.append(current)
-        return SourcePolicySnapshot(tuple(sorted(eligible, key=lambda source: source.source_id)))
+            raise SourcePolicyReadError("source_registry_point_read_failed") from error
+        return SourcePolicySnapshot((current,) if current is not None else ())
 
     def validate_sources(
         self,
@@ -92,7 +67,7 @@ class SourcePolicyReader:
                 current = self._read_eligibility(source_id)
             except Exception:
                 return False
-            if current != expected:
+            if current is None or not _same_retrieval_semantics(expected, current):
                 return False
         return True
 
@@ -111,4 +86,27 @@ def _eligibility_from_item(item: object) -> SourceEligibility | None:
     catalog_etag = item.get("_etag") if isinstance(item, dict) else None
     if not isinstance(catalog_etag, str) or not catalog_etag:
         return None
-    return SourceEligibility(source.source_id, catalog_etag)
+    return SourceEligibility(
+        source_id=source.source_id,
+        catalog_etag=catalog_etag,
+        desired_state=source.desired_state,
+        content_scope=source.content_scope,
+        chunks_container=source.chunks_container,
+        manifests_container=source.manifests_container,
+        retrieval_acl_enabled=source.retrieval_acl_enabled,
+        business_name=source.business_name,
+    )
+
+
+def _same_retrieval_semantics(
+    expected: SourceEligibility,
+    current: SourceEligibility,
+) -> bool:
+    return (
+        expected.source_id == current.source_id
+        and expected.desired_state == current.desired_state
+        and expected.content_scope == current.content_scope
+        and expected.chunks_container == current.chunks_container
+        and expected.manifests_container == current.manifests_container
+        and expected.retrieval_acl_enabled == current.retrieval_acl_enabled
+    )

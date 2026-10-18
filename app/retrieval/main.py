@@ -16,27 +16,27 @@ from typing import Any, Mapping
 
 import httpx
 import structlog
-from azure.identity import DefaultAzureCredential
+from azure.core.credentials import TokenCredential
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from openai import AzureOpenAI, DefaultAsyncHttpxClient, DefaultHttpxClient
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
+from azure_credentials import create_azure_credential
 from cosmos_connection import create_cosmos_client
+from source_registry import validate_source_id
 from retrieval.auth import (
     AuthorizationError,
-    GATEWAY_CONTEXT_HEADER,
-    GATEWAY_REQUEST_ID_HEADER,
     GraphGroupResolver,
     Principal,
-    principal_from_gateway,
-    parse_gateway_request_id,
+    principal_from_easy_auth_user,
+    principal_with_security_groups,
 )
 from retrieval.catalog import RequestPolicy, RuntimeCatalogLoader
 from retrieval.config import RetrievalConfig, load_retrieval_config
 from retrieval.cosmos import RetrievalMode, RetrievedChunk
-from retrieval.cosmos_registry import CosmosRegistry, build_cosmos_registry, load_cosmos_instance_configs
+from retrieval.cosmos_registry import CosmosRegistry, build_cosmos_registry
 from retrieval.pipeline import (
     RetrievalDependencyError,
     citation_label,
@@ -48,7 +48,7 @@ from retrieval.service import (
     accept_answer, suppress_content_filter_retry, suppress_content_filter_retry_async,
 )
 from retrieval.runtime_catalog import RuntimeCatalogProvider
-from retrieval.source_policy import SourcePolicyReader
+from retrieval.source_policy import SourcePolicyReader, SourcePolicySnapshot
 from retrieval.telemetry import CATALOG_LOGGER_NAME, catalog_event_emitter, write_audit_records
 
 try:
@@ -64,7 +64,7 @@ logger = structlog.get_logger()
 class _TokenRefreshAuth(httpx.Auth):
     """httpx auth handler that refreshes MI tokens before expiry."""
 
-    def __init__(self, credential: DefaultAzureCredential) -> None:
+    def __init__(self, credential: TokenCredential) -> None:
         self._credential = credential
         self._scope = "https://graph.microsoft.com/.default"
 
@@ -77,7 +77,7 @@ class _TokenRefreshAuth(httpx.Auth):
 class _AppState:
     config: RetrievalConfig
     registry: CosmosRegistry
-    credential: DefaultAzureCredential
+    credential: TokenCredential
     openai_client: AzureOpenAI
     rag_service: RagService
     group_resolver: GraphGroupResolver
@@ -90,7 +90,11 @@ class _AppState:
 _state = _AppState()
 
 
-def _configure_tracing(config: RetrievalConfig, *, credential: DefaultAzureCredential | None = None) -> None:
+def _configure_tracing(
+    config: RetrievalConfig,
+    *,
+    credential: TokenCredential | None = None,
+) -> None:
     """Disable GenAI capture and configure optional Azure Monitor telemetry."""
     if _AGENT_AVAILABLE:
         from agent_framework.observability import disable_instrumentation
@@ -119,25 +123,15 @@ async def _lifespan(app: FastAPI):
     provider: RuntimeCatalogProvider | None = None
     try:
         config = load_retrieval_config()
-        credential = DefaultAzureCredential(managed_identity_client_id=config.managed_identity_client_id)
+        credential = create_azure_credential(config.managed_identity_client_id)
         resources.callback(_close_resource, credential)
         _configure_tracing(config, credential=credential)
-
-        instance_configs = load_cosmos_instance_configs(
-            default_source_id=os.getenv("INGESTION_SOURCE_ID", "default"),
-            default_endpoint=config.cosmos_endpoint,
-            default_database=config.cosmos_database,
-            default_chunks_container=config.cosmos_chunks_container,
-            default_manifests_container=config.cosmos_manifests_container,
-        )
-        registry = build_cosmos_registry(
-            instance_configs, credential, acl_enabled=config.acl_enabled,
-        )
-        resources.callback(_close_resource, registry)
 
         cosmos = create_cosmos_client(config.cosmos_endpoint, credential=credential)
         resources.callback(_close_resource, cosmos)
         db = cosmos.get_database_client(config.cosmos_database)
+        registry = build_cosmos_registry(db)
+        resources.callback(_close_resource, registry)
         audit_container = db.get_container_client(config.cosmos_audit_container)
         source_policy_reader = SourcePolicyReader(
             db.get_container_client(config.cosmos_ingestion_sources_container),
@@ -177,6 +171,9 @@ async def _lifespan(app: FastAPI):
                     api_version=config.agent_api_version,
                     api_key=_agent_token_provider,
                 )
+                _state.agent_chat_client.function_invocation_configuration[
+                    "max_iterations"
+                ] = config.agent_max_iterations
                 original_client = _state.agent_chat_client.client
                 async_resources.push_async_callback(original_client.close)
                 agent_http_client = DefaultAsyncHttpxClient(
@@ -192,13 +189,12 @@ async def _lifespan(app: FastAPI):
 
         catalog_container = db.get_container_client(config.catalog_container)
         provider = RuntimeCatalogProvider(
-            RuntimeCatalogLoader(catalog_container, config.deployment_instance_id),
+            RuntimeCatalogLoader(catalog_container),
             config.catalog_poll_seconds,
             emit=catalog_event_emitter(
                 os.getenv("CONTAINER_APP_REVISION", ""),
                 os.getenv("CONTAINER_APP_REPLICA_NAME", ""),
                 application=os.getenv("CONTAINER_APP_NAME", ""),
-                deployment_instance_hash=hashlib.sha256(config.deployment_instance_id.encode("utf-8")).hexdigest(),
             ),
         )
         await provider.start()
@@ -214,7 +210,6 @@ async def _lifespan(app: FastAPI):
             generation_timeout_seconds=config.generation_timeout_seconds,
             max_evidence=config.max_evidence_chunks,
             max_planned_queries=config.max_planned_queries,
-            acl_enabled=config.acl_enabled,
             catalog_provider=provider,
             source_policy_reader=source_policy_reader,
         )
@@ -228,8 +223,7 @@ async def _lifespan(app: FastAPI):
         logger.info(
             "retrieval_service_started",
             cosmos_endpoint=config.cosmos_endpoint,
-            cosmos_instances=len(registry),
-            acl_enabled=config.acl_enabled,
+            cosmos_cached_pairs=len(registry),
             catalog_version=provider.snapshot.digest,
             catalog_etag=provider.snapshot.etag,
         )
@@ -260,13 +254,11 @@ app = FastAPI(title="RAG Retrieval Agent", lifespan=_lifespan)
 
 
 def _error_request_id(request: Request) -> str:
-    values = request.headers.getlist(GATEWAY_REQUEST_ID_HEADER)
-    if len(values) == 1:
-        try:
-            return parse_gateway_request_id(values[0])
-        except AuthorizationError:
-            pass
-    return str(uuid.uuid4())
+    request_id = getattr(request.state, "request_id", None)
+    if request_id is None:
+        request_id = str(uuid.uuid4())
+        request.state.request_id = request_id
+    return request_id
 
 
 def _error_response(
@@ -414,12 +406,18 @@ _rate_limiter = _SlidingWindowLimiter(_RATE_LIMIT_RPM, _RATE_LIMIT_WINDOW)
 
 
 class QueryRequest(BaseModel):
+    source_id: str = Field(alias="sourceId", min_length=1, max_length=1023)
     question: str = Field(min_length=1, max_length=4000)
     history: list[dict[str, str]] = Field(default_factory=list)
     mode: str = Field(default="hybrid", pattern="^(hybrid|vector|full_text)$")
     top_k: int | None = Field(default=None, ge=1, le=20)
     scoring_profile: str | None = Field(default=None, max_length=200)
     expand_synonyms: bool | None = Field(default=None)
+
+    @field_validator("source_id")
+    @classmethod
+    def validate_source_id(cls, source_id: str) -> str:
+        return validate_source_id(source_id)
 
 
 class Citation(BaseModel):
@@ -452,14 +450,23 @@ def _citation_from_result(index: int, chunk: Mapping[str, Any]) -> Citation:
 
 @app.post("/api/query", response_model=QueryResponse, response_model_exclude_none=True)
 async def query(request: Request, body: QueryRequest, background_tasks: BackgroundTasks):
+    request_id = _error_request_id(request)
     principal = await asyncio.to_thread(_resolve_principal, request)
-    request_id_headers = request.headers.getlist(GATEWAY_REQUEST_ID_HEADER)
-    if len(request_id_headers) != 1:
-        raise HTTPException(status_code=401, detail="invalid_gateway_request_id")
-    try:
-        request_id = parse_gateway_request_id(request_id_headers[0])
-    except AuthorizationError as error:
-        raise HTTPException(status_code=401, detail=str(error)) from error
+    source_policy_snapshot = await asyncio.to_thread(
+        _state.rag_service.capture_source_policy,
+        body.source_id,
+    )
+    selected_source = (
+        source_policy_snapshot.sources[0]
+        if source_policy_snapshot is not None
+        and len(source_policy_snapshot.sources) == 1
+        else None
+    )
+    principal = await asyncio.to_thread(
+        _principal_for_source_policy,
+        principal,
+        source_policy_snapshot,
+    )
     start = time.perf_counter()
     log = logger.bind(request_id=request_id)
 
@@ -477,14 +484,15 @@ async def query(request: Request, body: QueryRequest, background_tasks: Backgrou
     path = "standard"
 
     if use_agent:
-        log.info("query_start", user_id=principal.user_id, mode=body.mode, path="agentic",
+        log.info("query_start", mode=body.mode, path="agentic",
                  planned_queries=len(queries))
         result = await _run_agentic_path(
-            body.question, principal, mode, planning_usage, log,
+            body.question, principal, mode, planning_usage, log, body.source_id,
             body.scoring_profile,
             body.expand_synonyms,
             body.top_k,
             policy=policy,
+            source_policy_snapshot=source_policy_snapshot,
         )
         if result is not None:
             path = "agentic"
@@ -493,7 +501,7 @@ async def query(request: Request, body: QueryRequest, background_tasks: Backgrou
             log.warning("agentic_path_fallback")
 
     if not use_agent or result is None:
-        log.info("query_start", user_id=principal.user_id, mode=body.mode, path=path,
+        log.info("query_start", mode=body.mode, path=path,
                  planned_queries=len(queries))
         result = await asyncio.to_thread(
             _state.rag_service.answer_with_queries,
@@ -502,6 +510,8 @@ async def query(request: Request, body: QueryRequest, background_tasks: Backgrou
             body.scoring_profile,
             body.expand_synonyms,
             policy=policy,
+            source_id=body.source_id,
+            source_policy_snapshot=source_policy_snapshot,
         )
 
     background_tasks.add_task(
@@ -512,6 +522,8 @@ async def query(request: Request, body: QueryRequest, background_tasks: Backgrou
         principal.tenant_id,
         body.mode,
         result.get("usage", []),
+        source_id=selected_source.source_id if selected_source is not None else None,
+        business_name=selected_source.business_name if selected_source is not None else None,
     )
 
     elapsed = time.perf_counter() - start
@@ -532,6 +544,8 @@ async def query(request: Request, body: QueryRequest, background_tasks: Backgrou
             for record in result.get("usage", [])),
         policy.snapshot.etag,
         policy.snapshot.operation_id,
+        selected_source.source_id if selected_source is not None else None,
+        selected_source.business_name if selected_source is not None else None,
     )
 
     if not _state.config.include_citations:
@@ -554,6 +568,8 @@ def _write_query_summary(
     catalog_version: str | None, scoring_profile: str | None,
     synonym_map: str | None, retrieval_degraded: bool,
     catalog_etag: str | None = None, catalog_operation_id: str | None = None,
+    source_id: str | None = None,
+    business_name: str | None = None,
 ) -> None:
     from retrieval.telemetry import write_audit_records
     write_audit_records(container, request_id, user_id, tenant_id, mode, [{
@@ -568,7 +584,7 @@ def _write_query_summary(
         "scoring_profile": scoring_profile,
         "synonym_map": synonym_map,
         "retrieval_degraded": retrieval_degraded,
-    }])
+    }], source_id=source_id, business_name=business_name)
 
 
 async def _run_agentic_path(
@@ -577,11 +593,13 @@ async def _run_agentic_path(
     mode: RetrievalMode,
     planning_usage: list[dict[str, Any]],
     log: Any,
+    source_id: str,
     scoring_profile: str | None = None,
     expand_synonyms: bool | None = None,
     top_k: int | None = None,
     *,
     policy: RequestPolicy | None = None,
+    source_policy_snapshot: SourcePolicySnapshot | None = None,
 ) -> dict[str, Any] | None:
     """Run the Agent Framework agent. Returns None on timeout/error (caller falls back)."""
     # Resolved outside the try/except so a config error (unknown profile) fails fast
@@ -596,6 +614,7 @@ async def _run_agentic_path(
             rag_service=_state.rag_service,
             principal=principal,
             retrieved_chunks=retrieved_chunks,
+            source_id=source_id,
             usage=agentic_usage,
             scoring_profile=scoring_profile,
             max_evidence=top_k or _state.config.max_evidence_chunks,
@@ -604,6 +623,7 @@ async def _run_agentic_path(
             deadline_monotonic=agent_deadline,
             policy=policy,
             source_policy_versions=source_policy_versions,
+            source_policy_snapshot=source_policy_snapshot,
         )
         agent = create_rag_agent(
             _state.agent_chat_client, search_tool, model=_state.config.chat_deployment,
@@ -661,33 +681,46 @@ async def health_live():
 @app.get("/health/ready")
 async def health_ready():
     try:
-        _source_id, retriever = _state.registry.items()[0]
-        items = retriever._chunks.query_items(
-            query="SELECT TOP 1 c.id FROM c",
-            enable_cross_partition_query=True,
-            max_item_count=1,
-        )
-        await asyncio.to_thread(lambda: list(items))
+        _state.catalog_provider.snapshot
         return {"status": "ready"}
     except Exception:
         raise HTTPException(status_code=503, detail="cosmos_unavailable")
 
 
 def _resolve_principal(request: Request) -> Principal:
-    service_headers = request.headers.getlist("X-MS-CLIENT-PRINCIPAL")
-    context_headers = request.headers.getlist(GATEWAY_CONTEXT_HEADER)
-    if len(service_headers) != 1 or len(context_headers) != 1:
-        raise HTTPException(status_code=401, detail="invalid_gateway_headers")
+    principal_headers = request.headers.getlist("X-MS-CLIENT-PRINCIPAL")
+    if len(principal_headers) != 1:
+        raise HTTPException(
+            status_code=401,
+            detail="invalid_authenticated_principal_header",
+        )
     try:
-        return principal_from_gateway(
-            service_headers[0],
-            context_headers[0],
+        return principal_from_easy_auth_user(
+            principal_headers[0],
             expected_tenant_id=_state.config.tenant_id,
             expected_audience=_state.config.retrieval_audience,
-            expected_gateway_client_id=_state.config.gateway_client_id,
-            expected_gateway_principal_id=_state.config.gateway_principal_id,
-            group_resolver=_state.group_resolver,
-            acl_enabled=_state.config.acl_enabled,
         )
-    except AuthorizationError as e:
-        raise HTTPException(status_code=401, detail=str(e))
+    except AuthorizationError as error:
+        raise HTTPException(status_code=401, detail=str(error)) from error
+
+
+def _principal_for_source_policy(
+    principal: Principal,
+    snapshot: SourcePolicySnapshot | None,
+) -> Principal:
+    if snapshot is None or len(snapshot.sources) != 1:
+        return Principal(principal.user_id, principal.tenant_id, frozenset())
+    source = snapshot.sources[0]
+    if source.content_scope == "common" and source.retrieval_acl_enabled:
+        raise RetrievalDependencyError("source_policy_invalid")
+    if not source.retrieval_acl_enabled:
+        return Principal(principal.user_id, principal.tenant_id, frozenset())
+    if principal.security_group_ids:
+        return principal
+    try:
+        return principal_with_security_groups(
+            principal,
+            _state.group_resolver,
+        )
+    except AuthorizationError as error:
+        raise HTTPException(status_code=401, detail=str(error)) from error

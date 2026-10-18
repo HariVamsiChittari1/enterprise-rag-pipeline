@@ -1659,7 +1659,8 @@ replace deployed workload identities or ACA delegated-user authentication.
 
 #### T20 - Execute guarded source-by-source cutover [P0]
 
-- Status: PREPARATION BLOCKED AT MUTATION GATE (2026-10-18)
+- Status: COMPLETE; CUTOVER, INGESTION, AND DELEGATED RETRIEVAL VALIDATED
+  (2026-10-18)
 - Depends on: T07, T08, T12, T18, T19
 - Surfaces: existing coordinator maintenance, purge, reprovision/reset, full
   sync, and operator runbook
@@ -1694,19 +1695,57 @@ replace deployed workload identities or ACA delegated-user authentication.
     cutover, not non-destructive preparation; and
   - no source, coordinator, permit, registration, content, or orchestration was
     mutated during preparation.
-- Required implementation before T20 execution:
-  1. add an audited legacy-recovery path limited to exact T02 source IDs and
-     exact coordinator/permit identities; it may settle only after the existing
-     quiescence attestations are proven and must not make a rejected source
-     ingestible or retrievable;
-  2. add an ETag-fenced cutover replacement operation that requires a paused or
-     retired source, a settled zero-work coordinator, completed source-scoped
-     purge/reset, the same source/site/drive identity, and a T19-passed target
-     request; it writes the strict registration as `paused`;
-  3. keep target routing replacement out of preparation. Run it only inside the
-     approved T20 source-by-source maintenance sequence; and
-  4. halt after each source until accepted-record, isolation, audit, and rollback
-     checks pass, following Azure Well-Architected safe-deployment guidance.
+- Development reset decision (2026-10-18):
+  - the environment owner explicitly approved deleting and recreating the four
+    T02 sources. A production-grade legacy recovery route and generic in-place
+    binding replacement would add a permanent mutation surface solely to
+    migrate rejected development records, so they are not needed for T20;
+  - stop the exact Function and delete the one development Durable Task hub
+    before Cosmos mutation. This prevents legacy orchestration history from
+    resuming writes after restart;
+  - bind execution to a SHA-256-approved preview containing exact registration
+    and reservation ETags, counts, and per-record-set digests. Revalidate the
+    Azure CLI tenant, subscription, operator object, Function stopped state,
+    and task-hub absence immediately before mutation;
+  - delete only the four approved source partitions, their exact drive
+    reservations and registrations, and source-filtered records in the legacy
+    and approved content pairs. Preserve `service-audit`, `retrieval-config`,
+    shared database infrastructure, and unrelated source state;
+  - create an immutable in-progress audit manifest before the first delete,
+    checkpoint each source with optimistic concurrency, verify zero remaining
+    scoped state, and then mark the manifest complete. Failure remains
+    fail-closed while the Function is stopped; and
+  - recreate the four strict registrations through the operator API, perform
+    one fresh source-specific sync at a time, validate isolation and ACL
+    behavior after each source, and leave `poc-auth` paused.
+- Execution evidence (2026-10-18):
+  - the approved reset preview SHA-256 was
+    `6c301dc738017c7d312d0b54b634281a0f2a5e392fee1b54f5dd2a89d6b977a5`;
+    the reset deleted 59,667 source-partition operational records, four exact
+    registrations and reservations, 57 legacy manifests, and 2,443 legacy
+    chunks. Its durable manifest is `completed`, and post-reset scoped counts
+    were zero;
+  - the task hub was deleted while the Function was stopped, recreated through
+    the focused Bicep module, and verified with one task-hub-scoped Function
+    `Durable Task Data Contributor` assignment. The Function returned to
+    `Running` with four accepted sources and no rejected, duplicate, or
+    unattributed records;
+  - all registrations use their exact T02 pair. Final ready content is 36/2,318
+    documents/chunks for `sharepoint-drive`, 3/11 for `poc-auth-demo`, 11/113
+    for `poc-pg`, and 5/6 for `poc-auth`; source documents have verified ACL
+    metadata, no source record exists in a legacy or wrong pair, and every
+    coordinator is settled with zero active work;
+  - `sharepoint-drive` initially hit Azure OpenAI call-rate quota. The old
+    Durable hub was removed, five exact claimed permits were recovered only
+    after proving their manifests were still `discovered` with zero chunks and
+    no audio metadata, and the source completed with temporary `WAVE_SIZE=1`.
+    The override was then removed; and
+  - the ACA revision is Running and its UAMI retains Data Reader on all six
+    target containers. The approved public client acquired a delegated
+    `user_impersonation` token for the expected tenant, audience, caller, and
+    user. Direct ACA queries returned five source-isolated citations for each
+    active business source, the paused Common source returned the canonical
+    no-evidence response, and an anonymous query returned `401`.
 
 ### Focused runtime catalog control plane
 
@@ -1763,7 +1802,7 @@ replace deployed workload identities or ACA delegated-user authentication.
 
 #### T21 - Run the full acceptance matrix [P0]
 
-- Status: NOT STARTED
+- Status: COMPLETE WITH EXPLICIT GUEST REAUTHENTICATION LIMITATION (2026-10-18)
 - Depends on: T20
 - Surfaces: targeted unit/contract tests, integration tests, deployed dev smoke
   tests
@@ -1778,6 +1817,39 @@ replace deployed workload identities or ACA delegated-user authentication.
   - all 34 design acceptance criteria pass with captured evidence;
   - any skipped check is an explicit blocker, not an assumed pass.
 - Evidence: implementation validation matrix in the approved design.
+- Runtime evidence (2026-10-18):
+  - Microsoft Graph revalidation confirmed all three approved T02 identities
+    remain enabled. The administrator and member each currently resolve to two
+    transitive security groups; the approved guest resolves to zero;
+  - a fresh administrator delegated token passed exact tenant, audience,
+    approved-client, and `user_impersonation` checks;
+  - direct ACA queries returned `200` with five citations from only
+    `POC-Auth-Docs` for `sharepoint-drive`, only `PoCAuthDemo` for
+    `poc-auth-demo`, and only `POC-PG` for `poc-pg`;
+  - `poc-auth`, which remains paused, returned `200` with the canonical
+    no-evidence answer and zero citations; anonymous ACA access returned `401`;
+  - current guest authorization was revalidated through localhost-only trusted
+    principal emulation against the live Graph, Cosmos, runtime catalog, and
+    retrieval implementation. All four sources returned `200`, the canonical
+    no-evidence answer, and zero citations;
+  - a fresh deployed guest token could not be acquired because the operator no
+    longer has access to that external account. No credential bypass, app-only
+    substitution, or authentication weakening was used. The earlier deployed
+    guest proof remains the end-to-end Easy Auth composition evidence, while
+    the current Graph and live-dependency proof establishes current no-authority
+    behavior; and
+  - the calls used the ACA FQDN directly. The focused gateway-removal tests
+    confirm no Function query route remains.
+- Repository validation (2026-10-18):
+  - 1,406 focused source, routing, ACL, retrieval, auth, Function-gateway,
+    infrastructure, and deployment-contract tests passed;
+  - the complete suite passed 2,705 tests with nine explicitly reported
+    live-environment skips and one dependency deprecation warning;
+  - Ruff fatal/error checks passed; the full optional Ruff ruleset reports
+    existing formatting and modernization debt and was not mass-fixed in T21;
+  - `main.bicep` compiled to external build storage and parsed successfully;
+    and
+  - `git diff --check` passed.
 
 #### T22 - Review and hand off [P0]
 

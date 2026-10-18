@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import hashlib
@@ -14,7 +15,6 @@ from azure.cosmos.exceptions import CosmosResourceNotFoundError
 
 from source_registry import (
     DRIVE_COORDINATOR_ID,
-    SOURCE_RECORD_TYPE,
     SOURCE_SERVING_ID,
     SOURCE_SERVING_RECORD_TYPE,
     SOURCE_SERVING_SCHEMA_VERSION,
@@ -23,6 +23,12 @@ from source_registry import (
     drive_reservation_digest,
     source_binding_digest,
 )
+
+_DOCUMENT_OPERATION_TERMINAL_STATES = frozenset({
+    "succeeded",
+    "failed",
+    "quarantined",
+})
 
 
 class SourceRegistryConflictError(RuntimeError):
@@ -39,13 +45,18 @@ class SourcePlan:
     def source_id(self) -> str:
         return self.source.source_id
 
-    def to_payload(self) -> dict[str, str]:
+    def to_payload(self) -> dict[str, str | bool]:
         return {
             "sourceId": self.source.source_id,
             "siteId": self.source.site_id,
             "siteUrl": self.source.site_url,
             "driveId": self.source.drive_id,
+            "businessName": self.source.business_name,
             "desiredState": self.source.desired_state,
+            "contentScope": self.source.content_scope,
+            "chunksContainer": self.source.chunks_container,
+            "manifestsContainer": self.source.manifests_container,
+            "retrievalAclEnabled": self.source.retrieval_acl_enabled,
             "catalogEtag": self.catalog_etag,
             "bindingDigest": self.binding_digest,
         }
@@ -57,7 +68,6 @@ class SourcePlan:
         source_item = {
             "id": payload.get("sourceId"),
             "sourceId": payload.get("sourceId"),
-            "recordType": SOURCE_RECORD_TYPE,
             "schemaVersion": 1,
             "sourceKind": "sharepoint-drive",
             "desiredState": payload.get("desiredState"),
@@ -65,6 +75,11 @@ class SourcePlan:
                 "siteId": payload.get("siteId"),
                 "siteUrl": payload.get("siteUrl"),
                 "driveId": payload.get("driveId"),
+                "businessName": payload.get("businessName"),
+                "contentScope": payload.get("contentScope"),
+                "chunksContainer": payload.get("chunksContainer"),
+                "manifestsContainer": payload.get("manifestsContainer"),
+                "retrievalAclEnabled": payload.get("retrievalAclEnabled"),
             },
         }
         source = SharePointSource.from_item(source_item)
@@ -75,6 +90,17 @@ class SourcePlan:
         if not isinstance(binding_digest, str) or re.fullmatch(r"[0-9a-f]{64}", binding_digest) is None:
             raise SourceRegistryError("source_plan_binding_invalid")
         return cls(source, catalog_etag, binding_digest)
+
+
+def _same_ingestion_work(
+    current: SourcePlan,
+    expected: SourcePlan,
+) -> bool:
+    return (
+        current.source_id == expected.source_id
+        and current.source.desired_state == expected.source.desired_state
+        and current.binding_digest == expected.binding_digest
+    )
 
 
 @dataclass(frozen=True)
@@ -139,20 +165,46 @@ class SourceRegistryRepository:
         site_id: str,
         site_url: str,
         drive_id: str,
+        business_name: str,
+        content_scope: str,
+        chunks_container: str,
+        manifests_container: str,
+        retrieval_acl_enabled: bool | None,
     ) -> SourcePlan:
         """Create a paused source and accept it; an exact retry completes an interrupted one.
 
         The drive reservation is the uniqueness authority; the pre-check only avoids
         writing a catalog record that acceptance would reject.
         """
+        if retrieval_acl_enabled is None:
+            if content_scope != "common":
+                raise SourceRegistryError("source_retrievalAclEnabled_invalid")
+            retrieval_acl_enabled = False
+        if type(retrieval_acl_enabled) is not bool:
+            raise SourceRegistryError("source_retrievalAclEnabled_invalid")
+        if not isinstance(content_scope, str) or content_scope not in {
+            "business",
+            "common",
+        }:
+            raise SourceRegistryError("source_contentScope_invalid")
+        if content_scope == "common" and retrieval_acl_enabled:
+            raise SourceRegistryError("source_retrievalAclEnabled_invalid")
         body = {
             "id": source_id,
             "sourceId": source_id,
-            "recordType": SOURCE_RECORD_TYPE,
             "schemaVersion": 1,
             "sourceKind": "sharepoint-drive",
             "desiredState": "paused",
-            "config": {"siteId": site_id, "siteUrl": site_url, "driveId": drive_id},
+            "config": {
+                "siteId": site_id,
+                "siteUrl": site_url,
+                "driveId": drive_id,
+                "businessName": business_name,
+                "contentScope": content_scope,
+                "chunksContainer": chunks_container,
+                "manifestsContainer": manifests_container,
+                "retrievalAclEnabled": retrieval_acl_enabled,
+            },
         }
         requested = SharePointSource.from_item(body)
         body["config"]["siteUrl"] = requested.site_url
@@ -165,8 +217,24 @@ class SourceRegistryRepository:
                 raise
             stored = self._sources.read_item(item=source_id, partition_key=source_id)
         source = SharePointSource.from_item(stored)
-        if (source.site_id, source.site_url, source.drive_id) != (
-            requested.site_id, requested.site_url, requested.drive_id,
+        if (
+            source.site_id,
+            source.site_url,
+            source.drive_id,
+            source.business_name,
+            source.content_scope,
+            source.chunks_container,
+            source.manifests_container,
+            source.retrieval_acl_enabled,
+        ) != (
+            requested.site_id,
+            requested.site_url,
+            requested.drive_id,
+            requested.business_name,
+            requested.content_scope,
+            requested.chunks_container,
+            requested.manifests_container,
+            requested.retrieval_acl_enabled,
         ):
             raise SourceRegistryConflictError("source_id_conflict")
         etag = stored.get("_etag")
@@ -174,6 +242,47 @@ class SourceRegistryRepository:
             raise SourceRegistryError("source_catalog_etag_missing")
         return self.accept_source_plan(
             SourcePlan(source, etag, source_binding_digest(source, self._tenant_id))
+        )
+
+    def change_source_business_name(
+        self,
+        *,
+        source_id: str,
+        business_name: str,
+        if_match: str,
+    ) -> tuple[SourcePlan, str]:
+        """Update source display metadata under ETag protection."""
+        try:
+            item = self._sources.read_item(item=source_id, partition_key=source_id)
+        except CosmosResourceNotFoundError as error:
+            raise SourceRegistryError("source_registration_missing") from error
+        source = SharePointSource.from_item(item)
+        if item.get("_etag") != if_match:
+            raise SourceRegistryConflictError("source_etag_mismatch")
+        body = {key: value for key, value in item.items() if not key.startswith("_")}
+        body["config"] = dict(body["config"])
+        body["config"]["businessName"] = business_name
+        requested = SharePointSource.from_item(body)
+        body["config"]["businessName"] = requested.business_name
+        try:
+            item = self._sources.replace_item(
+                item=source_id,
+                body=body,
+                etag=if_match,
+                match_condition=MatchConditions.IfNotModified,
+            )
+        except Exception as error:
+            if getattr(error, "status_code", None) == 412:
+                raise SourceRegistryConflictError("source_etag_mismatch") from error
+            raise
+        updated = SharePointSource.from_item(item)
+        return (
+            SourcePlan(
+                updated,
+                item["_etag"],
+                source_binding_digest(updated, self._tenant_id),
+            ),
+            source.business_name,
         )
 
     def change_source_state(self, *, source_id: str, desired_state: str, if_match: str) -> SourcePlan:
@@ -227,6 +336,36 @@ class SourceRegistryRepository:
             raise SourceRegistryError("source_lifecycle_pending") from error
         return plan
 
+    def change_source_policy(self, *, source_id: str, retrieval_acl_enabled: bool, if_match: str) -> SourcePlan:
+        """Update the retrieval ACL policy for one registered source under ETag protection."""
+        if type(retrieval_acl_enabled) is not bool:
+            raise SourceRegistryError("source_retrievalAclEnabled_invalid")
+        try:
+            item = self._sources.read_item(item=source_id, partition_key=source_id)
+        except CosmosResourceNotFoundError as error:
+            raise SourceRegistryError("source_registration_missing") from error
+        source = SharePointSource.from_item(item)
+        if item.get("_etag") != if_match:
+            raise SourceRegistryConflictError("source_etag_mismatch")
+        if source.content_scope == "common" and retrieval_acl_enabled:
+            raise SourceRegistryError("source_retrievalAclEnabled_invalid")
+        body = {key: value for key, value in item.items() if not key.startswith("_")}
+        body["config"] = dict(body["config"])
+        body["config"]["retrievalAclEnabled"] = retrieval_acl_enabled
+        try:
+            item = self._sources.replace_item(
+                item=source_id,
+                body=body,
+                etag=if_match,
+                match_condition=MatchConditions.IfNotModified,
+            )
+        except Exception as error:
+            if getattr(error, "status_code", None) == 412:
+                raise SourceRegistryConflictError("source_etag_mismatch") from error
+            raise
+        source = SharePointSource.from_item(item)
+        return SourcePlan(source, item["_etag"], source_binding_digest(source, self._tenant_id))
+
     def get_drive_coordinator(self, source_id: str) -> dict[str, Any] | None:
         try:
             return self._ingestion_runs.read_item(
@@ -266,7 +405,7 @@ class SourceRegistryRepository:
         ):
             raise SourceRegistryConflictError("source_not_active")
         current_plan = self.read_source_plan(plan.source_id)
-        if current_plan != plan:
+        if not _same_ingestion_work(current_plan, plan):
             raise SourceRegistryConflictError("source_catalog_changed")
         current = self.get_drive_coordinator(plan.source_id)
         if current is not None:
@@ -278,11 +417,6 @@ class SourceRegistryRepository:
                 if current.get("ownerInstanceId") == owner_instance_id:
                     if current.get("acceptedBindingDigest") != plan.binding_digest:
                         raise SourceRegistryConflictError("drive_coordinator_binding_changed")
-                    if (
-                        current.get("catalogEtag") != plan.catalog_etag
-                        and operation != "audio-poll"
-                    ):
-                        raise SourceRegistryConflictError("drive_coordinator_catalog_changed")
                     return current
                 raise SourceRegistryConflictError("drive_writer_already_active")
         body = {
@@ -391,7 +525,7 @@ class SourceRegistryRepository:
             if reprovision_recovery
             else self.read_source_plan(plan.source_id)
         )
-        if current_plan != plan:
+        if not _same_ingestion_work(current_plan, plan):
             raise SourceRegistryConflictError("source_catalog_changed")
         current = self.get_drive_coordinator(plan.source_id)
         if current is not None:
@@ -400,7 +534,6 @@ class SourceRegistryRepository:
                 and current.get("operation") == operation
                 and current.get("ownerInstanceId") == owner_instance_id
                 and current.get("acceptedBindingDigest") == plan.binding_digest
-                and current.get("catalogEtag") == plan.catalog_etag
                 and self._active_work_count(current) == 0
             ):
                 return current
@@ -950,7 +1083,7 @@ class SourceRegistryRepository:
                     operation_kind,
                 )
                 state = operation.get("state")
-                if state in {"succeeded", "failed"}:
+                if state in _DOCUMENT_OPERATION_TERMINAL_STATES:
                     replay = {
                         "status": "completed",
                         "terminalStatus": state,
@@ -1021,7 +1154,7 @@ class SourceRegistryRepository:
                 item_id,
                 operation_kind,
             )
-            if operation.get("state") in {"succeeded", "failed"}:
+            if operation.get("state") in _DOCUMENT_OPERATION_TERMINAL_STATES:
                 return {
                     "status": "completed",
                     "terminalStatus": operation["state"],
@@ -1049,7 +1182,7 @@ class SourceRegistryRepository:
             self._assert_operation_identity(
                 operation, source_id, physical_run_id, item_id, operation_kind,
             )
-            if operation.get("state") in {"succeeded", "failed"}:
+            if operation.get("state") in _DOCUMENT_OPERATION_TERMINAL_STATES:
                 return {"status": "completed", "outcome": operation.get("outcome")}
             if operation.get("state") in {"running", "unresolved"}:
                 return {"status": "unresolved"}
@@ -1104,7 +1237,10 @@ class SourceRegistryRepository:
         outcome: dict[str, Any],
     ) -> dict[str, Any]:
         """Persist an unresolved or terminal result using the operation ETag."""
-        if status not in {"unresolved", "succeeded", "failed"} or not isinstance(outcome, dict):
+        if (
+            status != "unresolved"
+            and status not in _DOCUMENT_OPERATION_TERMINAL_STATES
+        ) or not isinstance(outcome, dict):
             raise ValueError("document_operation_settlement_invalid")
         for _ in range(3):
             coordinator = self.get_drive_coordinator(source_id)
@@ -1114,7 +1250,7 @@ class SourceRegistryRepository:
             self._assert_operation_identity(
                 operation, source_id, physical_run_id, item_id, operation_kind,
             )
-            if operation.get("state") in {"succeeded", "failed"}:
+            if operation.get("state") in _DOCUMENT_OPERATION_TERMINAL_STATES:
                 if operation.get("state") != status:
                     raise SourceRegistryConflictError("document_operation_terminal_mismatch")
                 return {"status": "completed", "outcome": operation.get("outcome")}
@@ -1134,7 +1270,7 @@ class SourceRegistryRepository:
 
             body = dict(coordinator)
             body.pop("_etag", None)
-            if status in {"succeeded", "failed"}:
+            if status in _DOCUMENT_OPERATION_TERMINAL_STATES:
                 active_count = self._active_work_count(coordinator)
                 if active_count <= 0:
                     raise SourceRegistryConflictError("document_operation_count_invalid")
@@ -1160,7 +1296,9 @@ class SourceRegistryRepository:
                     ),
                 ])
                 return {
-                    "status": "completed" if status in {"succeeded", "failed"} else status,
+                    "status": "completed"
+                    if status in _DOCUMENT_OPERATION_TERMINAL_STATES
+                    else status,
                     "outcome": outcome,
                 }
             except SourceRegistryConflictError:
@@ -1169,7 +1307,9 @@ class SourceRegistryRepository:
                 persisted = self._read_work_item(source_id, operation_id)
                 if persisted is not None and persisted.get("state") == status:
                     return {
-                        "status": "completed" if status in {"succeeded", "failed"} else status,
+                        "status": "completed"
+                        if status in _DOCUMENT_OPERATION_TERMINAL_STATES
+                        else status,
                         "outcome": persisted.get("outcome"),
                     }
                 raise SourceRegistryError("document_operation_settlement_failed") from error
@@ -1410,6 +1550,7 @@ class SourceRegistryRepository:
                 "committedDeltaLink": committed_delta_link,
                 "roundStartKind": "initial" if committed_delta_link is None else "incremental",
                 "roundStartUrl": committed_delta_link,
+                "traversalGeneration": 0,
                 "phase": "enumerating",
                 "state": "active",
                 "createdAt": _utc_timestamp(),
@@ -1432,17 +1573,129 @@ class SourceRegistryRepository:
                     raise SourceRegistryConflictError("delta_round_identity_mismatch")
         raise SourceRegistryConflictError("delta_round_begin_conflict")
 
-    def record_delta_round_reset(
+    def record_delta_round_page(
         self,
         source_id: str,
         round_id: str,
         owner_instance_id: str,
-        reset_location: str,
-    ) -> None:
-        self._update_delta_round(
-            source_id, round_id, owner_instance_id,
-            {"roundStartKind": "reset", "roundStartUrl": reset_location, "phase": "reset"},
-        )
+        receipt_id: str,
+        predecessor_receipt_id: str | None,
+        page_ordinal: int,
+    ) -> dict[str, Any]:
+        receipt = self._read_work_item(source_id, receipt_id)
+        if (
+            receipt is None
+            or receipt.get("recordType") != DELTA_PAGE_RECORD_TYPE
+            or receipt.get("roundId") != round_id
+            or receipt.get("ownerInstanceId") != owner_instance_id
+            or receipt.get("state") != "sealed"
+            or receipt.get("predecessorReceiptId") != predecessor_receipt_id
+            or receipt.get("pageOrdinal") != page_ordinal
+        ):
+            raise SourceRegistryConflictError("delta_round_page_receipt_invalid")
+        round_item_id = _delta_round_item_id(round_id)
+        for _ in range(3):
+            current = self._read_work_item(source_id, round_item_id)
+            if current is None or current.get("roundId") != round_id:
+                raise SourceRegistryConflictError("delta_round_missing")
+            if current.get("ownerInstanceId") != owner_instance_id:
+                raise SourceRegistryConflictError("delta_round_owner_mismatch")
+            if current.get("state") != "active":
+                raise SourceRegistryConflictError("delta_round_not_active")
+            generation = current.get("traversalGeneration", 0)
+            if (
+                isinstance(generation, bool)
+                or not isinstance(generation, int)
+                or generation < 0
+                or receipt.get("traversalGeneration", 0) != generation
+            ):
+                raise SourceRegistryConflictError("delta_round_page_generation_mismatch")
+            if current.get("lastReceiptId") == receipt_id:
+                return current
+            current_receipt_id = current.get("lastReceiptId")
+            current_ordinal = current.get("lastPageOrdinal")
+            if current_receipt_id is None:
+                expected_ordinal = 0
+            elif isinstance(current_ordinal, bool) or not isinstance(current_ordinal, int):
+                raise SourceRegistryError("delta_round_page_ordinal_invalid")
+            else:
+                expected_ordinal = current_ordinal + 1
+            if (
+                current_receipt_id != predecessor_receipt_id
+                or page_ordinal != expected_ordinal
+            ):
+                raise SourceRegistryConflictError("delta_round_page_sequence_invalid")
+            body = dict(current)
+            body.pop("_etag", None)
+            body.update({
+                "lastReceiptId": receipt_id,
+                "lastPageOrdinal": page_ordinal,
+                "phase": "enumerating",
+                "updatedAt": _utc_timestamp(),
+            })
+            try:
+                return self._ingestion_runs.replace_item(
+                    item=round_item_id,
+                    body=body,
+                    etag=current.get("_etag"),
+                    match_condition=MatchConditions.IfNotModified,
+                )
+            except Exception as error:
+                if getattr(error, "status_code", None) not in {409, 412}:
+                    raise SourceRegistryError("delta_round_page_update_failed") from None
+        raise SourceRegistryConflictError("delta_round_page_update_conflict")
+
+    def get_delta_round_page_resume(
+        self,
+        source_id: str,
+        round_id: str,
+        owner_instance_id: str,
+    ) -> dict[str, Any]:
+        round_item = self._read_work_item(source_id, _delta_round_item_id(round_id))
+        if round_item is None or round_item.get("roundId") != round_id:
+            raise SourceRegistryConflictError("delta_round_missing")
+        if round_item.get("ownerInstanceId") != owner_instance_id:
+            raise SourceRegistryConflictError("delta_round_owner_mismatch")
+        receipt_id = round_item.get("lastReceiptId")
+        generation = round_item.get("traversalGeneration", 0)
+        if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
+            raise SourceRegistryError("delta_round_generation_invalid")
+        if receipt_id is None:
+            return {
+                "roundStartKind": round_item.get("roundStartKind"),
+                "roundStartUrl": round_item.get("roundStartUrl"),
+                "traversalGeneration": generation,
+                "receiptId": None,
+                "pageOrdinal": None,
+                "requestUrl": None,
+                "predecessorReceiptId": None,
+                "nextLink": None,
+                "deltaLink": None,
+            }
+        if not isinstance(receipt_id, str) or not receipt_id:
+            raise SourceRegistryError("delta_round_page_receipt_id_invalid")
+        receipt = self._read_work_item(source_id, receipt_id)
+        if (
+            receipt is None
+            or receipt.get("recordType") != DELTA_PAGE_RECORD_TYPE
+            or receipt.get("roundId") != round_id
+            or receipt.get("ownerInstanceId") != owner_instance_id
+            or receipt.get("state") != "sealed"
+            or receipt.get("pageOrdinal") != round_item.get("lastPageOrdinal")
+            or receipt.get("traversalGeneration", 0) != generation
+        ):
+            raise SourceRegistryConflictError("delta_round_page_receipt_invalid")
+        return {
+            "roundStartKind": round_item.get("roundStartKind"),
+            "roundStartUrl": round_item.get("roundStartUrl"),
+            "traversalGeneration": generation,
+            "receiptId": receipt_id,
+            "pageOrdinal": receipt.get("pageOrdinal"),
+            "requestUrl": receipt.get("requestUrl"),
+            "predecessorReceiptId": receipt.get("predecessorReceiptId"),
+            "nextLink": receipt.get("nextLink"),
+            "deltaLink": receipt.get("deltaLink"),
+        }
 
     def mark_delta_round_cursor_ready(
         self,
@@ -1486,7 +1739,7 @@ class SourceRegistryRepository:
             raise ValueError("full_sync_progress_identity_invalid")
         current_plan = self.read_source_plan(plan.source_id)
         bootstrap_required = self.is_reprovision_full_sync_required(plan.source_id)
-        if current_plan != plan or (
+        if not _same_ingestion_work(current_plan, plan) or (
             plan.source.desired_state != "active"
             and not (plan.source.desired_state == "paused" and bootstrap_required)
         ):
@@ -1599,8 +1852,20 @@ class SourceRegistryRepository:
             or not request_url or not round_id or not owner_instance_id
         ):
             raise ValueError("delta_page_capture_request_invalid")
+        round_item = self._read_work_item(plan.source_id, _delta_round_item_id(round_id))
+        if (
+            round_item is None
+            or round_item.get("ownerInstanceId") != owner_instance_id
+            or round_item.get("state") != "active"
+        ):
+            raise SourceRegistryConflictError("delta_round_not_active")
+        generation = round_item.get("traversalGeneration", 0)
+        if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
+            raise SourceRegistryError("delta_round_generation_invalid")
         url_digest = hashlib.sha256(request_url.encode("utf-8")).hexdigest()
-        receipt_id = _delta_page_receipt_id(round_id, page_ordinal, url_digest)
+        receipt_id = _delta_page_receipt_id(
+            round_id, page_ordinal, url_digest, generation,
+        )
         current = self._read_work_item(plan.source_id, receipt_id)
         if current is not None:
             if (
@@ -1608,6 +1873,7 @@ class SourceRegistryRepository:
                 or current.get("pageOrdinal") != page_ordinal
                 or current.get("requestUrlDigest") != url_digest
                 or current.get("predecessorReceiptId") != predecessor_receipt_id
+                or current.get("traversalGeneration", 0) != generation
             ):
                 raise SourceRegistryConflictError("delta_page_receipt_identity_mismatch")
             if current.get("state") == "sealed":
@@ -1630,12 +1896,15 @@ class SourceRegistryRepository:
             body = dict(coordinator)
             body.pop("_etag", None)
             body["updatedAt"] = _utc_timestamp()
+            round_body = dict(round_item)
+            round_body.pop("_etag", None)
             receipt = {
                 "id": receipt_id,
                 "sourceId": plan.source_id,
                 "recordType": DELTA_PAGE_RECORD_TYPE,
                 "schemaVersion": 1,
                 "roundId": round_id,
+                "traversalGeneration": generation,
                 "pageOrdinal": page_ordinal,
                 "requestUrlDigest": url_digest,
                 "requestUrl": request_url,
@@ -1650,6 +1919,10 @@ class SourceRegistryRepository:
                     (
                         "replace", (DRIVE_COORDINATOR_ID, body),
                         {"if_match_etag": coordinator.get("_etag")},
+                    ),
+                    (
+                        "replace", (_delta_round_item_id(round_id), round_body),
+                        {"if_match_etag": round_item.get("_etag")},
                     ),
                     ("create", (receipt,), {}),
                 ])
@@ -1670,35 +1943,76 @@ class SourceRegistryRepository:
         receipt_id: str,
         request_url: str,
         location: str,
+        owner_instance_id: str,
     ) -> None:
         for _ in range(3):
-            current = self._read_work_item(source_id, receipt_id)
-            if current is None or current.get("requestUrl") != request_url:
+            receipt = self._read_work_item(source_id, receipt_id)
+            if receipt is None or receipt.get("requestUrl") != request_url:
                 raise SourceRegistryConflictError("delta_page_receipt_missing")
-            if current.get("state") == "reset":
-                if current.get("resetLocation") != location:
+            round_id = receipt.get("roundId")
+            if not isinstance(round_id, str) or not round_id:
+                raise SourceRegistryError("delta_page_round_id_invalid")
+            round_item_id = _delta_round_item_id(round_id)
+            round_item = self._read_work_item(source_id, round_item_id)
+            if (
+                round_item is None
+                or round_item.get("ownerInstanceId") != owner_instance_id
+                or round_item.get("state") != "active"
+            ):
+                raise SourceRegistryConflictError("delta_round_not_active")
+            receipt_generation = receipt.get("traversalGeneration", 0)
+            round_generation = round_item.get("traversalGeneration", 0)
+            if any(
+                isinstance(value, bool) or not isinstance(value, int) or value < 0
+                for value in (receipt_generation, round_generation)
+            ):
+                raise SourceRegistryError("delta_round_generation_invalid")
+            if receipt.get("state") == "reset":
+                if receipt.get("resetLocation") != location:
                     raise SourceRegistryConflictError("delta_page_reset_location_changed")
-                return
-            if current.get("state") != "capturing":
+                if (
+                    round_generation == receipt_generation + 1
+                    and round_item.get("roundStartKind") == "reset"
+                    and round_item.get("roundStartUrl") == location
+                ):
+                    return
+                raise SourceRegistryConflictError("delta_round_reset_incomplete")
+            if receipt.get("state") not in {"capturing", "sealed"}:
                 raise SourceRegistryConflictError("delta_page_receipt_not_capturing")
-            body = dict(current)
-            body.pop("_etag", None)
-            body.update({
+            if round_generation != receipt_generation:
+                raise SourceRegistryConflictError("delta_round_page_generation_mismatch")
+            receipt_body = dict(receipt)
+            receipt_body.pop("_etag", None)
+            receipt_body.update({
                 "state": "reset",
                 "resetLocation": location,
                 "updatedAt": _utc_timestamp(),
             })
+            round_body = dict(round_item)
+            round_body.pop("_etag", None)
+            round_body.update({
+                "roundStartKind": "reset",
+                "roundStartUrl": location,
+                "traversalGeneration": round_generation + 1,
+                "phase": "reset",
+                "lastReceiptId": None,
+                "lastPageOrdinal": None,
+                "updatedAt": _utc_timestamp(),
+            })
             try:
-                self._ingestion_runs.replace_item(
-                    item=receipt_id,
-                    body=body,
-                    etag=current.get("_etag"),
-                    match_condition=MatchConditions.IfNotModified,
-                )
+                self._execute_work_batch(source_id, [
+                    (
+                        "replace", (receipt_id, receipt_body),
+                        {"if_match_etag": receipt.get("_etag")},
+                    ),
+                    (
+                        "replace", (round_item_id, round_body),
+                        {"if_match_etag": round_item.get("_etag")},
+                    ),
+                ])
                 return
-            except Exception as error:
-                if getattr(error, "status_code", None) not in {409, 412}:
-                    raise SourceRegistryError("delta_page_reset_persist_failed") from None
+            except SourceRegistryConflictError:
+                continue
         raise SourceRegistryConflictError("delta_page_reset_conflict")
 
     def seal_delta_page(
@@ -1754,12 +2068,14 @@ class SourceRegistryRepository:
                     raise SourceRegistryConflictError("delta_page_fragment_conflict") from None
         receipt_id = receipt["id"]
         page_ordinal = receipt["pageOrdinal"]
+        generation = receipt.get("traversalGeneration", 0)
         for entry_ordinal, item in enumerate(items):
             item_id = item.get("id")
             if not isinstance(item_id, str) or not item_id:
                 raise SourceRegistryError("delta_page_item_id_missing")
             self._reduce_delta_item(
-                source_id, receipt["roundId"], page_ordinal, entry_ordinal, item,
+                source_id, receipt["roundId"], generation,
+                page_ordinal, entry_ordinal, item,
             )
         response_data = {
             "items": items,
@@ -1802,19 +2118,26 @@ class SourceRegistryRepository:
         self,
         source_id: str,
         round_id: str,
+        generation: int,
         page_ordinal: int,
         entry_ordinal: int,
         item: dict[str, Any],
     ) -> None:
         item_id = item["id"]
         digest = hashlib.sha256(item_id.encode("utf-8")).hexdigest()
-        state_id = f"delta-item:{hashlib.sha256(round_id.encode('utf-8')).hexdigest()[:16]}:{digest}"
+        generation_scope = "" if generation == 0 else f":g{generation}"
+        state_id = (
+            f"delta-item:{hashlib.sha256(round_id.encode('utf-8')).hexdigest()[:16]}"
+            f"{generation_scope}:{digest}"
+        )
         for _ in range(3):
             current = self._read_work_item(source_id, state_id)
             if current is not None:
                 current_position = (current.get("pageOrdinal", -1), current.get("entryOrdinal", -1))
                 if current.get("roundId") != round_id:
                     raise SourceRegistryConflictError("delta_item_round_mismatch")
+                if current.get("traversalGeneration", 0) != generation:
+                    raise SourceRegistryConflictError("delta_item_generation_mismatch")
                 if current_position >= (page_ordinal, entry_ordinal):
                     return
                 body = dict(current)
@@ -1843,6 +2166,7 @@ class SourceRegistryRepository:
                 "recordType": DELTA_ITEM_RECORD_TYPE,
                 "schemaVersion": 1,
                 "roundId": round_id,
+                "traversalGeneration": generation,
                 "itemId": item_id,
                 "pageOrdinal": page_ordinal,
                 "entryOrdinal": entry_ordinal,
@@ -1858,16 +2182,29 @@ class SourceRegistryRepository:
                     raise SourceRegistryError("delta_item_reduction_failed") from None
         raise SourceRegistryConflictError("delta_item_reduction_conflict")
 
+    def _get_delta_round_generation(self, source_id: str, round_id: str) -> int:
+        round_item = self._read_work_item(source_id, _delta_round_item_id(round_id))
+        if round_item is None or round_item.get("roundId") != round_id:
+            raise SourceRegistryConflictError("delta_round_missing")
+        generation = round_item.get("traversalGeneration", 0)
+        if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
+            raise SourceRegistryError("delta_round_generation_invalid")
+        return generation
+
     def list_reduced_delta_items(self, source_id: str, round_id: str) -> list[dict[str, Any]]:
+        generation = self._get_delta_round_generation(source_id, round_id)
         try:
             iterator = self._ingestion_runs.query_items(
                 query=(
                     "SELECT c.itemId, c.item FROM c WHERE c.recordType = @recordType "
-                    "AND c.roundId = @roundId"
+                    "AND c.roundId = @roundId AND "
+                    "(c.traversalGeneration = @generation OR "
+                    "(@generation = 0 AND NOT IS_DEFINED(c.traversalGeneration)))"
                 ),
                 parameters=[
                     {"name": "@recordType", "value": DELTA_ITEM_RECORD_TYPE},
                     {"name": "@roundId", "value": round_id},
+                    {"name": "@generation", "value": generation},
                 ],
                 partition_key=source_id,
                 max_item_count=100,
@@ -1892,15 +2229,20 @@ class SourceRegistryRepository:
             or isinstance(page_size, bool) or not isinstance(page_size, int) or page_size < 1
         ):
             raise ValueError("delta_reduced_items_page_request_invalid")
+        generation = self._get_delta_round_generation(source_id, round_id)
         try:
             iterator = self._ingestion_runs.query_items(
                 query=(
                     "SELECT c.itemId, c.item FROM c WHERE c.recordType = @recordType "
-                    "AND c.roundId = @roundId ORDER BY c.itemId"
+                    "AND c.roundId = @roundId AND "
+                    "(c.traversalGeneration = @generation OR "
+                    "(@generation = 0 AND NOT IS_DEFINED(c.traversalGeneration))) "
+                    "ORDER BY c.itemId"
                 ),
                 parameters=[
                     {"name": "@recordType", "value": DELTA_ITEM_RECORD_TYPE},
                     {"name": "@roundId", "value": round_id},
+                    {"name": "@generation", "value": generation},
                 ],
                 partition_key=source_id,
                 max_item_count=page_size,
@@ -1918,16 +2260,20 @@ class SourceRegistryRepository:
         return DeltaReducedItemsPage(tuple(items), token)
 
     def has_reduced_delta_item(self, source_id: str, round_id: str, item_id: str) -> bool:
+        generation = self._get_delta_round_generation(source_id, round_id)
         try:
             iterator = self._ingestion_runs.query_items(
                 query=(
                     "SELECT TOP 1 c.id FROM c WHERE c.recordType = @recordType "
-                    "AND c.roundId = @roundId AND c.itemId = @itemId"
+                    "AND c.roundId = @roundId AND c.itemId = @itemId AND "
+                    "(c.traversalGeneration = @generation OR "
+                    "(@generation = 0 AND NOT IS_DEFINED(c.traversalGeneration)))"
                 ),
                 parameters=[
                     {"name": "@recordType", "value": DELTA_ITEM_RECORD_TYPE},
                     {"name": "@roundId", "value": round_id},
                     {"name": "@itemId", "value": item_id},
+                    {"name": "@generation", "value": generation},
                 ],
                 partition_key=source_id,
                 max_item_count=1,
@@ -1939,16 +2285,20 @@ class SourceRegistryRepository:
         return bool(rows)
 
     def count_delta_round_entries(self, source_id: str, round_id: str) -> int:
+        generation = self._get_delta_round_generation(source_id, round_id)
         try:
             iterator = self._ingestion_runs.query_items(
                 query=(
                     "SELECT c.state, c.itemCount FROM c WHERE c.recordType = @recordType "
-                    "AND c.roundId = @roundId AND c.state = @state"
+                    "AND c.roundId = @roundId AND c.state = @state AND "
+                    "(c.traversalGeneration = @generation OR "
+                    "(@generation = 0 AND NOT IS_DEFINED(c.traversalGeneration)))"
                 ),
                 parameters=[
                     {"name": "@recordType", "value": DELTA_PAGE_RECORD_TYPE},
                     {"name": "@roundId", "value": round_id},
                     {"name": "@state", "value": "sealed"},
+                    {"name": "@generation", "value": generation},
                 ],
                 partition_key=source_id,
                 max_item_count=100,
@@ -2291,13 +2641,13 @@ class SourceRegistryRepository:
         if isinstance(page_size, bool) or not isinstance(page_size, int) or page_size < 1:
             raise ValueError("source_inventory_page_size_invalid")
         query = (
-            "SELECT c.id, c.sourceId, c.recordType, c.schemaVersion, c.sourceKind, "
-            "c.desiredState, c.config, c._etag FROM c WHERE c.recordType = @recordType"
+            "SELECT c.id, c.sourceId, c.schemaVersion, c.sourceKind, "
+            "c.desiredState, c.config, c._etag FROM c"
         )
         try:
             iterator = self._sources.query_items(
                 query=query,
-                parameters=[{"name": "@recordType", "value": SOURCE_RECORD_TYPE}],
+                parameters=[],
                 enable_cross_partition_query=True,
                 max_item_count=page_size,
             )
@@ -2360,13 +2710,10 @@ class SourceRegistryRepository:
         try:
             rows = list(self._sources.query_items(
                 query=(
-                    "SELECT TOP 2 c.sourceId FROM c WHERE c.recordType = @recordType "
-                    "AND c.config.driveId = @driveId"
+                    "SELECT TOP 2 c.sourceId FROM c "
+                    "WHERE c.config.driveId = @driveId"
                 ),
-                parameters=[
-                    {"name": "@recordType", "value": SOURCE_RECORD_TYPE},
-                    {"name": "@driveId", "value": drive_id},
-                ],
+                parameters=[{"name": "@driveId", "value": drive_id}],
                 enable_cross_partition_query=True,
                 max_item_count=2,
             ))
@@ -2741,7 +3088,7 @@ class SourceRegistryRepository:
         retired: bool,
     ) -> dict[str, Any]:
         current = self.read_source_plan(plan.source_id)
-        if current.catalog_etag != plan.catalog_etag or current.binding_digest != plan.binding_digest:
+        if not _same_ingestion_work(current, plan):
             raise SourceRegistryConflictError("source_catalog_changed")
         existing = self._read_gate(plan.source_id)
         if existing is not None and existing.get("retired") is True and not retired:
@@ -2791,13 +3138,36 @@ class DeltaPageCapture:
         self._owner_instance_id = owner_instance_id
         self._round_id = round_id
 
+    def resume_state(self) -> dict[str, Any]:
+        return self._repository.get_delta_round_page_resume(
+            self._plan.source_id,
+            self._round_id,
+            self._owner_instance_id,
+        )
+
+    def paging_position(self, request_url: str) -> tuple[int, str | None]:
+        state = self.resume_state()
+        receipt_id = state["receiptId"]
+        if receipt_id is None:
+            round_start_url = state.get("roundStartUrl")
+            if round_start_url is not None and request_url != round_start_url:
+                raise SourceRegistryConflictError("delta_round_resume_url_mismatch")
+            return 0, None
+        if state.get("deltaLink"):
+            if request_url != state.get("requestUrl"):
+                raise SourceRegistryConflictError("delta_round_resume_url_mismatch")
+            return state["pageOrdinal"], state.get("predecessorReceiptId")
+        if not state.get("nextLink") or request_url != state["nextLink"]:
+            raise SourceRegistryConflictError("delta_round_resume_url_mismatch")
+        return state["pageOrdinal"] + 1, receipt_id
+
     def begin_page(
         self,
         request_url: str,
         page_ordinal: int,
         predecessor_receipt_id: str | None,
     ) -> dict[str, Any]:
-        return self._repository.begin_delta_page_capture(
+        state = self._repository.begin_delta_page_capture(
             self._plan,
             self._owner_instance_id,
             self._round_id,
@@ -2805,18 +3175,29 @@ class DeltaPageCapture:
             request_url,
             predecessor_receipt_id,
         )
+        if state.get("state") == "sealed":
+            self._repository.record_delta_round_page(
+                self._plan.source_id,
+                self._round_id,
+                self._owner_instance_id,
+                state["receiptId"],
+                predecessor_receipt_id,
+                page_ordinal,
+            )
+        return state
 
     def record_reset(self, request_url: str, page_ordinal: int, location: str) -> None:
+        generation = self.resume_state()["traversalGeneration"]
         url_digest = hashlib.sha256(request_url.encode("utf-8")).hexdigest()
-        receipt_id = _delta_page_receipt_id(self._round_id, page_ordinal, url_digest)
-        self._repository.record_delta_page_reset(
-            self._plan.source_id, receipt_id, request_url, location,
+        receipt_id = _delta_page_receipt_id(
+            self._round_id, page_ordinal, url_digest, generation,
         )
-        self._repository.record_delta_round_reset(
+        self._repository.record_delta_page_reset(
             self._plan.source_id,
-            self._round_id,
-            self._owner_instance_id,
+            receipt_id,
+            request_url,
             location,
+            self._owner_instance_id,
         )
 
     def seal_page(
@@ -2828,8 +3209,11 @@ class DeltaPageCapture:
         next_link: str | None,
         delta_link: str | None,
     ) -> str:
+        generation = self.resume_state()["traversalGeneration"]
         url_digest = hashlib.sha256(request_url.encode("utf-8")).hexdigest()
-        receipt_id = _delta_page_receipt_id(self._round_id, page_ordinal, url_digest)
+        receipt_id = _delta_page_receipt_id(
+            self._round_id, page_ordinal, url_digest, generation,
+        )
         self._repository.seal_delta_page(
             self._plan.source_id,
             self._owner_instance_id,
@@ -2837,6 +3221,14 @@ class DeltaPageCapture:
             items,
             next_link,
             delta_link,
+        )
+        self._repository.record_delta_round_page(
+            self._plan.source_id,
+            self._round_id,
+            self._owner_instance_id,
+            receipt_id,
+            predecessor_receipt_id,
+            page_ordinal,
         )
         return receipt_id
 
@@ -2873,9 +3265,15 @@ class DeltaPageCapture:
         )
 
 
-def _delta_page_receipt_id(round_id: str, page_ordinal: int, request_url_digest: str) -> str:
+def _delta_page_receipt_id(
+    round_id: str,
+    page_ordinal: int,
+    request_url_digest: str,
+    generation: int = 0,
+) -> str:
+    generation_scope = [] if generation == 0 else [generation]
     identity = json.dumps(
-        [round_id, page_ordinal, request_url_digest],
+        [round_id, *generation_scope, page_ordinal, request_url_digest],
         ensure_ascii=True,
         separators=(",", ":"),
     )
@@ -2897,13 +3295,22 @@ def _delta_page_fragment_id(receipt_id: str, entry_ordinal: int, fragment_ordina
 
 def config_for_source(config: Any, plan: SourcePlan) -> Any:
     """Bind deployment-owned settings to an immutable catalog source plan."""
-    return replace(
-        config,
-        source_id=plan.source.source_id,
-        drive_id=plan.source.drive_id,
-        sharepoint_site_url=plan.source.site_url,
-        sharepoint_site_id=plan.source.site_id,
-    )
+    bound = copy.copy(config)
+    updates = {
+        "source_id": plan.source.source_id,
+        "drive_id": plan.source.drive_id,
+        "sharepoint_site_url": plan.source.site_url,
+        "sharepoint_site_id": plan.source.site_id,
+        "business_name": plan.source.business_name or None,
+        "cosmos_search_chunks_container": plan.source.chunks_container,
+        "cosmos_source_documents_container": plan.source.manifests_container,
+    }
+    for key, value in updates.items():
+        if hasattr(bound, key):
+            object.__setattr__(bound, key, value)
+        else:
+            setattr(bound, key, value)
+    return bound
 
 
 def active_source_payloads(plans: Iterable[SourcePlan]) -> list[dict[str, str]]:

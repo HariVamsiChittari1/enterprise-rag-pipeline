@@ -11,8 +11,8 @@ This document records the approved requirement and target design. It does not
 claim that the application or infrastructure implements the design.
 
 - Requirement status: approved.
-- Design status: implemented and contract-validated; fresh-content cutover is
-  pending.
+- Design status: implemented, fresh-content cut over, and validated through
+  deployed and local source-aware retrieval.
 - Existing SharePoint sites and compatible Azure resources are reused.
 - Azure Functions owns ingestion only.
 - For this milestone, the required retrieval path is direct ACA access from a
