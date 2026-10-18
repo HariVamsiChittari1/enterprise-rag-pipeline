@@ -72,6 +72,95 @@ def test_deployment_controller_has_no_implicit_or_destructive_target() -> None:
     assert "az acr build" in source
     assert "--no-logs --only-show-errors | Out-Null" in source
     assert "--mode Incremental" in source
+    assert "'ContentTopology'" in source
+    assert "function Invoke-ContentTopology" in source
+    assert "'ContentRbac'" in source
+    assert "function Invoke-ContentRbac" in source
+    for phase in (
+        "ExternalAcaCleanup",
+        "ExternalAcaEnvironment",
+        "ExternalAcaServing",
+    ):
+        assert f"'{phase}'" in source
+        assert f"function Invoke-{phase}" in source
+    topology = source[source.index("function Invoke-ContentTopology"):]
+    assert topology.index("az deployment group what-if") < topology.index(
+        "az deployment group create"
+    )
+    content_rbac = source[source.index("function Invoke-ContentRbac"):]
+    assert content_rbac.index("az deployment group what-if") < content_rbac.index(
+        "az deployment group create"
+    )
+    assert "Get-ExpectedUserAssignedIdentity" in content_rbac
+    assert "Assert-ExpectedUserAssignedIdentity" in content_rbac
+    assert '\"rag-$DeploymentInstanceId-functions-mi\"' in content_rbac
+    assert '\"rag-$DeploymentInstanceId-aca-retrieval-mi\"' in content_rbac
+    assert "az functionapp identity show" in content_rbac
+    assert "az containerapp identity show" in content_rbac
+    assert "Get-SingleDeploymentResource 'Microsoft.Web/sites'" in content_rbac
+    assert "Get-SingleDeploymentResource 'Microsoft.Web/sites' 'functionapp'" not in content_rbac
+    assert "$ContentRbacTemplatePath" in content_rbac
+    assert "$ContentRbacParameterPath" in content_rbac
+    cleanup = source[source.index("function Invoke-ExternalAcaCleanup"):]
+    assert cleanup.index("Test-CatalogJob") < cleanup.index(
+        "Remove-ReviewedResource 'Microsoft.App/jobs'"
+    )
+    assert cleanup.index("Remove-ReviewedResource 'Microsoft.App/jobs'") < cleanup.index(
+        "Remove-ReviewedResource 'Microsoft.App/managedEnvironments'"
+    )
+    assert cleanup.index("Remove-ReviewedResource 'Microsoft.App/containerApps'") < cleanup.index(
+        "Remove-ReviewedResource 'Microsoft.App/managedEnvironments'"
+    )
+    assert "Remove-ReviewedResource 'Microsoft.Network/privateDnsZones'" in cleanup
+    assert "az network private-dns zone delete" in source
+    assert "az network private-dns link vnet delete" in source
+    assert '"$ResourceId/virtualNetworkLinks/aca-vnet-link"' in source
+    assert "if ($ResourceType -ceq 'Microsoft.Network/privateDnsZones')" in source
+    assert "Assert-RecoveryImageAvailable" in cleanup
+    assert "if ($ids.Count -eq 0) { return }" in source
+    assert "$attempt -lt 8" in source
+    assert "environmentState.internal -ne $true" in cleanup
+    assert "dnsZone.deploymentInstance -cne $DeploymentInstanceId" in cleanup
+    assert "reviewed cleanup manifest" in cleanup
+    external_environment = source[
+        source.index("function Invoke-ExternalAcaEnvironment"):
+        source.index("function Invoke-ExternalAcaServing")
+    ]
+    external_serving = source[
+        source.index("function Invoke-ExternalAcaServing"):
+        source.index("function Invoke-OperationsInfrastructure")
+    ]
+    assert "Invoke-GuardedGroupDeployment" in external_environment
+    assert '--name "$DeploymentName-preview"' in source
+    assert "external-aca-environment" in external_environment
+    assert "Test-CatalogJob" not in external_serving
+    assert "external-aca-serving" in external_serving
+    assert "Test-ExternalAcaServing" in external_serving
+    assert "anonymous request" in source
+    assert "public IPv4 address" in source
+    assert "Test-PublicIpv4Address $staticIp" in source
+    assert "healthState -cne 'Healthy'" in source
+    assert "Assert-ApprovedRetrievalImageReference" in source
+    assert "Get-ReviewedContainerRegistry" in source
+    assert "Assert-RecoveryImageAvailable" in source
+    assert "az acr repository show" in source
+    assert "'ExpectedAcrName' $ExpectedAcrName" in source
+    assert "roleDefinitionName=='AcrPull'" in source
+    assert "RETRIEVAL_IMAGE_DIGEST" in source
+    assert "Get-ReviewedResourceIfPresent" in source
+    assert "Assert-ExternalAcaAppOwnership" in source
+    app_ownership = source[
+        source.index("function Assert-ExternalAcaAppOwnership"):
+        source.index("function Set-ExternalAcaServingEnvironment")
+    ]
+    assert "$app.id -ine $expectedAppId" in app_ownership
+    assert "$app.environmentId -ine $env:MANAGED_ENVIRONMENT_ID" in app_ownership
+    assert "$app.image -cne $env:RETRIEVAL_IMAGE_REFERENCE" not in app_ownership
+    assert "az containerapp auth show" in source
+    assert "entraProvider:identityProviders.azureActiveDirectory.enabled" in source
+    assert "$Auth.entraProvider -ne $true" in source
+    assert "External retrieval Easy Auth does not match the reviewed policy." in source
+    assert "Cognitive Services OpenAI User" in source
     assert "az group create" not in source
     assert "azd down" not in source
     assert "az ad " not in source
@@ -86,6 +175,14 @@ def test_deployment_controller_has_no_implicit_or_destructive_target() -> None:
     assert "'Operations'" in source
     assert "'CatalogVerify'" in source
     assert "'OperationsCleanup'" in source
+    assert "function Assert-RetrievalCaller" in source
+    assert "isFallbackPublicClient" in source
+    assert "passwordCredentials" in source
+    assert "keyCredentials" in source
+    assert "requiredResourceAccess" in source
+    assert "oauth2PermissionGrants" in source
+    assert "consentType -ceq 'AllPrincipals'" in source
+    assert "Assert-RetrievalCaller" in source[source.index("Import-AzdEnvironment"):]
     assert "az containerapp job start" in source
     assert "az containerapp job execution show" in source
     assert "az containerapp job delete" in source
@@ -101,9 +198,9 @@ def test_deployment_controller_has_no_implicit_or_destructive_target() -> None:
     assert "SUBNET_FUNCTION_INTEGRATION_NSG_ID" in source
     assert "SUBNET_PRIVATE_ENDPOINTS_NSG_ID" in source
     assert "SUBNET_ACA_ENVIRONMENT_NSG_ID" in source
-    assert "[bool]$AclEnabled = $true" in source
-    assert "$env:ACL_ENABLED = $AclEnabled.ToString().ToLowerInvariant()" in source
-    assert "param aclEnabled = readEnvironmentVariable('ACL_ENABLED', 'true') == 'true'" in parameters
+    assert "$AclEnabled" not in source
+    assert "ACL_ENABLED" not in source
+    assert "ACL_ENABLED" not in parameters
     assert "[bool]$IncludeCitations = $true" in source
     assert "$env:INCLUDE_CITATIONS = $IncludeCitations.ToString().ToLowerInvariant()" in source
     assert "includeCitations: includeCitations" in (PROJECT_ROOT / "infra" / "main.bicep").read_text(encoding="utf-8")
@@ -524,15 +621,19 @@ def test_function_target_uses_explicit_yaml_binding() -> None:
 
 @pytest.mark.parametrize(
     "case",
-    ["valid", "valid_1340", "missing_app", "invalid_app", "version", "missing", "blank", "whitespace",
-     "multiple", "subscription", "group", "app"],
+    [
+        "valid", "valid_1340", "missing_app", "invalid_app", "version", "missing", "blank",
+        "whitespace", "multiple", "subscription", "group", "app", "azure_failure", "resource_id",
+        "kind", "instance_tag", "service_tag", "identity_type", "identity_count", "identity_id",
+    ],
 )
-def test_function_target_fails_closed_without_cloud_calls(case: str) -> None:
+def test_function_target_fails_closed_against_live_resource(case: str) -> None:
     body = r"""
 $FunctionAppName = 'synthetic-app'
 $SubscriptionId = '11111111-1111-4111-8111-111111111111'
 $ResourceGroup = 'synthetic-group'
 $AzdEnvironment = 'synthetic-env'
+$DeploymentInstanceId = 'synthetic-instance'
 $case = 'CASE'
 if ($case -eq 'missing_app') { $FunctionAppName = '' }
 if ($case -eq 'invalid_app') { $FunctionAppName = 'app/slots/staging' }
@@ -567,6 +668,28 @@ function azd {
         default { throw 'Unexpected setting' }
     }
 }
+function az {
+    if (($args[0..1] -join ' ') -ne 'functionapp show') { throw 'Unexpected Azure call' }
+    $global:LASTEXITCODE = 0
+    if ($case -eq 'azure_failure') { $global:LASTEXITCODE = 1; return '' }
+    $expectedAppId = "/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroup/providers/Microsoft.Web/sites/$FunctionAppName"
+    $expectedIdentityId = "/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroup/providers/Microsoft.ManagedIdentity/userAssignedIdentities/rag-$DeploymentInstanceId-functions-mi"
+    $identityId = if ($case -eq 'identity_id') { "$expectedIdentityId-wrong" } else { $expectedIdentityId }
+    $identities = [ordered]@{ $identityId = @{} }
+    if ($case -eq 'identity_count') { $identities['extra'] = @{} }
+    [ordered]@{
+        id = if ($case -eq 'resource_id') { "$expectedAppId-wrong" } else { $expectedAppId }
+        kind = if ($case -eq 'kind') { 'app,linux' } else { 'functionapp,linux' }
+        tags = [ordered]@{
+            DeploymentInstance = if ($case -eq 'instance_tag') { 'wrong' } else { $DeploymentInstanceId }
+            'azd-service-name' = if ($case -eq 'service_tag') { 'wrong' } else { 'rag-functions' }
+        }
+        identity = [ordered]@{
+            type = if ($case -eq 'identity_type') { 'SystemAssigned' } else { 'UserAssigned' }
+            userAssignedIdentities = $identities
+        }
+    } | ConvertTo-Json -Depth 6
+}
 Assert-FunctionTarget
 if ($script:reads -ne 3) { throw 'Bindings were not all checked' }
 Write-Output 'verified'
@@ -579,8 +702,29 @@ Write-Output 'verified'
         assert result.returncode != 0
         assert any(message in result.stderr for message in (
             "FunctionAppName", "reviewed azd version", "does not match the reviewed Function target",
+            "Unable to resolve the reviewed live Function target",
+            "Live Function resource does not match the reviewed target identity",
         ))
     assert "Unexpected Azure call" not in result.stderr
+    assert "Unexpected azd call" not in result.stderr
+
+
+@pytest.mark.parametrize("case", ["missing_path", "missing_hash"])
+def test_function_deployment_requires_reviewed_package(case: str) -> None:
+    body = r"""
+$ProjectRoot = (Get-Location).Path
+$FunctionPackagePath = if ('CASE' -eq 'missing_path') { '' } else { 'candidate.zip' }
+$ExpectedFunctionPackageHash = if ('CASE' -eq 'missing_hash') { '' } else { '0' * 64 }
+$Execute = $false
+function Assert-FunctionTarget {}
+Invoke-FunctionDeployment
+""".replace("CASE", case)
+    result = _run_controller_functions(body)
+    assert result.returncode != 0
+    expected = "FunctionPackagePath is required" if case == "missing_path" else (
+        "ExpectedFunctionPackageHash is required"
+    )
+    assert expected in result.stderr
     assert "Unexpected azd call" not in result.stderr
 
 
@@ -704,10 +848,30 @@ def test_catalog_poll_defaults_only_when_absent() -> None:
     assert result.stdout.strip() == "7200"
 
 
+def test_external_auth_policy_rejects_disabled_entra_provider() -> None:
+    result = _run_controller_functions(r"""
+$auth = [pscustomobject]@{
+    platform = $true
+    entraProvider = $false
+    unauthenticated = 'Return401'
+    requireHttps = $true
+    clientId = 'api-client'
+    issuer = 'https://login.microsoftonline.com/tenant/v2.0'
+    audiences = @('api-client')
+    applications = @('caller-client')
+}
+Assert-ExternalAcaAuthPolicy `
+    $auth 'api-client' 'caller-client' 'https://login.microsoftonline.com/tenant/v2.0'
+""")
+    assert result.returncode != 0
+    assert "Easy Auth does not match the reviewed policy" in result.stderr
+
+
 @pytest.mark.parametrize("configured", ["absent", "blank"])
-def test_azd_poll_import_preserves_explicit_process_value_or_rejects_blank(configured: str) -> None:
+def test_azd_poll_import_clears_process_value_or_rejects_blank(configured: str) -> None:
     body = r"""
 $AzdEnvironment = 'synthetic-environment'
+$TenantId = '00000000-0000-0000-0000-000000000001'
 $env:RETRIEVAL_CATALOG_POLL_SECONDS = '90'
 function azd {
     $global:LASTEXITCODE = EXIT_CODE
@@ -720,14 +884,30 @@ Write-Output $env:RETRIEVAL_CATALOG_POLL_SECONDS
     result = _run_controller_functions(body)
     if configured == "absent":
         assert result.returncode == 0, result.stderr
-        assert result.stdout.strip() == "90"
+        assert result.stdout.strip() == "7200"
     else:
         assert result.returncode != 0
         assert "must not be blank" in result.stderr
 
 
+def test_azd_import_removes_absent_optional_setting() -> None:
+    result = _run_controller_functions(r"""
+$AzdEnvironment = 'synthetic-environment'
+$TenantId = '00000000-0000-0000-0000-000000000001'
+$env:COSMOS_METADATA_AUTOSCALE_MAX_RUS = '2000'
+function azd {
+    $global:LASTEXITCODE = 1
+    return ''
+}
+Import-AzdEnvironment
+Write-Output (Test-Path Env:COSMOS_METADATA_AUTOSCALE_MAX_RUS)
+""")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "False"
+
+
 @pytest.mark.parametrize("operation", ["verify-catalog", "publish-catalog"])
-def test_final_preview_requires_read_only_verification_without_mutation(operation: str) -> None:
+def test_final_preview_is_read_only_without_catalog_job_dependency(operation: str) -> None:
     body = r"""
 $CatalogOperation = 'OPERATION'
 $Execute = $false
@@ -737,13 +917,12 @@ $ResourceGroup = 'synthetic-group'
 $TemplatePath = 'synthetic-template'
 $ParameterPath = 'synthetic-parameters'
 $env:RETRIEVAL_IMAGE_REFERENCE = 'registry.example/app@sha256:' + ('a' * 64)
-$script:verified = $false
 function Assert-RequiredEnvironment {}
 function Set-ParameterEnvironment {}
-function Test-CatalogJob { $script:verified = $true }
+function Test-CatalogJob { throw 'Serving preview must not depend on catalog job history' }
 function az {
-    if (($args[0..2] -join ' ') -ne 'deployment group what-if' -or -not $script:verified) {
-        throw 'Mutation or preview without verification'
+    if (($args[0..2] -join ' ') -ne 'deployment group what-if') {
+        throw 'Unexpected mutation'
     }
     $global:LASTEXITCODE = 0
     Write-Output 'preview-only'
@@ -751,12 +930,8 @@ function az {
 Invoke-InfrastructurePhase -Serving $true -Operations $false
 """.replace("OPERATION", operation)
     result = _run_controller_functions(body)
-    if operation == "verify-catalog":
-        assert result.returncode == 0, result.stderr
-        assert result.stdout.strip() == "preview-only"
-    else:
-        assert result.returncode != 0
-        assert "requires a read-only" in result.stderr
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "preview-only"
 
 
 def test_redeployment_catalog_preview_does_not_read_seed_or_start_job() -> None:
@@ -786,7 +961,7 @@ Invoke-CatalogJob
     assert "differs from the reviewed catalog file" in result.stderr
 
 
-@pytest.mark.parametrize("mismatch", ["none", "image", "operation", "partition", "endpoint", "database", "container", "identity"])
+@pytest.mark.parametrize("mismatch", ["none", "image", "operation", "endpoint", "database", "container", "identity"])
 def test_catalog_container_checks_actual_execution_identity(mismatch: str) -> None:
     body = r"""
 $env:RETRIEVAL_IMAGE_REFERENCE = 'registry.example/app@sha256:' + ('a' * 64)
@@ -795,7 +970,6 @@ $container = [pscustomobject]@{
     name = 'catalog-publisher'; image = $env:RETRIEVAL_IMAGE_REFERENCE
     command = @('python'); args = @('-m', 'retrieval.operations', 'verify-catalog')
     env = @(
-        [pscustomobject]@{ name = 'DEPLOYMENT_INSTANCE_ID'; value = $DeploymentInstanceId }
         [pscustomobject]@{ name = 'COSMOS_ENDPOINT'; value = $env:COSMOS_ENDPOINT }
         [pscustomobject]@{ name = 'COSMOS_DATABASE'; value = 'rag-db' }
         [pscustomobject]@{ name = 'RETRIEVAL_CONFIG_CONTAINER'; value = 'retrieval-config' }
@@ -807,11 +981,10 @@ $container = [pscustomobject]@{
         "none": "",
         "image": "$container.image = 'registry.example/app@sha256:' + ('b' * 64)",
         "operation": "$container.args[2] = 'publish-catalog'",
-        "partition": "$container.env[0].value = 'other-instance'",
-        "endpoint": "$container.env[1].value = 'https://other.documents.azure.com:443/'",
-        "database": "$container.env[2].value = 'other-db'",
-        "container": "$container.env[3].value = 'other-container'",
-        "identity": "$container.env[4].value = 'other-client'",
+        "endpoint": "$container.env[0].value = 'https://other.documents.azure.com:443/'",
+        "database": "$container.env[1].value = 'other-db'",
+        "container": "$container.env[2].value = 'other-container'",
+        "identity": "$container.env[3].value = 'other-client'",
     }
     result = _run_controller_functions(body + mutations[mismatch] + "\nAssert-CatalogContainer @($container)")
     if mismatch == "none":
@@ -849,7 +1022,6 @@ function az {
                 name = 'catalog-publisher'; image = $image; command = @('python')
                 args = @('-m', 'retrieval.operations', 'verify-catalog')
                 env = @(
-                    @{ name = 'DEPLOYMENT_INSTANCE_ID'; value = $DeploymentInstanceId }
                     @{ name = 'COSMOS_ENDPOINT'; value = $env:COSMOS_ENDPOINT }
                     @{ name = 'COSMOS_DATABASE'; value = 'rag-db' }
                     @{ name = 'RETRIEVAL_CONFIG_CONTAINER'; value = 'retrieval-config' }

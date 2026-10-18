@@ -13,7 +13,8 @@
 param(
     [Parameter(Mandatory)]
     [ValidateSet(
-        'Authority', 'Foundation', 'Build', 'Operations', 'Catalog', 'CatalogVerify',
+        'Authority', 'Foundation', 'ContentTopology', 'ContentRbac', 'ExternalAcaCleanup',
+        'ExternalAcaEnvironment', 'ExternalAcaServing', 'Build', 'Operations', 'Catalog', 'CatalogVerify',
         'OperationsCleanup', 'Final', 'Function', 'FunctionPackage'
     )]
     [string]$Phase,
@@ -30,12 +31,18 @@ param(
     [string]$Location,
     [string]$AzdEnvironment,
     [string]$DeploymentInstanceId,
+    [string]$ExpectedAcrName,
+    [string]$ExpectedAcaEnvironmentName,
+    [string]$ExpectedRetrievalAppName,
+    [string]$ExpectedAcaPrivateDnsZone,
+    [string]$ExpectedAcaInternalStaticIp,
+    [string]$ExpectedRetrievalImageReference,
+    [string]$ExpectedCatalogImageReference,
     [bool]$DocumentIntelligenceEnabled = $true,
     [bool]$ContentUnderstandingEnabled = $false,
     [bool]$AudioWriterEnabled = $false,
     [ValidateSet('en-US', 'en-GB', 'en-IN')]
     [string]$AudioLocale = 'en-US',
-    [bool]$AclEnabled = $true,
     [bool]$IncludeCitations = $true,
     [string]$ContentUnderstandingAnalyzerId = 'prebuilt-documentSearch',
     [string]$TemporaryContentUnderstandingClientIp,
@@ -53,6 +60,14 @@ $ProjectRoot = Split-Path -Parent $PSScriptRoot
 $PlanPath = Join-Path $ProjectRoot '.azure/deployment-plan.md'
 $TemplatePath = Join-Path $ProjectRoot 'infra/main.bicep'
 $ParameterPath = Join-Path $ProjectRoot 'infra/main.parameters.bicepparam'
+$ContentTopologyTemplatePath = Join-Path $ProjectRoot 'infra/modules/cosmos-content-topology.bicep'
+$ContentTopologyParameterPath = Join-Path $ProjectRoot 'infra/content-topology.parameters.bicepparam'
+$ContentRbacTemplatePath = Join-Path $ProjectRoot 'infra/modules/cosmos-content-rbac.bicep'
+$ContentRbacParameterPath = Join-Path $ProjectRoot 'infra/content-rbac.parameters.bicepparam'
+$ExternalAcaEnvironmentTemplatePath = Join-Path $ProjectRoot 'infra/modules/external-aca-environment.bicep'
+$ExternalAcaEnvironmentParameterPath = Join-Path $ProjectRoot 'infra/external-aca-environment.parameters.bicepparam'
+$ExternalAcaServingTemplatePath = Join-Path $ProjectRoot 'infra/modules/external-aca-serving.bicep'
+$ExternalAcaServingParameterPath = Join-Path $ProjectRoot 'infra/external-aca-serving.parameters.bicepparam'
 $ContentUnderstandingAccessParameterPath = Join-Path $ProjectRoot 'infra/content-understanding-access.parameters.bicepparam'
 $OperationsTemplatePath = Join-Path $ProjectRoot 'infra/modules/aca-operations-job.bicep'
 $OperationsParameterPath = Join-Path $ProjectRoot 'infra/operations.parameters.bicepparam'
@@ -246,6 +261,27 @@ function Assert-FunctionTarget {
             throw "Stored azd $key does not match the reviewed Function target."
         }
     }
+
+    $app = az functionapp show `
+        --subscription $SubscriptionId `
+        --resource-group $ResourceGroup `
+        --name $appName `
+        --output json `
+        --only-show-errors | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 0 -or $null -eq $app) {
+        throw 'Unable to resolve the reviewed live Function target.'
+    }
+    $expectedAppId = "/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroup/providers/Microsoft.Web/sites/$appName"
+    $expectedIdentityId = "/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroup/providers/Microsoft.ManagedIdentity/userAssignedIdentities/rag-$DeploymentInstanceId-functions-mi"
+    $identityIds = @($app.identity.userAssignedIdentities.PSObject.Properties.Name)
+    if ($app.id -ine $expectedAppId -or
+        @($app.kind -split ',') -inotcontains 'functionapp' -or
+        $app.tags.DeploymentInstance -cne $DeploymentInstanceId -or
+        $app.tags.'azd-service-name' -cne 'rag-functions' -or
+        $app.identity.type -cne 'UserAssigned' -or
+        $identityIds.Count -ne 1 -or $identityIds[0] -ine $expectedIdentityId) {
+        throw 'Live Function resource does not match the reviewed target identity.'
+    }
 }
 
 function Invoke-FunctionDeployment {
@@ -253,27 +289,27 @@ function Invoke-FunctionDeployment {
     Push-Location $ProjectRoot
     try {
         Assert-FunctionTarget
-        $package = $null
-        $packagePath = $null
-        if (-not [string]::IsNullOrEmpty($FunctionPackagePath) -or
-            -not [string]::IsNullOrEmpty($ExpectedFunctionPackageHash)) {
-            $package = Test-FunctionPackage
-            $packagePath = (Resolve-Path -LiteralPath $FunctionPackagePath).Path
-            $packageStream = [IO.File]::Open($packagePath, [IO.FileMode]::Open,
-                [IO.FileAccess]::Read, [IO.FileShare]::Read)
-            $lockedHash = (Get-FileHash -InputStream $packageStream -Algorithm SHA256).Hash.ToLowerInvariant()
-            if ($lockedHash -cne $package.packageHash) { throw 'Function package changed after validation.' }
-        }
+        $package = Test-FunctionPackage
+        $packagePath = (Resolve-Path -LiteralPath $FunctionPackagePath).Path
+        $packageStream = [IO.File]::Open($packagePath, [IO.FileMode]::Open,
+            [IO.FileAccess]::Read, [IO.FileShare]::Read)
+        $lockedHash = (Get-FileHash -InputStream $packageStream -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($lockedHash -cne $package.packageHash) { throw 'Function package changed after validation.' }
         if (-not $Execute) {
-            $preview = [ordered]@{ action = 'preview'; service = 'rag-functions'; environment = $AzdEnvironment }
-            if ($null -ne $package) { $preview.packageHash = $package.packageHash }
-            $preview | ConvertTo-Json -Compress
+            [ordered]@{
+                action      = 'preview'
+                service     = 'rag-functions'
+                environment = $AzdEnvironment
+                packageHash = $package.packageHash
+            } | ConvertTo-Json -Compress
             return
         }
         Assert-Authority -Authority (Get-Authority) | Out-Null
         Assert-FunctionTarget
-        $arguments = @('deploy', 'rag-functions', '--environment', $AzdEnvironment, '--no-prompt')
-        if ($null -ne $packagePath) { $arguments += @('--from-package', $packagePath) }
+        $arguments = @(
+            'deploy', 'rag-functions', '--environment', $AzdEnvironment,
+            '--no-prompt', '--from-package', $packagePath
+        )
         azd @arguments
         if ($LASTEXITCODE -ne 0) { throw 'Function deployment failed.' }
     }
@@ -316,11 +352,81 @@ function Assert-RequiredEnvironment {
         'INGESTION_SOURCE_ID', 'ADMIN_API_CLIENT_ID', 'FUNCTION_API_AUDIENCE',
         'RETRIEVAL_API_CLIENT_ID', 'RETRIEVAL_API_AUDIENCE',
         'RETRIEVAL_API_SERVICE_PRINCIPAL_ID',
+        'RETRIEVAL_ALLOWED_CALLER_CLIENT_ID',
         'FUNCTION_ALLOWED_CALLER_CLIENT_ID', 'WEBHOOK_CLIENT_STATE',
         'COST_CENTER', 'CLEANUP_DATE'
     )
     $missing = @($required | Where-Object { [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($_)) })
     if ($missing.Count -gt 0) { throw "Required deployment settings are missing: $($missing -join ', ')" }
+}
+
+function Assert-RetrievalCaller {
+    $clientId = [Environment]::GetEnvironmentVariable('RETRIEVAL_ALLOWED_CALLER_CLIENT_ID')
+    $apiClientId = [Environment]::GetEnvironmentVariable('RETRIEVAL_API_CLIENT_ID')
+    $guidPattern = '^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+    if ($clientId -cnotmatch $guidPattern -or $apiClientId -cnotmatch $guidPattern) {
+        throw 'Retrieval API and allowed caller client IDs must be canonical lowercase GUIDs.'
+    }
+
+    function Get-GraphCollection {
+        param([string]$Resource, [string]$Filter)
+        $encodedFilter = [Uri]::EscapeDataString($Filter)
+        $url = "https://graph.microsoft.com/v1.0/$Resource`?`$filter=$encodedFilter"
+        $result = az rest --method get --url $url --only-show-errors 2>$null
+        if ($LASTEXITCODE -ne 0) { throw "Unable to validate retrieval identity resource $Resource." }
+        return @(($result -join "`n" | ConvertFrom-Json).value)
+    }
+
+    $clientApps = Get-GraphCollection -Resource 'applications' `
+        -Filter "appId eq '$clientId'"
+    if ($clientApps.Count -ne 1) { throw 'Approved retrieval caller application was not found exactly once.' }
+    $client = $clientApps[0]
+    if (
+        $client.appId -cne $clientId -or
+        $client.signInAudience -cne 'AzureADMyOrg' -or
+        $client.isFallbackPublicClient -ne $true -or
+        @($client.passwordCredentials).Count -ne 0 -or
+        @($client.keyCredentials).Count -ne 0
+    ) {
+        throw 'Approved retrieval caller must be a secretless single-tenant public client.'
+    }
+
+    $apiApps = Get-GraphCollection -Resource 'applications' `
+        -Filter "appId eq '$apiClientId'"
+    if ($apiApps.Count -ne 1) { throw 'Retrieval API application was not found exactly once.' }
+    $scopes = @($apiApps[0].api.oauth2PermissionScopes | Where-Object {
+        $_.value -ceq 'user_impersonation' -and $_.isEnabled -eq $true
+    })
+    if ($scopes.Count -ne 1) { throw 'Retrieval API must expose one enabled user_impersonation scope.' }
+    $scopeId = $scopes[0].id
+    $required = @($client.requiredResourceAccess)
+    $access = if ($required.Count -eq 1) { @($required[0].resourceAccess) } else { @() }
+    if (
+        $required.Count -ne 1 -or
+        $required[0].resourceAppId -cne $apiClientId -or
+        $access.Count -ne 1 -or
+        $access[0].id -cne $scopeId -or
+        $access[0].type -cne 'Scope'
+    ) {
+        throw 'Approved retrieval caller must request only the retrieval user_impersonation scope.'
+    }
+
+    $clientPrincipals = Get-GraphCollection -Resource 'servicePrincipals' `
+        -Filter "appId eq '$clientId'"
+    $apiPrincipals = Get-GraphCollection -Resource 'servicePrincipals' `
+        -Filter "appId eq '$apiClientId'"
+    if ($clientPrincipals.Count -ne 1 -or $apiPrincipals.Count -ne 1) {
+        throw 'Retrieval caller and API service principals must each resolve exactly once.'
+    }
+    $grants = Get-GraphCollection -Resource 'oauth2PermissionGrants' `
+        -Filter "clientId eq '$($clientPrincipals[0].id)' and resourceId eq '$($apiPrincipals[0].id)'"
+    $approved = @($grants | Where-Object {
+        $_.consentType -ceq 'AllPrincipals' -and
+        @($_.scope -split ' ') -ccontains 'user_impersonation'
+    })
+    if ($approved.Count -ne 1) {
+        throw 'Retrieval user_impersonation must have tenant-wide admin consent for the approved caller.'
+    }
 }
 
 function Import-AzdEnvironment {
@@ -334,6 +440,7 @@ function Import-AzdEnvironment {
         'ADMIN_API_CLIENT_ID', 'FUNCTION_API_AUDIENCE',
         'RETRIEVAL_API_CLIENT_ID', 'RETRIEVAL_API_AUDIENCE',
         'RETRIEVAL_API_SERVICE_PRINCIPAL_ID',
+        'RETRIEVAL_ALLOWED_CALLER_CLIENT_ID',
         'FUNCTION_ALLOWED_CALLER_CLIENT_ID', 'WEBHOOK_CLIENT_STATE',
         'COSMOS_DB_MODE', 'COSMOS_METADATA_AUTOSCALE_MAX_RUS',
         'COSMOS_SEARCH_AUTOSCALE_MAX_RUS', 'STORAGE_REDUNDANCY',
@@ -345,6 +452,7 @@ function Import-AzdEnvironment {
         'CATALOG_WRITER_PRINCIPAL_ID', 'CATALOG_OBSERVER_PRINCIPAL_ID'
     )
     foreach ($name in $names) {
+        Remove-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue
         $value = azd env get-value $name --environment $AzdEnvironment 2>$null
         if ($name -eq 'RETRIEVAL_CATALOG_POLL_SECONDS') {
             if ($LASTEXITCODE -eq 0 -and [string]::IsNullOrWhiteSpace($value)) {
@@ -359,11 +467,12 @@ function Import-AzdEnvironment {
             [Environment]::SetEnvironmentVariable($name, $value.Trim(), 'Process')
         }
     }
+    $env:ENTRA_API_TENANT_ID = $TenantId
 }
 
 function Set-CatalogEnvironment {
     $pollValue = [Environment]::GetEnvironmentVariable('RETRIEVAL_CATALOG_POLL_SECONDS')
-    if ($null -eq $pollValue) { $pollValue = '7200' }
+    if ([string]::IsNullOrEmpty($pollValue)) { $pollValue = '7200' }
     $pollSeconds = 0
     if ($pollValue -notmatch '^[0-9]+$' -or
         -not [int]::TryParse($pollValue, [ref]$pollSeconds) -or
@@ -395,7 +504,6 @@ function Set-ParameterEnvironment {
     $env:CONTENT_UNDERSTANDING_ENABLED = $ContentUnderstandingEnabled.ToString().ToLowerInvariant()
     $env:AUDIO_WRITER_ENABLED = $AudioWriterEnabled.ToString().ToLowerInvariant()
     $env:AUDIO_LOCALE = $AudioLocale
-    $env:ACL_ENABLED = $AclEnabled.ToString().ToLowerInvariant()
     $env:INCLUDE_CITATIONS = $IncludeCitations.ToString().ToLowerInvariant()
     $env:CONTENT_UNDERSTANDING_ANALYZER_ID = Get-RequiredValue `
         'ContentUnderstandingAnalyzerId' $ContentUnderstandingAnalyzerId
@@ -658,24 +766,83 @@ function Set-OperationsEnvironment {
     if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($cosmosEndpoint)) {
         throw 'The Cosmos DB endpoint could not be resolved.'
     }
-    $registryName = Get-RequiredValue 'ACR_NAME' $env:ACR_NAME
-    $registry = az acr show `
-        --subscription $SubscriptionId `
-        --resource-group $ResourceGroup `
-        --name $registryName `
-        --output json `
-        --only-show-errors | ConvertFrom-Json
-    if ($LASTEXITCODE -ne 0 -or $registry.tags.DeploymentInstance -ne $DeploymentInstanceId) {
-        throw 'The container registry does not match the reviewed deployment instance.'
-    }
-    $jobStem = ("rag-$DeploymentInstanceId" -replace '-', '')
-    $jobStem = $jobStem.Substring(0, [Math]::Min(19, $jobStem.Length))
-    $env:OPERATIONS_JOB_NAME = "$jobStem-catalog-job"
+    $registry = Get-ReviewedContainerRegistry
+    Assert-RecoveryImageAvailable `
+        $registry $env:RETRIEVAL_IMAGE_REFERENCE $identity.principalId | Out-Null
+    $env:OPERATIONS_JOB_NAME = Get-ExpectedOperationsJobName
     $env:MANAGED_ENVIRONMENT_ID = $managedEnvironment.id
     $env:ACR_LOGIN_SERVER = $registry.loginServer
     $env:OPERATIONS_MANAGED_IDENTITY_ID = $identity.id
     $env:OPERATIONS_MANAGED_IDENTITY_CLIENT_ID = $identity.clientId
     $env:COSMOS_ENDPOINT = $cosmosEndpoint.Trim()
+}
+
+function Assert-ApprovedRetrievalImageReference {
+    param(
+        [string]$ImageReference,
+        [string]$RegistryLoginServer
+    )
+
+    $image = Get-RequiredValue 'RetrievalImageReference' $ImageReference
+    $registry = Get-RequiredValue 'RegistryLoginServer' $RegistryLoginServer
+    $approvedImagePrefix = "$registry/rag-retrieval@sha256:"
+    if ($image -cnotmatch '^[a-z0-9.-]+/rag-retrieval@sha256:[a-f0-9]{64}$' -or
+        -not $image.StartsWith($approvedImagePrefix, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Retrieval image must bind to the reviewed ACR rag-retrieval repository and digest.'
+    }
+    return $image
+}
+
+function Get-ReviewedContainerRegistry {
+    $registryName = Get-RequiredValue 'ExpectedAcrName' $ExpectedAcrName
+    $expectedId = "/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroup/providers/Microsoft.ContainerRegistry/registries/$registryName"
+    $registry = az acr show `
+        --subscription $SubscriptionId `
+        --resource-group $ResourceGroup `
+        --name $registryName `
+        --query '{id:id,name:name,loginServer:loginServer,deploymentInstance:tags.DeploymentInstance}' `
+        --output json `
+        --only-show-errors | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 0 -or $registry.id -ine $expectedId -or
+        $registry.name -cne $registryName -or
+        $registry.deploymentInstance -cne $DeploymentInstanceId -or
+        $registry.loginServer -cne "$registryName.azurecr.io") {
+        throw 'The container registry does not match the exact reviewed resource.'
+    }
+    return $registry
+}
+
+function Assert-RecoveryImageAvailable {
+    param(
+        $Registry,
+        [string]$ImageReference,
+        [string]$PullPrincipalId
+    )
+
+    $image = Assert-ApprovedRetrievalImageReference $ImageReference $Registry.loginServer
+    $digest = $image.Split('@')[1]
+    $availableDigest = az acr repository show `
+        --name $Registry.name `
+        --image "rag-retrieval@$digest" `
+        --query digest `
+        --output tsv `
+        --only-show-errors
+    if ($LASTEXITCODE -ne 0 -or $availableDigest -cne $digest) {
+        throw 'The reviewed retrieval image manifest is not available for recovery.'
+    }
+    $pullAssignments = @(
+        az role assignment list `
+            --subscription $SubscriptionId `
+            --assignee-object-id $PullPrincipalId `
+            --scope $Registry.id `
+            --query "[?roleDefinitionName=='AcrPull'].id" `
+            --output tsv `
+            --only-show-errors
+    )
+    if ($LASTEXITCODE -ne 0 -or $pullAssignments.Count -lt 1) {
+        throw 'The reviewed workload identity cannot pull the recovery image.'
+    }
+    return $image
 }
 
 function Invoke-InfrastructurePhase {
@@ -694,13 +861,6 @@ function Invoke-InfrastructurePhase {
         $env:RETRIEVAL_IMAGE_REFERENCE = ''
         $env:RETRIEVAL_CATALOG_DIGEST = ''
     }
-    if ($Serving) {
-        if ($CatalogOperation -ne 'verify-catalog') {
-            throw 'Serving deployment requires a read-only verify-catalog execution.'
-        }
-        Test-CatalogJob | Out-Null
-    }
-
     az deployment group what-if `
         --subscription $SubscriptionId `
         --resource-group $ResourceGroup `
@@ -748,6 +908,693 @@ function Invoke-InfrastructurePhase {
         --mode Incremental `
         --only-show-errors
     if ($LASTEXITCODE -ne 0) { throw 'Infrastructure deployment failed.' }
+}
+
+function Invoke-ContentTopology {
+    $cosmosAccount = Get-SingleDeploymentResource 'Microsoft.DocumentDB/databaseAccounts'
+    $env:COSMOS_ACCOUNT_NAME = $cosmosAccount.name
+
+    az deployment group what-if `
+        --subscription $SubscriptionId `
+        --resource-group $ResourceGroup `
+        --template-file $ContentTopologyTemplatePath `
+        --parameters $ContentTopologyParameterPath `
+        --result-format FullResourcePayloads `
+        --no-pretty-print `
+        --only-show-errors
+    if ($LASTEXITCODE -ne 0) { throw 'Content topology preview failed.' }
+    if (-not $Execute) { return }
+
+    az deployment group create `
+        --subscription $SubscriptionId `
+        --resource-group $ResourceGroup `
+        --template-file $ContentTopologyTemplatePath `
+        --parameters $ContentTopologyParameterPath `
+        --mode Incremental `
+        --only-show-errors
+    if ($LASTEXITCODE -ne 0) { throw 'Content topology deployment failed.' }
+}
+
+function Get-ExpectedUserAssignedIdentity {
+    param([string]$IdentityName)
+
+    $identity = az identity show `
+        --subscription $SubscriptionId `
+        --resource-group $ResourceGroup `
+        --name $IdentityName `
+        --only-show-errors | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 0 -or
+        [string]::IsNullOrWhiteSpace($identity.id) -or
+        [string]::IsNullOrWhiteSpace($identity.principalId)) {
+        throw "Unable to resolve expected managed identity '$IdentityName'."
+    }
+    return $identity
+}
+
+function Assert-ExpectedUserAssignedIdentity {
+    param(
+        [object]$WorkloadIdentity,
+        [object]$ExpectedIdentity,
+        [string]$WorkloadName
+    )
+
+    $assignments = @($WorkloadIdentity.userAssignedIdentities.PSObject.Properties)
+    if ($assignments.Count -ne 1 -or
+        $assignments[0].Name -ine $ExpectedIdentity.id -or
+        $assignments[0].Value.principalId -ine $ExpectedIdentity.principalId) {
+        throw "Workload '$WorkloadName' is not attached exclusively to expected identity '$($ExpectedIdentity.name)'."
+    }
+}
+
+function Invoke-ContentRbac {
+    $cosmosAccount = Get-SingleDeploymentResource 'Microsoft.DocumentDB/databaseAccounts'
+    $functionApp = Get-SingleDeploymentResource 'Microsoft.Web/sites'
+    $retrievalApp = Get-SingleDeploymentResource 'Microsoft.App/containerApps'
+    $functionIdentity = Get-ExpectedUserAssignedIdentity "rag-$DeploymentInstanceId-functions-mi"
+    $retrievalIdentity = Get-ExpectedUserAssignedIdentity "rag-$DeploymentInstanceId-aca-retrieval-mi"
+
+    $functionAppIdentity = az functionapp identity show `
+        --subscription $SubscriptionId `
+        --resource-group $ResourceGroup `
+        --name $functionApp.name `
+        --only-show-errors | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 0) { throw 'Unable to inspect Function App managed identity.' }
+
+    $retrievalAppIdentity = az containerapp identity show `
+        --subscription $SubscriptionId `
+        --resource-group $ResourceGroup `
+        --name $retrievalApp.name `
+        --only-show-errors | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 0) { throw 'Unable to inspect retrieval Container App managed identity.' }
+
+    Assert-ExpectedUserAssignedIdentity $functionAppIdentity $functionIdentity $functionApp.name
+    Assert-ExpectedUserAssignedIdentity $retrievalAppIdentity $retrievalIdentity $retrievalApp.name
+    $env:COSMOS_ACCOUNT_NAME = $cosmosAccount.name
+    $env:FUNCTION_PRINCIPAL_ID = $functionIdentity.principalId
+    $env:RETRIEVAL_PRINCIPAL_ID = $retrievalIdentity.principalId
+
+    az deployment group what-if `
+        --subscription $SubscriptionId `
+        --resource-group $ResourceGroup `
+        --template-file $ContentRbacTemplatePath `
+        --parameters $ContentRbacParameterPath `
+        --result-format FullResourcePayloads `
+        --no-pretty-print `
+        --only-show-errors
+    if ($LASTEXITCODE -ne 0) { throw 'Content RBAC preview failed.' }
+    if (-not $Execute) { return }
+
+    az deployment group create `
+        --subscription $SubscriptionId `
+        --resource-group $ResourceGroup `
+        --template-file $ContentRbacTemplatePath `
+        --parameters $ContentRbacParameterPath `
+        --mode Incremental `
+        --only-show-errors
+    if ($LASTEXITCODE -ne 0) { throw 'Content RBAC deployment failed.' }
+}
+
+function Invoke-GuardedGroupDeployment {
+    param(
+        [string]$DeploymentName,
+        [string]$TemplateFile,
+        [string]$ParameterFile,
+        [string]$FailureLabel
+    )
+
+    az deployment group what-if `
+        --subscription $SubscriptionId `
+        --resource-group $ResourceGroup `
+        --name "$DeploymentName-preview" `
+        --template-file $TemplateFile `
+        --parameters $ParameterFile `
+        --result-format FullResourcePayloads `
+        --no-pretty-print `
+        --only-show-errors
+    if ($LASTEXITCODE -ne 0) { throw "$FailureLabel preview failed." }
+    if (-not $Execute) { return }
+
+    az deployment group create `
+        --subscription $SubscriptionId `
+        --resource-group $ResourceGroup `
+        --name $DeploymentName `
+        --template-file $TemplateFile `
+        --parameters $ParameterFile `
+        --mode Incremental `
+        --only-show-errors
+    if ($LASTEXITCODE -ne 0) { throw "$FailureLabel deployment failed." }
+}
+
+function Set-ExternalAcaEnvironment {
+    $env:ACA_ENVIRONMENT_NAME = Get-RequiredValue `
+        'ExpectedAcaEnvironmentName' $ExpectedAcaEnvironmentName
+    $virtualNetwork = Get-SingleDeploymentResource 'Microsoft.Network/virtualNetworks'
+    $workspace = Get-SingleDeploymentResource 'Microsoft.OperationalInsights/workspaces'
+    $subnetId = az network vnet subnet show `
+        --subscription $SubscriptionId `
+        --resource-group $ResourceGroup `
+        --vnet-name $virtualNetwork.name `
+        --name 'aca-environment' `
+        --query id `
+        --output tsv `
+        --only-show-errors
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($subnetId)) {
+        throw 'The dedicated ACA infrastructure subnet could not be resolved.'
+    }
+    $env:ACA_ENVIRONMENT_SUBNET_ID = $subnetId.Trim()
+    $env:LOG_ANALYTICS_WORKSPACE_ID = $workspace.id
+}
+
+function Assert-ExternalAcaEnvironment {
+    $managedEnvironment = az containerapp env show `
+        --subscription $SubscriptionId `
+        --resource-group $ResourceGroup `
+        --name $env:ACA_ENVIRONMENT_NAME `
+        --output json `
+        --only-show-errors | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 0 -or
+        $managedEnvironment.tags.DeploymentInstance -cne $DeploymentInstanceId) {
+        throw 'Expected external ACA environment could not be resolved.'
+    }
+    $state = az containerapp env show `
+        --subscription $SubscriptionId `
+        --resource-group $ResourceGroup `
+        --name $managedEnvironment.name `
+        --query '{id:id,internal:properties.vnetConfiguration.internal,staticIp:properties.staticIp,subnetId:properties.vnetConfiguration.infrastructureSubnetId}' `
+        --output json `
+        --only-show-errors | ConvertFrom-Json
+    $staticIp = $null
+    if (-not [Net.IPAddress]::TryParse([string]$state.staticIp, [ref]$staticIp)) {
+        throw 'External ACA environment did not expose a valid static IP.'
+    }
+    if ($LASTEXITCODE -ne 0 -or $state.id -ine $managedEnvironment.id -or
+        $state.internal -ne $false -or -not (Test-PublicIpv4Address $staticIp) -or
+        $state.subnetId -ine $env:ACA_ENVIRONMENT_SUBNET_ID) {
+        throw 'ACA environment is not the reviewed external VNet-integrated environment.'
+    }
+    return $managedEnvironment
+}
+
+function Get-ReviewedResourceIfPresent {
+    param(
+        [string]$ResourceType,
+        [string]$ResourceName,
+        [string]$ExpectedResourceId
+    )
+
+    $resources = @(
+        az resource list `
+            --subscription $SubscriptionId `
+            --resource-group $ResourceGroup `
+            --resource-type $ResourceType `
+            --query "[?name=='$ResourceName'].{id:id,name:name}" `
+            --output json `
+            --only-show-errors | ConvertFrom-Json
+    )
+    if ($LASTEXITCODE -ne 0) {
+        throw "Unable to inspect the reviewed $ResourceType target."
+    }
+    if ($resources.Count -eq 0) { return $null }
+    if ($resources.Count -ne 1 -or $resources[0].id -ine $ExpectedResourceId) {
+        throw "An existing $ResourceType target does not match the reviewed resource ID."
+    }
+    return $resources[0]
+}
+
+function Assert-ExternalAcaAppOwnership {
+    $appName = Get-RequiredValue 'ExpectedRetrievalAppName' $ExpectedRetrievalAppName
+    $expectedAppId = "/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroup/providers/Microsoft.App/containerApps/$appName"
+    $existing = Get-ReviewedResourceIfPresent `
+        'Microsoft.App/containerApps' $appName $expectedAppId
+    if ($null -eq $existing) { return }
+
+    $app = az containerapp show `
+        --subscription $SubscriptionId `
+        --resource-group $ResourceGroup `
+        --name $appName `
+        --query '{id:id,environmentId:properties.environmentId,identities:identity.userAssignedIdentities,deploymentInstance:tags.DeploymentInstance}' `
+        --output json `
+        --only-show-errors | ConvertFrom-Json
+    $identityAssignments = @($app.identities.PSObject.Properties)
+    if ($LASTEXITCODE -ne 0 -or $app.id -ine $expectedAppId -or
+        $app.environmentId -ine $env:MANAGED_ENVIRONMENT_ID -or
+        $app.deploymentInstance -cne $DeploymentInstanceId -or
+        $identityAssignments.Count -ne 1 -or
+        $identityAssignments[0].Name -ine $env:RETRIEVAL_MANAGED_IDENTITY_ID) {
+        throw 'Existing retrieval app does not match the reviewed ownership boundary.'
+    }
+}
+
+function Set-ExternalAcaServingEnvironment {
+    Set-ExternalAcaEnvironment
+    $managedEnvironment = Assert-ExternalAcaEnvironment
+    $env:RETRIEVAL_APP_NAME = Get-RequiredValue `
+        'ExpectedRetrievalAppName' $ExpectedRetrievalAppName
+    $identity = Get-ExpectedUserAssignedIdentity "rag-$DeploymentInstanceId-aca-retrieval-mi"
+    $cosmosAccount = Get-SingleDeploymentResource 'Microsoft.DocumentDB/databaseAccounts'
+    $applicationInsights = Get-SingleDeploymentResource 'Microsoft.Insights/components'
+    $registry = Get-ReviewedContainerRegistry
+    $imageReference = Assert-RecoveryImageAvailable `
+        $registry $ExpectedRetrievalImageReference $identity.principalId
+    $cosmosEndpoint = az cosmosdb show `
+        --subscription $SubscriptionId `
+        --ids $cosmosAccount.id `
+        --query documentEndpoint `
+        --output tsv `
+        --only-show-errors
+    $connectionString = az monitor app-insights component show `
+        --subscription $SubscriptionId `
+        --ids $applicationInsights.id `
+        --query connectionString `
+        --output tsv `
+        --only-show-errors
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($cosmosEndpoint) -or
+        [string]::IsNullOrWhiteSpace($connectionString)) {
+        throw 'Retrieval dependency configuration could not be resolved.'
+    }
+
+    $env:MANAGED_ENVIRONMENT_ID = $managedEnvironment.id
+    $env:ACR_LOGIN_SERVER = $registry.loginServer
+    $env:RETRIEVAL_MANAGED_IDENTITY_ID = $identity.id
+    $env:RETRIEVAL_MANAGED_IDENTITY_CLIENT_ID = $identity.clientId
+    $env:COSMOS_ENDPOINT = $cosmosEndpoint.Trim()
+    $env:AZURE_OPENAI_ENDPOINT = "https://$($env:AZURE_OPENAI_ACCOUNT_NAME).openai.azure.com/"
+    $env:APPLICATIONINSIGHTS_CONNECTION_STRING = $connectionString.Trim()
+    $env:ENTRA_API_TENANT_ID = $TenantId
+    $env:RETRIEVAL_IMAGE_REFERENCE = $imageReference
+    $env:RETRIEVAL_IMAGE_DIGEST = $imageReference.Split('@sha256:')[1]
+
+    $openAiAccount = az cognitiveservices account show `
+        --subscription $SubscriptionId `
+        --resource-group $env:AZURE_OPENAI_RESOURCE_GROUP `
+        --name $env:AZURE_OPENAI_ACCOUNT_NAME `
+        --query '{id:id,name:name}' `
+        --output json `
+        --only-show-errors | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 0 -or $null -eq $openAiAccount -or
+        [string]::IsNullOrWhiteSpace($openAiAccount.id)) {
+        throw 'The reviewed Azure OpenAI account could not be resolved.'
+    }
+    $openAiAssignments = @(
+        az role assignment list `
+            --subscription $SubscriptionId `
+            --assignee-object-id $identity.principalId `
+            --scope $openAiAccount.id `
+            --include-inherited `
+            --query "[?roleDefinitionName=='Cognitive Services OpenAI User'].scope" `
+            --output tsv `
+            --only-show-errors
+    )
+    if ($LASTEXITCODE -ne 0 -or
+        @($openAiAssignments | Where-Object { $_ -ieq $openAiAccount.id }).Count -lt 1) {
+        throw 'Retrieval identity lacks reviewed account-scoped Azure OpenAI access.'
+    }
+}
+
+function Get-ExpectedOperationsJobName {
+    $jobStem = ("rag-$DeploymentInstanceId" -replace '-', '')
+    $jobStem = $jobStem.Substring(0, [Math]::Min(19, $jobStem.Length))
+    return "$jobStem-catalog-job"
+}
+
+function Remove-ReviewedResource {
+    param(
+        [string]$ResourceType,
+        [string]$ResourceName,
+        [string]$ResourceId,
+        [string]$Label
+    )
+
+    for ($attempt = 0; $attempt -lt 8; $attempt++) {
+        $ids = @(
+            az resource list `
+                --subscription $SubscriptionId `
+                --resource-group $ResourceGroup `
+                --resource-type $ResourceType `
+                --query "[?name=='$ResourceName'].id" `
+                --output tsv `
+                --only-show-errors
+        )
+        if ($LASTEXITCODE -ne 0) { throw "Unable to inspect $Label during cleanup." }
+        if ($ids.Count -eq 0) { return }
+        if ($ids.Count -ne 1 -or $ids[0] -ine $ResourceId) {
+            throw "$Label no longer matches the reviewed resource ID."
+        }
+        if ($ResourceType -ceq 'Microsoft.Network/privateDnsZones') {
+            $expectedLinkId = "$ResourceId/virtualNetworkLinks/aca-vnet-link"
+            $linkIds = @(
+                az network private-dns link vnet list `
+                    --subscription $SubscriptionId `
+                    --resource-group $ResourceGroup `
+                    --zone-name $ResourceName `
+                    --query "[?name=='aca-vnet-link'].id" `
+                    --output tsv `
+                    --only-show-errors
+            )
+            if ($LASTEXITCODE -ne 0 -or $linkIds.Count -gt 1 -or
+                ($linkIds.Count -eq 1 -and $linkIds[0] -ine $expectedLinkId)) {
+                throw 'ACA private DNS VNet link no longer matches the reviewed child resource.'
+            }
+            if ($linkIds.Count -eq 1) {
+                az network private-dns link vnet delete `
+                    --subscription $SubscriptionId `
+                    --resource-group $ResourceGroup `
+                    --zone-name $ResourceName `
+                    --name 'aca-vnet-link' `
+                    --yes `
+                    --only-show-errors
+                if ($LASTEXITCODE -ne 0) {
+                    throw 'Reviewed ACA private DNS VNet link deletion failed.'
+                }
+            }
+            $deleteOutput = az network private-dns zone delete `
+                --subscription $SubscriptionId `
+                --resource-group $ResourceGroup `
+                --name $ResourceName `
+                --yes `
+                --only-show-errors 2>&1
+        }
+        else {
+            $deleteOutput = az resource delete `
+                --subscription $SubscriptionId `
+                --ids $ResourceId `
+                --only-show-errors 2>&1
+        }
+        $deleteExitCode = $LASTEXITCODE
+        if ($deleteExitCode -ne 0 -and
+            ($deleteOutput -join "`n") -notmatch '(?i)(notfound|not found)' -and
+            $attempt -eq 7) {
+            throw "$Label deletion failed: $($deleteOutput -join "`n")"
+        }
+        if ($attempt -lt 7) {
+            Start-Sleep -Seconds ([Math]::Min(30, [Math]::Pow(2, $attempt + 1)))
+        }
+    }
+    $remaining = @(
+        az resource list `
+            --subscription $SubscriptionId `
+            --resource-group $ResourceGroup `
+            --resource-type $ResourceType `
+            --query "[?name=='$ResourceName'].id" `
+            --output tsv `
+            --only-show-errors
+    )
+    if ($LASTEXITCODE -eq 0 -and $remaining.Count -eq 0) { return }
+    throw "$Label still exists after bounded cleanup retries."
+}
+
+function Invoke-ExternalAcaCleanup {
+    Set-ExternalAcaEnvironment
+    $environmentName = Get-RequiredValue 'ExpectedAcaEnvironmentName' $ExpectedAcaEnvironmentName
+    $appName = Get-RequiredValue 'ExpectedRetrievalAppName' $ExpectedRetrievalAppName
+    $dnsZoneName = Get-RequiredValue 'ExpectedAcaPrivateDnsZone' $ExpectedAcaPrivateDnsZone
+    $internalStaticIp = Get-RequiredValue 'ExpectedAcaInternalStaticIp' $ExpectedAcaInternalStaticIp
+    $jobName = Get-ExpectedOperationsJobName
+    $providerRoot = "/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroup/providers"
+    $environmentId = "$providerRoot/Microsoft.App/managedEnvironments/$environmentName"
+    $appId = "$providerRoot/Microsoft.App/containerApps/$appName"
+    $jobId = "$providerRoot/Microsoft.App/jobs/$jobName"
+    $dnsZoneId = "$providerRoot/Microsoft.Network/privateDnsZones/$dnsZoneName"
+    $inventory = @(az resource list `
+            --subscription $SubscriptionId `
+            --resource-group $ResourceGroup `
+            --output json `
+            --only-show-errors | ConvertFrom-Json)
+    if ($LASTEXITCODE -ne 0) { throw 'Unable to inventory reviewed ACA cleanup resources.' }
+    $environmentExists = @($inventory | Where-Object { $_.id -ieq $environmentId }).Count -eq 1
+    $appExists = @($inventory | Where-Object { $_.id -ieq $appId }).Count -eq 1
+    $jobExists = @($inventory | Where-Object { $_.id -ieq $jobId }).Count -eq 1
+    $dnsExists = @($inventory | Where-Object { $_.id -ieq $dnsZoneId }).Count -eq 1
+
+    $registry = $null
+    if ($appExists -or $jobExists) {
+        $registry = Get-ReviewedContainerRegistry
+    }
+    if ($environmentExists) {
+        $environmentState = az containerapp env show `
+            --subscription $SubscriptionId --resource-group $ResourceGroup `
+            --name $environmentName `
+            --query '{id:id,internal:properties.vnetConfiguration.internal,defaultDomain:properties.defaultDomain,staticIp:properties.staticIp,subnetId:properties.vnetConfiguration.infrastructureSubnetId,deploymentInstance:tags.DeploymentInstance}' `
+            --output json --only-show-errors | ConvertFrom-Json
+        if ($LASTEXITCODE -ne 0 -or $environmentState.id -ine $environmentId -or
+            $environmentState.internal -ne $true -or
+            $environmentState.defaultDomain -cne $dnsZoneName -or
+            $environmentState.staticIp -cne $internalStaticIp -or
+            $environmentState.subnetId -ine $env:ACA_ENVIRONMENT_SUBNET_ID -or
+            $environmentState.deploymentInstance -cne $DeploymentInstanceId) {
+            throw 'Current internal ACA environment does not match the reviewed cleanup manifest.'
+        }
+    }
+    if ($appExists) {
+        $retrievalIdentity = Get-ExpectedUserAssignedIdentity "rag-$DeploymentInstanceId-aca-retrieval-mi"
+        $retrievalImage = Assert-RecoveryImageAvailable `
+            $registry $ExpectedRetrievalImageReference $retrievalIdentity.principalId
+        $appState = az containerapp show `
+            --subscription $SubscriptionId --resource-group $ResourceGroup `
+            --name $appName `
+            --query '{id:id,environmentId:properties.environmentId,image:properties.template.containers[0].image,identities:identity.userAssignedIdentities,deploymentInstance:tags.DeploymentInstance}' `
+            --output json --only-show-errors | ConvertFrom-Json
+        $identityAssignments = @($appState.identities.PSObject.Properties)
+        if ($LASTEXITCODE -ne 0 -or $appState.id -ine $appId -or
+            $appState.environmentId -ine $environmentId -or
+            $appState.image -cne $retrievalImage -or
+            $appState.deploymentInstance -cne $DeploymentInstanceId -or
+            $identityAssignments.Count -ne 1 -or
+            $identityAssignments[0].Name -ine $retrievalIdentity.id -or
+            $identityAssignments[0].Value.principalId -ine $retrievalIdentity.principalId) {
+            throw 'Current retrieval app does not match the reviewed cleanup manifest.'
+        }
+    }
+    if ($jobExists) {
+        $operationsIdentity = Get-ExpectedUserAssignedIdentity "rag-$DeploymentInstanceId-operations-mi"
+        $catalogImage = Assert-RecoveryImageAvailable `
+            $registry $ExpectedCatalogImageReference $operationsIdentity.principalId
+        $env:RETRIEVAL_IMAGE_REFERENCE = $catalogImage
+        if ((Get-VerifiedCatalogJob) -cne $jobName) {
+            throw 'Current catalog job does not match the reviewed cleanup manifest.'
+        }
+        Test-CatalogJob | Out-Null
+    }
+    if ($dnsExists) {
+        $dnsZone = az network private-dns zone show `
+            --subscription $SubscriptionId --resource-group $ResourceGroup `
+            --name $dnsZoneName `
+            --query '{id:id,deploymentInstance:tags.DeploymentInstance}' `
+            --output json --only-show-errors | ConvertFrom-Json
+        $records = @(az network private-dns record-set a list `
+                --subscription $SubscriptionId --resource-group $ResourceGroup `
+                --zone-name $dnsZoneName `
+                --query '[].{name:name,ips:aRecords[].ipv4Address}' `
+                --output json --only-show-errors | ConvertFrom-Json)
+        $links = @(az network private-dns link vnet list `
+                --subscription $SubscriptionId --resource-group $ResourceGroup `
+                --zone-name $dnsZoneName `
+                --query '[].{name:name,vnet:virtualNetwork.id,registration:registrationEnabled}' `
+                --output json --only-show-errors | ConvertFrom-Json)
+        $expectedVnetId = $env:ACA_ENVIRONMENT_SUBNET_ID.Substring(
+            0,
+            $env:ACA_ENVIRONMENT_SUBNET_ID.IndexOf('/subnets/', [StringComparison]::OrdinalIgnoreCase)
+        )
+        $invalidLink = $links.Count -gt 1 -or
+            ($links.Count -eq 1 -and ($links[0].name -cne 'aca-vnet-link' -or
+                $links[0].vnet -ine $expectedVnetId -or $links[0].registration -ne $false))
+        if ($LASTEXITCODE -ne 0 -or $dnsZone.id -ine $dnsZoneId -or
+            $dnsZone.deploymentInstance -cne $DeploymentInstanceId -or
+            $records.Count -ne 2 -or
+            @($records | Where-Object { $_.name -in @('@', '*') -and $_.ips.Count -eq 1 -and $_.ips[0] -ceq $internalStaticIp }).Count -ne 2 -or
+            $invalidLink) {
+            throw 'ACA private DNS zone contains resources outside the reviewed cleanup manifest.'
+        }
+    }
+    if (-not $Execute) {
+        [ordered]@{
+            action      = 'preview-recreate-external-aca'
+            job         = $jobName
+            app         = $appName
+            environment = $environmentName
+            privateDns  = $dnsZoneName
+            resume      = -not ($environmentExists -and $appExists -and $jobExists -and $dnsExists)
+        } | ConvertTo-Json -Compress
+        return
+    }
+
+    Remove-ReviewedResource 'Microsoft.App/jobs' $jobName $jobId 'catalog job'
+    Remove-ReviewedResource 'Microsoft.App/containerApps' $appName $appId 'retrieval app'
+    Remove-ReviewedResource 'Microsoft.App/managedEnvironments' $environmentName $environmentId 'internal ACA environment'
+    Remove-ReviewedResource 'Microsoft.Network/privateDnsZones' $dnsZoneName $dnsZoneId 'ACA private DNS zone'
+}
+
+function Invoke-ExternalAcaEnvironment {
+    Set-ExternalAcaEnvironment
+    $environmentName = Get-RequiredValue `
+        'ExpectedAcaEnvironmentName' $ExpectedAcaEnvironmentName
+    $environmentId = "/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroup/providers/Microsoft.App/managedEnvironments/$environmentName"
+    $existing = Get-ReviewedResourceIfPresent `
+        'Microsoft.App/managedEnvironments' $environmentName $environmentId
+    if ($null -ne $existing) { Assert-ExternalAcaEnvironment | Out-Null }
+    Invoke-GuardedGroupDeployment `
+        -DeploymentName 'external-aca-environment' `
+        -TemplateFile $ExternalAcaEnvironmentTemplatePath `
+        -ParameterFile $ExternalAcaEnvironmentParameterPath `
+        -FailureLabel 'External ACA environment'
+    if ($Execute) { Assert-ExternalAcaEnvironment | Out-Null }
+}
+
+function Test-PublicIpv4Address {
+    param([Net.IPAddress]$Address)
+    if ($Address.AddressFamily -ne [Net.Sockets.AddressFamily]::InterNetwork) { return $false }
+    $bytes = $Address.GetAddressBytes()
+    return -not (
+        $bytes[0] -in @(0, 10, 127) -or
+        ($bytes[0] -eq 169 -and $bytes[1] -eq 254) -or
+        ($bytes[0] -eq 172 -and $bytes[1] -in 16..31) -or
+        ($bytes[0] -eq 192 -and $bytes[1] -eq 168)
+    )
+}
+
+function Assert-ExternalAcaAuthPolicy {
+    param(
+        $Auth,
+        [string]$ExpectedApiClientId,
+        [string]$ExpectedCallerClientId,
+        [string]$ExpectedIssuer
+    )
+
+    if ($null -eq $Auth -or $Auth.platform -ne $true -or
+        $Auth.entraProvider -ne $true -or
+        $Auth.unauthenticated -cne 'Return401' -or $Auth.requireHttps -ne $true -or
+        $Auth.clientId -cne $ExpectedApiClientId -or $Auth.issuer -cne $ExpectedIssuer -or
+        @($Auth.audiences).Count -ne 1 -or
+        $Auth.audiences[0] -cne $ExpectedApiClientId -or
+        @($Auth.applications).Count -ne 1 -or
+        $Auth.applications[0] -cne $ExpectedCallerClientId) {
+        throw 'External retrieval Easy Auth does not match the reviewed policy.'
+    }
+}
+
+function Test-ExternalAcaServing {
+    $appName = Get-RequiredValue 'ExpectedRetrievalAppName' $ExpectedRetrievalAppName
+    $expectedImage = Get-RequiredValue `
+        'ExpectedRetrievalImageReference' $ExpectedRetrievalImageReference
+    $app = $null
+    for ($attempt = 0; $attempt -lt 30 -and $null -eq $app; $attempt++) {
+        $candidate = az containerapp show `
+            --subscription $SubscriptionId --resource-group $ResourceGroup `
+            --name $appName `
+            --query '{id:id,fqdn:properties.configuration.ingress.fqdn,external:properties.configuration.ingress.external,allowInsecure:properties.configuration.ingress.allowInsecure,image:properties.template.containers[0].image,latestRevision:properties.latestRevisionName,provisioningState:properties.provisioningState}' `
+            --output json --only-show-errors 2>$null
+        if ($LASTEXITCODE -eq 0) {
+            $app = $candidate | ConvertFrom-Json
+        }
+        elseif ($attempt -lt 29) {
+            Start-Sleep -Seconds 10
+        }
+    }
+    if ($null -eq $app -or $app.external -ne $true -or $app.allowInsecure -ne $false -or
+        $app.image -cne $expectedImage -or $app.provisioningState -cne 'Succeeded' -or
+        [string]::IsNullOrWhiteSpace($app.fqdn) -or
+        [string]::IsNullOrWhiteSpace($app.latestRevision)) {
+        throw 'External retrieval app did not reach the reviewed serving configuration.'
+    }
+
+    $expectedApiClientId = Get-RequiredValue `
+        'RETRIEVAL_API_CLIENT_ID' $env:RETRIEVAL_API_CLIENT_ID
+    $expectedCallerClientId = Get-RequiredValue `
+        'RETRIEVAL_ALLOWED_CALLER_CLIENT_ID' $env:RETRIEVAL_ALLOWED_CALLER_CLIENT_ID
+    $expectedIssuer = "https://login.microsoftonline.com/$TenantId/v2.0"
+    $auth = az containerapp auth show `
+        --subscription $SubscriptionId `
+        --resource-group $ResourceGroup `
+        --name $appName `
+        --query '{platform:platform.enabled,entraProvider:identityProviders.azureActiveDirectory.enabled,unauthenticated:globalValidation.unauthenticatedClientAction,requireHttps:httpSettings.requireHttps,clientId:identityProviders.azureActiveDirectory.registration.clientId,issuer:identityProviders.azureActiveDirectory.registration.openIdIssuer,audiences:identityProviders.azureActiveDirectory.validation.allowedAudiences,applications:identityProviders.azureActiveDirectory.validation.defaultAuthorizationPolicy.allowedApplications}' `
+        --output json `
+        --only-show-errors | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 0) {
+        throw 'External retrieval Easy Auth could not be read.'
+    }
+    Assert-ExternalAcaAuthPolicy `
+        $auth $expectedApiClientId $expectedCallerClientId $expectedIssuer
+
+    $revision = $null
+    for ($attempt = 0; $attempt -lt 30; $attempt++) {
+        $revision = az containerapp revision show `
+            --subscription $SubscriptionId --resource-group $ResourceGroup `
+            --name $appName --revision $app.latestRevision `
+            --query '{healthState:properties.healthState,runningState:properties.runningState,provisioningState:properties.provisioningState}' `
+            --output json --only-show-errors 2>$null | ConvertFrom-Json
+        if ($LASTEXITCODE -eq 0 -and $revision.healthState -ceq 'Healthy' -and
+            $revision.runningState -ceq 'Running' -and
+            $revision.provisioningState -ceq 'Provisioned') {
+            break
+        }
+        if ($attempt -lt 29) { Start-Sleep -Seconds 10 }
+    }
+    if ($null -eq $revision -or $revision.healthState -cne 'Healthy' -or
+        $revision.runningState -cne 'Running' -or $revision.provisioningState -cne 'Provisioned') {
+        throw 'External retrieval revision did not become healthy and ready.'
+    }
+
+    $publicAddresses = @()
+    for ($attempt = 0; $attempt -lt 30 -and $publicAddresses.Count -eq 0; $attempt++) {
+        try {
+            $publicAddresses = @(
+                [Net.Dns]::GetHostAddresses($app.fqdn) |
+                    Where-Object { Test-PublicIpv4Address $_ }
+            )
+        }
+        catch [Net.Sockets.SocketException] {
+            $publicAddresses = @()
+        }
+        if ($publicAddresses.Count -eq 0 -and $attempt -lt 29) { Start-Sleep -Seconds 10 }
+    }
+    if ($publicAddresses.Count -eq 0) {
+        throw 'External retrieval FQDN did not resolve to a public IPv4 address.'
+    }
+
+    $queryUrl = "https://$($app.fqdn)/api/query"
+    $statusCode = 0
+    for ($attempt = 0; $attempt -lt 30 -and $statusCode -ne 401; $attempt++) {
+        try {
+            $response = Invoke-WebRequest `
+                -Uri $queryUrl `
+                -Method Post `
+                -ContentType 'application/json' `
+                -Body '{}' `
+                -SkipHttpErrorCheck `
+                -TimeoutSec 30
+            $statusCode = [int]$response.StatusCode
+        }
+        catch {
+            $statusCode = 0
+        }
+        if ($statusCode -ne 401 -and $attempt -lt 29) { Start-Sleep -Seconds 10 }
+    }
+    if ($statusCode -ne 401) {
+        throw "External retrieval endpoint returned HTTP $statusCode instead of 401 for an anonymous request."
+    }
+    [ordered]@{
+        fqdn          = $app.fqdn
+        queryUrl      = $queryUrl
+        revision      = $app.latestRevision
+        healthState   = $revision.healthState
+        anonymousHttp = $statusCode
+        publicIpv4    = @($publicAddresses | ForEach-Object { $_.ToString() })
+        authIssuer     = $auth.issuer
+        dependencyProof = 'healthy readiness probe reads the Cosmos-backed catalog snapshot'
+    } | ConvertTo-Json -Compress
+}
+
+function Invoke-ExternalAcaServing {
+    $env:RETRIEVAL_IMAGE_REFERENCE = Get-RequiredValue `
+        'ExpectedRetrievalImageReference' $ExpectedRetrievalImageReference
+    Set-ExternalAcaServingEnvironment
+    Assert-ExternalAcaAppOwnership
+    Invoke-GuardedGroupDeployment `
+        -DeploymentName 'external-aca-serving' `
+        -TemplateFile $ExternalAcaServingTemplatePath `
+        -ParameterFile $ExternalAcaServingParameterPath `
+        -FailureLabel 'External ACA serving'
+    if ($Execute) { Test-ExternalAcaServing }
 }
 
 function Invoke-OperationsInfrastructure {
@@ -800,8 +1647,7 @@ function Get-ReviewedCatalogDigest {
     $output = & python @(
         (Join-Path $ProjectRoot 'tools/publish_retrieval_catalog.py'),
         'validate',
-        '--file', $catalogPath,
-        '--deployment-instance-id', $DeploymentInstanceId
+        '--file', $catalogPath
     )
     if ($LASTEXITCODE -ne 0) { throw 'Catalog validation failed.' }
     $catalog = $output | ConvertFrom-Json
@@ -837,10 +1683,6 @@ function Assert-CatalogContainer {
         ($container.command -join '|') -cne 'python' -or
         ($container.args -join '|') -cne "-m|retrieval.operations|$CatalogOperation") {
         throw 'Private catalog image or operation does not match the reviewed candidate.'
-    }
-    $partitions = @($container.env | Where-Object { $_.name -eq 'DEPLOYMENT_INSTANCE_ID' })
-    if ($partitions.Count -ne 1 -or $partitions[0].value -cne $DeploymentInstanceId) {
-        throw 'Private catalog partition does not match the reviewed deployment instance.'
     }
     $expectedSettings = @{
         COSMOS_ENDPOINT            = $env:COSMOS_ENDPOINT
@@ -1026,10 +1868,18 @@ if ($Phase -eq 'Function') {
     return
 }
 Import-AzdEnvironment
+if ($Phase -in @('Final', 'ExternalAcaCleanup', 'ExternalAcaServing')) {
+    Assert-RetrievalCaller
+}
 Set-ParameterEnvironment
 
 switch ($Phase) {
     'Foundation' { Invoke-InfrastructurePhase -Serving $false -Operations $false }
+    'ContentTopology' { Invoke-ContentTopology }
+    'ContentRbac' { Invoke-ContentRbac }
+    'ExternalAcaCleanup' { Invoke-ExternalAcaCleanup }
+    'ExternalAcaEnvironment' { Invoke-ExternalAcaEnvironment }
+    'ExternalAcaServing' { Invoke-ExternalAcaServing }
     'Build' { Invoke-ImageBuild }
     'Operations' { Invoke-OperationsInfrastructure }
     'Catalog' { Invoke-CatalogJob }

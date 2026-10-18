@@ -4,7 +4,6 @@ Endpoints:
   POST /api/ingestion/full-sync    Start durable full-sync orchestrator (returns 202)
   GET  /api/ingestion/status       Query orchestration instance status
   GET  /api/ingestion/inspect      Read Cosmos data for debugging
-  POST /api/query                  RAG query endpoint
   POST /api/webhook/sharepoint     Microsoft Graph change notification receiver
   POST /api/webhook/lifecycle      Microsoft Graph lifecycle notification receiver
 
@@ -26,28 +25,24 @@ from typing import Any
 import azure.functions as func
 import azure.durable_functions as df
 
+from azure_credentials import create_azure_credential
+from config import load_execution_batch_config
+
 app = df.DFApp(http_auth_level=func.AuthLevel.ANONYMOUS)
 logger = logging.getLogger("rag-ingestion")
 
-WAVE_SIZE = int(os.getenv("WAVE_SIZE", "4"))
-WAVE_TIMEOUT_MINUTES = int(os.getenv("WAVE_TIMEOUT_MINUTES", "20"))
-PROCESS_DOCUMENT_MAX_ATTEMPTS = int(os.getenv("PROCESS_DOCUMENT_MAX_ATTEMPTS", "5"))
-PROCESS_DOCUMENT_RETRY_DELAY_SECONDS = int(os.getenv("PROCESS_DOCUMENT_RETRY_DELAY_SECONDS", "60"))
+# Keep one worker-start snapshot so Durable replays use stable execution policy.
+EXECUTION_CONFIG = load_execution_batch_config()
 DELTA_SYNC_SCHEDULE = os.getenv("DELTA_SYNC_SCHEDULE", "0 0 4 * * *")  # daily 04:00 UTC
 ACL_RESYNC_SCHEDULE = os.getenv("ACL_RESYNC_SCHEDULE", "0 0 3 * * 0")  # weekly Sunday 03:00 UTC (safety net)
-ACL_RESYNC_PAGE_SIZE = int(os.getenv("ACL_RESYNC_PAGE_SIZE", "50"))
 LIFECYCLE_RECONCILE_SCHEDULE = os.getenv(
     "LIFECYCLE_RECONCILE_SCHEDULE", "0 */10 * * * *"
 )
-LIFECYCLE_RECONCILE_PAGE_SIZE = int(
-    os.getenv("LIFECYCLE_RECONCILE_PAGE_SIZE", "50")
-)
 AUDIO_POLL_SCHEDULE = os.getenv("AUDIO_POLL_SCHEDULE", "0 */5 * * * *")  # every 5 minutes
-AUDIO_POLL_PAGE_SIZE = int(os.getenv("AUDIO_POLL_PAGE_SIZE", "20"))
-SOURCE_DISPATCH_PAGE_SIZE = int(os.getenv("SOURCE_DISPATCH_PAGE_SIZE", "10"))
 SUBSCRIPTION_RENEW_SCHEDULE = os.getenv("SUBSCRIPTION_RENEW_SCHEDULE", "0 0 2 * * *")
 WEBHOOK_CLIENT_STATE = os.getenv("WEBHOOK_CLIENT_STATE", "")
 INGESTION_ADMIN_ROLE = os.getenv("INGESTION_ADMIN_ROLE", "Ingestion.Operator")
+MAX_RETRIEVAL_CONFIG_REQUEST_BYTES = 1_572_864
 
 
 def _require_ingestion_operator(req: func.HttpRequest) -> func.HttpResponse | None:
@@ -116,7 +111,7 @@ async def get_status(req: func.HttpRequest, client) -> func.HttpResponse:
             registry = _build_source_registry_repository(load_config())
             page = registry.list_source_dispatch_outcomes_page(
                 instance_id,
-                page_size=SOURCE_DISPATCH_PAGE_SIZE,
+                page_size=EXECUTION_CONFIG.source_dispatch_page_size,
                 continuation_token=req.params.get("sourceContinuationToken"),
             )
             payload["sourceOutcomes"] = list(page.items)
@@ -374,30 +369,26 @@ def register_source(req: func.HttpRequest) -> func.HttpResponse:
     import httpx
     from config import load_config
     from ingestion import graph
+    from ingestion.source_preflight import ProposedSourceRegistration
     from ingestion.source_registry import SourceRegistryConflictError
-    from source_registry import SourceRegistryError, validate_site_url, validate_source_id
+    from source_registry import SourceRegistryError
 
     try:
         body = req.get_json()
     except ValueError:
         body = None
-    if (
-        not isinstance(body, dict)
-        or set(body) != {"sourceId", "siteUrl", "driveId"}
-        or not all(isinstance(value, str) and value.strip() for value in body.values())
-    ):
-        return _json_response({"error": "source_registration_invalid"}, 400)
     try:
-        source_id = validate_source_id(body["sourceId"])
-        site_url = validate_site_url(body["siteUrl"].strip())
+        proposal = ProposedSourceRegistration.from_body(body)
     except SourceRegistryError as error:
         return _json_response({"error": str(error)}, 400)
-    drive_id = body["driveId"].strip()
 
     try:
         config = load_config()
         site_id = graph.validate_sharepoint_drive_site(
-            _build_graph_client(config), drive_id, site_url, config.acl_max_pages,
+            _build_graph_client(config),
+            proposal.drive_id,
+            proposal.site_url,
+            config.execution.acl_max_pages,
         )
     except httpx.HTTPStatusError as error:
         status_code = error.response.status_code
@@ -413,32 +404,224 @@ def register_source(req: func.HttpRequest) -> func.HttpResponse:
 
     try:
         plan = _build_source_registry_repository(config).register_sharepoint_source(
-            source_id=source_id, site_id=site_id, site_url=site_url, drive_id=drive_id,
+            source_id=proposal.source_id,
+            site_id=site_id,
+            site_url=proposal.site_url,
+            drive_id=proposal.drive_id,
+            business_name=proposal.business_name,
+            content_scope=proposal.content_scope,
+            chunks_container=proposal.chunks_container,
+            manifests_container=proposal.manifests_container,
+            retrieval_acl_enabled=proposal.retrieval_acl_enabled,
         )
     except SourceRegistryConflictError as error:
         return _json_response({"error": str(error)}, 409)
+    except SourceRegistryError as error:
+        code = str(error)
+        if code in {
+            "source_contentScope_invalid",
+            "source_businessName_invalid",
+            "source_chunksContainer_invalid",
+            "source_manifestsContainer_invalid",
+            "source_retrievalAclEnabled_invalid",
+        }:
+            return _json_response({"error": code}, 400)
+        logger.exception(
+            "source registration incomplete source=%s",
+            proposal.source_id,
+        )
+        return _json_response({"error": code}, 503)
     except Exception:
-        logger.exception("source registration unavailable source=%s", source_id)
+        logger.exception(
+            "source registration unavailable source=%s",
+            proposal.source_id,
+        )
         return _json_response({"error": "source_registry_unavailable"}, 503)
+    try:
+        from ingestion.telemetry import write_audit_record
+        from retrieval.auth import easy_auth_object_id
+        write_audit_record(_build_audit_container(config), plan.source_id, "source-registration", {
+            "operation": "source_registered",
+            "businessName": plan.source.business_name,
+            "catalogEtag": plan.catalog_etag,
+            "operatorObjectId": easy_auth_object_id(req.headers.get("X-MS-CLIENT-PRINCIPAL")),
+            "operator": req.headers.get("X-MS-CLIENT-PRINCIPAL-NAME", "unknown"),
+        })
+    except Exception:
+        logger.exception("source registration audit unavailable source=%s", plan.source_id)
     return _json_response({
         "sourceId": plan.source_id,
         "siteId": plan.source.site_id,
         "siteUrl": plan.source.site_url,
         "driveId": plan.source.drive_id,
+        "businessName": plan.source.business_name,
+        "contentScope": plan.source.content_scope,
+        "chunksContainer": plan.source.chunks_container,
+        "manifestsContainer": plan.source.manifests_container,
+        "retrievalAclEnabled": plan.source.retrieval_acl_enabled,
         "desiredState": plan.source.desired_state,
         "etag": plan.catalog_etag,
     }, 201)
 
 
+@app.route(
+    route="ingestion/sources/preflight",
+    methods=["POST"],
+    auth_level=func.AuthLevel.ANONYMOUS,
+)
+def preflight_source(req: func.HttpRequest) -> func.HttpResponse:
+    """Validate one proposed source and target pair without persisting state."""
+    authorization = _require_ingestion_operator(req)
+    if authorization is not None:
+        return authorization
+    import httpx
+    from config import load_config
+    from ingestion import graph
+    from ingestion.source_preflight import (
+        ProposedSourceRegistration,
+        SourcePreflightError,
+        inspect_content_pair,
+    )
+    from source_registry import SourceRegistryError
+
+    try:
+        body = req.get_json()
+    except ValueError:
+        body = None
+    try:
+        proposal = ProposedSourceRegistration.from_body(body)
+    except SourceRegistryError as error:
+        return _json_response({"error": str(error)}, 400)
+
+    try:
+        config = load_config()
+        site_id = graph.validate_sharepoint_drive_site(
+            _build_graph_client(config),
+            proposal.drive_id,
+            proposal.site_url,
+            config.execution.acl_max_pages,
+        )
+    except httpx.HTTPStatusError as error:
+        status_code = error.response.status_code
+        code = (
+            "source_preflight_graph_unavailable"
+            if status_code == 429 or status_code >= 500
+            else "source_preflight_graph_binding_invalid"
+        )
+        return _source_preflight_error(
+            proposal.source_id,
+            code,
+            "microsoft-graph",
+            503 if code.endswith("unavailable") else 422,
+        )
+    except ValueError:
+        return _source_preflight_error(
+            proposal.source_id,
+            "source_preflight_graph_binding_invalid",
+            "microsoft-graph",
+            422,
+        )
+    except Exception:
+        logger.exception(
+            "source preflight Graph validation unavailable source=%s",
+            proposal.source_id,
+        )
+        return _source_preflight_error(
+            proposal.source_id,
+            "source_preflight_graph_unavailable",
+            "microsoft-graph",
+            503,
+        )
+
+    try:
+        database = _build_cosmos_client(config).get_database_client(
+            config.cosmos_database,
+        )
+        pair = inspect_content_pair(database, proposal)
+    except SourcePreflightError as error:
+        status_code = (
+            422
+            if error.code in {
+                "source_preflight_container_missing",
+                "source_preflight_container_incompatible",
+            }
+            else 503
+        )
+        return _source_preflight_error(
+            proposal.source_id,
+            error.code,
+            error.dependency,
+            status_code,
+        )
+    except Exception:
+        logger.exception(
+            "source preflight Cosmos validation unavailable source=%s",
+            proposal.source_id,
+        )
+        return _source_preflight_error(
+            proposal.source_id,
+            "source_preflight_container_unavailable",
+            "cosmos-content-pair",
+            503,
+        )
+
+    return _json_response({
+        "sourceId": proposal.source_id,
+        "siteId": site_id,
+        "businessName": proposal.business_name,
+        "contentScope": proposal.content_scope,
+        "retrievalAclEnabled": proposal.retrieval_acl_enabled,
+        "preflightPassed": True,
+        "writesPerformed": False,
+        "checks": {
+            "graphBinding": "passed",
+            "contentPairPolicy": "passed",
+            "functionDataPlane": {
+                "metadataRead": pair["metadataRead"],
+                "query": pair["query"],
+                "writePermission": pair["functionWritePermission"],
+            },
+            "retrievalReadiness": {
+                "containerPolicy": "passed",
+                "readPermission": pair["retrievalReadPermission"],
+            },
+        },
+        "targetPair": {
+            "chunksContainer": pair["chunksContainer"],
+            "chunksPartitionKey": pair["chunksPartitionKey"],
+            "manifestsContainer": pair["manifestsContainer"],
+            "manifestsPartitionKey": pair["manifestsPartitionKey"],
+        },
+    }, 200)
+
+
+def _source_preflight_error(
+    source_id: str,
+    code: str,
+    dependency: str,
+    status_code: int,
+) -> func.HttpResponse:
+    return _json_response({
+        "error": code,
+        "sourceId": source_id,
+        "dependency": dependency,
+        "writesPerformed": False,
+    }, status_code)
+
+
 @app.route(route="ingestion/sources/{sourceId}", methods=["PATCH"], auth_level=func.AuthLevel.ANONYMOUS)
 def change_source_state(req: func.HttpRequest) -> func.HttpResponse:
-    """Change one source's desiredState under If-Match; retired is final."""
+    """Change a source lifecycle state or its retrieval ACL policy under If-Match."""
     authorization = _require_ingestion_operator(req)
     if authorization is not None:
         return authorization
     from config import load_config
     from ingestion.source_registry import SourceRegistryConflictError
-    from source_registry import SourceRegistryError, validate_source_id
+    from source_registry import (
+        SourceRegistryError,
+        validate_business_name,
+        validate_source_id,
+    )
 
     try:
         source_id = validate_source_id(req.route_params.get("sourceId"))
@@ -448,55 +631,157 @@ def change_source_state(req: func.HttpRequest) -> func.HttpResponse:
         body = req.get_json()
     except ValueError:
         body = None
-    if (
-        not isinstance(body, dict)
-        or set(body) != {"desiredState"}
-        or not isinstance(body["desiredState"], str)
-        or body["desiredState"] not in {"active", "paused", "retired"}
-    ):
-        return _json_response({"error": "source_state_invalid"}, 400)
     if_match = req.headers.get("If-Match")
     if not if_match:
         return _json_response({"error": "if_match_required"}, 428)
-
-    try:
-        plan = _build_source_registry_repository(load_config()).change_source_state(
-            source_id=source_id, desired_state=body["desiredState"], if_match=if_match,
-        )
-    except SourceRegistryConflictError as error:
-        code = str(error)
-        return _json_response({"error": code}, 412 if code == "source_etag_mismatch" else 409)
-    except SourceRegistryError as error:
-        code = str(error)
-        if code == "source_registration_missing":
-            return _json_response({"error": code}, 404)
-        if code == "source_binding_not_accepted":
-            return _json_response({"error": code}, 409)
-        logger.exception("source state change incomplete source=%s", source_id)
-        return _json_response({"error": code}, 503)
-    except Exception:
-        logger.exception("source state change unavailable source=%s", source_id)
-        return _json_response({"error": "source_registry_unavailable"}, 503)
-    # Best-effort, like purge: an audit outage must not report a committed change as failed.
-    try:
-        from ingestion.telemetry import write_audit_record
-        from retrieval.auth import easy_auth_object_id
-        write_audit_record(_build_audit_container(load_config()), plan.source_id, "source-state", {
-            "operation": "source_state_changed",
+    if not isinstance(body, dict):
+        return _json_response({"error": "source_state_invalid"}, 400)
+    if set(body) == {"businessName"}:
+        try:
+            business_name = validate_business_name(body["businessName"])
+        except SourceRegistryError as error:
+            return _json_response({"error": str(error)}, 400)
+        try:
+            plan, previous_business_name = (
+                _build_source_registry_repository(load_config())
+                .change_source_business_name(
+                    source_id=source_id,
+                    business_name=business_name,
+                    if_match=if_match,
+                )
+            )
+        except SourceRegistryConflictError as error:
+            code = str(error)
+            return _json_response(
+                {"error": code},
+                412 if code == "source_etag_mismatch" else 409,
+            )
+        except SourceRegistryError as error:
+            code = str(error)
+            if code == "source_registration_missing":
+                return _json_response({"error": code}, 404)
+            if code == "source_businessName_invalid":
+                return _json_response({"error": code}, 400)
+            logger.exception("source business name change incomplete source=%s", source_id)
+            return _json_response({"error": code}, 503)
+        except Exception:
+            logger.exception("source business name change unavailable source=%s", source_id)
+            return _json_response({"error": "source_registry_unavailable"}, 503)
+        try:
+            from ingestion.telemetry import write_audit_record
+            from retrieval.auth import easy_auth_object_id
+            write_audit_record(
+                _build_audit_container(load_config()),
+                plan.source_id,
+                "source-business-name",
+                {
+                    "operation": "source_business_name_changed",
+                    "previousBusinessName": previous_business_name,
+                    "businessName": plan.source.business_name,
+                    "catalogEtag": plan.catalog_etag,
+                    "operatorObjectId": easy_auth_object_id(
+                        req.headers.get("X-MS-CLIENT-PRINCIPAL")
+                    ),
+                    "operator": req.headers.get(
+                        "X-MS-CLIENT-PRINCIPAL-NAME",
+                        "unknown",
+                    ),
+                },
+            )
+        except Exception:
+            logger.exception("source business name audit unavailable source=%s", plan.source_id)
+        return _json_response({
+            "sourceId": plan.source_id,
+            "businessName": plan.source.business_name,
+            "etag": plan.catalog_etag,
+        }, 200)
+    if set(body) == {"desiredState"}:
+        if not isinstance(body["desiredState"], str) or body["desiredState"] not in {"active", "paused", "retired"}:
+            return _json_response({"error": "source_state_invalid"}, 400)
+        try:
+            plan = _build_source_registry_repository(load_config()).change_source_state(
+                source_id=source_id, desired_state=body["desiredState"], if_match=if_match,
+            )
+        except SourceRegistryConflictError as error:
+            code = str(error)
+            return _json_response({"error": code}, 412 if code == "source_etag_mismatch" else 409)
+        except SourceRegistryError as error:
+            code = str(error)
+            if code == "source_registration_missing":
+                return _json_response({"error": code}, 404)
+            if code == "source_binding_not_accepted":
+                return _json_response({"error": code}, 409)
+            logger.exception("source state change incomplete source=%s", source_id)
+            return _json_response({"error": code}, 503)
+        except Exception:
+            logger.exception("source state change unavailable source=%s", source_id)
+            return _json_response({"error": "source_registry_unavailable"}, 503)
+        try:
+            from ingestion.telemetry import write_audit_record
+            from retrieval.auth import easy_auth_object_id
+            write_audit_record(_build_audit_container(load_config()), plan.source_id, "source-state", {
+                "operation": "source_state_changed",
+                "businessName": plan.source.business_name,
+                "desiredState": plan.source.desired_state,
+                "catalogEtag": plan.catalog_etag,
+                "operatorObjectId": easy_auth_object_id(req.headers.get("X-MS-CLIENT-PRINCIPAL")),
+                "operator": req.headers.get("X-MS-CLIENT-PRINCIPAL-NAME", "unknown"),
+            })
+        except Exception:
+            logger.exception("source state audit unavailable source=%s", plan.source_id)
+        return _json_response({
+            "sourceId": plan.source_id,
+            "siteUrl": plan.source.site_url,
+            "driveId": plan.source.drive_id,
             "desiredState": plan.source.desired_state,
-            "catalogEtag": plan.catalog_etag,
-            "operatorObjectId": easy_auth_object_id(req.headers.get("X-MS-CLIENT-PRINCIPAL")),
-            "operator": req.headers.get("X-MS-CLIENT-PRINCIPAL-NAME", "unknown"),
-        })
-    except Exception:
-        logger.exception("source state audit unavailable source=%s", plan.source_id)
-    return _json_response({
-        "sourceId": plan.source_id,
-        "siteUrl": plan.source.site_url,
-        "driveId": plan.source.drive_id,
-        "desiredState": plan.source.desired_state,
-        "etag": plan.catalog_etag,
-    }, 200)
+            "etag": plan.catalog_etag,
+        }, 200)
+    if set(body) == {"retrievalAclEnabled"}:
+        value = body["retrievalAclEnabled"]
+        if type(value) is not bool:
+            return _json_response({"error": "source_retrievalAclEnabled_invalid"}, 400)
+        try:
+            plan = _build_source_registry_repository(load_config()).change_source_policy(
+                source_id=source_id,
+                retrieval_acl_enabled=value,
+                if_match=if_match,
+            )
+        except SourceRegistryConflictError as error:
+            code = str(error)
+            return _json_response({"error": code}, 412 if code == "source_etag_mismatch" else 409)
+        except SourceRegistryError as error:
+            code = str(error)
+            if code == "source_registration_missing":
+                return _json_response({"error": code}, 404)
+            if code == "source_retrievalAclEnabled_invalid":
+                return _json_response({"error": code}, 400)
+            logger.exception("source policy change incomplete source=%s", source_id)
+            return _json_response({"error": code}, 503)
+        except Exception:
+            logger.exception("source policy change unavailable source=%s", source_id)
+            return _json_response({"error": "source_registry_unavailable"}, 503)
+        try:
+            from ingestion.telemetry import write_audit_record
+            from retrieval.auth import easy_auth_object_id
+            write_audit_record(_build_audit_container(load_config()), plan.source_id, "source-policy", {
+                "operation": "source_policy_changed",
+                "businessName": plan.source.business_name,
+                "retrievalAclEnabled": plan.source.retrieval_acl_enabled,
+                "catalogEtag": plan.catalog_etag,
+                "operatorObjectId": easy_auth_object_id(req.headers.get("X-MS-CLIENT-PRINCIPAL")),
+                "operator": req.headers.get("X-MS-CLIENT-PRINCIPAL-NAME", "unknown"),
+            })
+        except Exception:
+            logger.exception("source policy audit unavailable source=%s", plan.source_id)
+        return _json_response({
+            "sourceId": plan.source_id,
+            "siteUrl": plan.source.site_url,
+            "driveId": plan.source.drive_id,
+            "desiredState": plan.source.desired_state,
+            "retrievalAclEnabled": plan.source.retrieval_acl_enabled,
+            "etag": plan.catalog_etag,
+        }, 200)
+    return _json_response({"error": "source_state_invalid"}, 400)
 
 
 @app.route(
@@ -594,7 +879,7 @@ async def reprovision_source(req: func.HttpRequest, client) -> func.HttpResponse
             _build_graph_client(config),
             plan.source.drive_id,
             plan.source.site_url,
-            config.acl_max_pages,
+            config.execution.acl_max_pages,
         )
         if validated_site_id != plan.source.site_id:
             raise ValueError("source_site_binding_changed")
@@ -649,7 +934,7 @@ def list_sources(req: func.HttpRequest) -> func.HttpResponse:
 
     try:
         page = _build_source_registry_repository(load_config()).list_source_inventory_page(
-            page_size=SOURCE_DISPATCH_PAGE_SIZE,
+            page_size=EXECUTION_CONFIG.source_dispatch_page_size,
             continuation_token=req.params.get("continuationToken") or None,
         )
     except Exception:
@@ -666,6 +951,9 @@ def list_sources(req: func.HttpRequest) -> func.HttpResponse:
             }
             for plan in page.plans
         ],
+        "rejectedSourceIds": list(page.rejected_source_ids),
+        "unattributedErrors": page.unattributed_errors,
+        "duplicateDriveSourceIds": list(page.duplicate_drive_source_ids),
         "continuationToken": page.continuation_token,
     }, 200)
 
@@ -676,21 +964,31 @@ def inspect_data(req: func.HttpRequest) -> func.HttpResponse:
     authorization = _require_ingestion_operator(req)
     if authorization is not None:
         return authorization
+    from config import load_config
     from cosmos_connection import create_cosmos_client
+    from ingestion.source_registry import SourceRegistryConflictError
+    from source_registry import SourceRegistryError, validate_source_id
 
     container_name = (req.params.get("container") or "").strip()
     allowed = {"ingestion-runs", "source-documents", "search-chunks", "service-audit", "retrieval-config"}
     if container_name not in allowed:
         return _json_response({"error": "invalid_container", "allowed": sorted(allowed)}, 400)
 
-    limit = min(int(req.params.get("limit", "10")), 200)
+    limit_value = req.params.get("limit")
+    try:
+        limit = int(limit_value) if limit_value else 10
+    except (TypeError, ValueError):
+        return _json_response({"error": "invalid_limit"}, 400)
+    if limit < 1:
+        return _json_response({"error": "invalid_limit"}, 400)
+    limit = min(limit, 200)
     run_id = (req.params.get("runId") or "").strip()
-    deployment_instance = (req.params.get("deploymentInstanceId") or "").strip()
-    source_id = (req.params.get("sourceId") or "").strip()
+    source_id = req.params.get("sourceId") or ""
     owner_instance_id = (req.params.get("ownerInstanceId") or "").strip()
     unresolved_only = (req.params.get("unresolvedOnly") or "").strip().lower()
     document_key = (req.params.get("documentKey") or "").strip()
     recovery_filter_requested = bool(owner_instance_id or unresolved_only)
+    source_container_requested = container_name in {"source-documents", "search-chunks"}
 
     if recovery_filter_requested and (
         container_name != "ingestion-runs"
@@ -705,39 +1003,80 @@ def inspect_data(req: func.HttpRequest) -> func.HttpResponse:
                 "only with ingestion-runs"
             ),
         }, 400)
-    if not recovery_filter_requested and (run_id or source_id) and (
-        container_name != "source-documents" or not run_id or not source_id
-    ):
+    if source_container_requested and not source_id:
         return _json_response({
-            "error": "sourceId and runId are required only with source-documents",
+            "error": "sourceId is required with source-documents or search-chunks",
         }, 400)
-    if document_key and (
-        container_name != "search-chunks"
-        or recovery_filter_requested
-        or bool(run_id or source_id or deployment_instance)
+    if run_id and (container_name != "source-documents" or recovery_filter_requested):
+        return _json_response({
+            "error": "runId is supported only with sourceId and source-documents",
+        }, 400)
+    if document_key and (container_name != "search-chunks" or recovery_filter_requested):
+        return _json_response({
+            "error": "documentKey is supported only with sourceId and search-chunks",
+        }, 400)
+    if (
+        not recovery_filter_requested
+        and source_id
+        and not source_container_requested
     ):
         return _json_response({
-            "error": "documentKey is supported only by itself with search-chunks",
+            "error": "sourceId is supported only with registered source containers",
         }, 400)
 
-    # retrieval-config is partitioned by deploymentInstanceId; the same catalog id can exist
-    # in multiple deployment partitions, so require an explicit partition and reject runId.
+    # retrieval-config is environment-local and partitioned by item id.
     if container_name == "retrieval-config":
-        if not deployment_instance:
-            return _json_response({"error": "deploymentInstanceId required for retrieval-config"}, 400)
+        if "deploymentInstanceId" in req.params:
+            return _json_response({"error": "deploymentInstanceId is not valid for retrieval-config"}, 400)
         if run_id:
             return _json_response({"error": "runId is not valid for retrieval-config"}, 400)
+
+    resolved_container = container_name
+    if source_container_requested:
+        try:
+            source_id = validate_source_id(source_id)
+        except SourceRegistryError as error:
+            return _json_response({"error": str(error)}, 400)
+        try:
+            plan = _build_source_registry_repository(load_config()).read_source_plan(source_id)
+        except SourceRegistryConflictError as error:
+            return _json_response({"error": str(error)}, 409)
+        except SourceRegistryError as error:
+            code = str(error)
+            if code == "source_registration_missing":
+                return _json_response({"error": code}, 404)
+            logger.exception("source inspection preflight incomplete source=%s", source_id)
+            return _json_response({"error": code}, 503)
+        except Exception:
+            logger.exception("source inspection preflight unavailable source=%s", source_id)
+            return _json_response({"error": "source_registry_unavailable"}, 503)
+        resolved_container = (
+            plan.source.manifests_container
+            if container_name == "source-documents"
+            else plan.source.chunks_container
+        )
 
     try:
         cosmos = create_cosmos_client(os.getenv("COSMOS_ENDPOINT", ""), os.getenv("AZURE_CLIENT_ID", ""))
         db = cosmos.get_database_client(os.getenv("COSMOS_DATABASE_NAME", ""))
-        container = db.get_container_client(container_name)
+        container = db.get_container_client(resolved_container)
 
-        if document_key:
+        if source_container_requested:
+            parameters = [
+                {"name": "@limit", "value": limit},
+                {"name": "@sourceId", "value": source_id},
+            ]
+            query_kwargs = {}
+            if run_id:
+                query_kwargs["partition_key"] = f"{source_id}:{run_id}"
+            elif document_key:
+                query_kwargs["partition_key"] = document_key
+            else:
+                query_kwargs["enable_cross_partition_query"] = True
             rows = list(container.query_items(
-                query="SELECT TOP @limit * FROM c",
-                parameters=[{"name": "@limit", "value": limit}],
-                partition_key=document_key,
+                query="SELECT TOP @limit * FROM c WHERE c.sourceId = @sourceId",
+                parameters=parameters,
+                **query_kwargs,
             ))
         elif recovery_filter_requested:
             rows = list(container.query_items(
@@ -758,7 +1097,7 @@ def inspect_data(req: func.HttpRequest) -> func.HttpResponse:
             rows = list(container.query_items(
                 query="SELECT TOP @limit * FROM c",
                 parameters=[{"name": "@limit", "value": limit}],
-                partition_key=deployment_instance,
+                enable_cross_partition_query=True,
             ))
         elif run_id:
             rows = list(container.query_items(
@@ -780,7 +1119,216 @@ def inspect_data(req: func.HttpRequest) -> func.HttpResponse:
         return _json_response({"error": "cosmos_query_failed"}, 503)
 
     sanitized = [{k: v for k, v in row.items() if not k.startswith("_")} for row in rows]
-    return _json_response({"container": container_name, "count": len(sanitized), "rows": sanitized}, 200)
+    return _json_response({
+        "container": container_name,
+        "resolvedContainer": resolved_container,
+        "count": len(sanitized),
+        "rows": sanitized,
+    }, 200)
+
+
+def _build_retrieval_config_container() -> Any:
+    from config import load_config
+    from cosmos_connection import create_cosmos_client
+
+    config = load_config()
+    cosmos = create_cosmos_client(
+        config.cosmos_endpoint,
+        config.managed_identity_client_id,
+    )
+    database = cosmos.get_database_client(config.cosmos_database)
+    return database.get_container_client(
+        os.getenv("RETRIEVAL_CONFIG_CONTAINER", "retrieval-config").strip()
+        or "retrieval-config"
+    )
+
+
+def _catalog_response(item: dict[str, Any], status: str, status_code: int) -> func.HttpResponse:
+    from retrieval.catalog import catalog_body, load_catalog_item
+
+    snapshot = load_catalog_item(item)
+    return _json_response(
+        {
+            "status": status,
+            "catalog": catalog_body(item),
+            "etag": snapshot.etag,
+            "catalogDigest": snapshot.digest,
+        },
+        status_code,
+        headers={"ETag": snapshot.etag} if snapshot.etag is not None else None,
+    )
+
+
+@app.route(
+    route="management/retrieval-config",
+    methods=["GET", "PUT"],
+    auth_level=func.AuthLevel.ANONYMOUS,
+)
+def manage_retrieval_config(req: func.HttpRequest) -> func.HttpResponse:
+    """Read or conditionally publish the environment-local runtime catalog."""
+    from retrieval.catalog import (
+        CATALOG_ID,
+        CatalogConflictError,
+        CatalogError,
+        CatalogSizeError,
+        apply_catalog_operation,
+        build_catalog_item,
+        catalog_body,
+        load_catalog_item,
+        prepare_catalog_operation,
+    )
+
+    authorization = _require_ingestion_operator(req)
+    if authorization is not None:
+        return authorization
+
+    body: Any = None
+    proposed: dict[str, Any] | None = None
+    if req.method == "PUT":
+        declared_length = (req.headers.get("Content-Length") or "").strip()
+        if (
+            declared_length.isdecimal()
+            and int(declared_length) > MAX_RETRIEVAL_CONFIG_REQUEST_BYTES
+        ):
+            return _json_response({"error": "catalog_request_too_large"}, 413)
+        raw_body = req.get_body()
+        if len(raw_body) > MAX_RETRIEVAL_CONFIG_REQUEST_BYTES:
+            return _json_response({"error": "catalog_request_too_large"}, 413)
+        try:
+            body = json.loads(raw_body)
+        except (TypeError, UnicodeDecodeError, json.JSONDecodeError):
+            return _json_response({"error": "invalid_json"}, 400)
+        if not isinstance(body, dict) or set(body) != {"config", "operationId", "reason"}:
+            return _json_response({"error": "invalid_catalog_request"}, 400)
+
+        if_match = (req.headers.get("If-Match") or "").strip()
+        if_none_match = (req.headers.get("If-None-Match") or "").strip()
+        bootstrap = if_none_match == "*" and not if_match
+        update = bool(if_match) and not if_none_match and if_match != "*"
+        if not bootstrap and not update:
+            return _json_response({"error": "catalog_precondition_required"}, 428)
+
+        source = {"config": body["config"]}
+        operation_id = body["operationId"]
+        reason = body["reason"]
+        try:
+            proposed = build_catalog_item(
+                source,
+                operation_id=operation_id,
+                changed_at=datetime.now(timezone.utc),
+                reason=reason,
+            )
+        except CatalogSizeError:
+            return _json_response({"error": "catalog_request_too_large"}, 413)
+        except CatalogError:
+            return _json_response({"error": "invalid_catalog"}, 400)
+
+    try:
+        container = _build_retrieval_config_container()
+    except Exception:
+        logger.exception("retrieval catalog container unavailable")
+        return _json_response({"error": "retrieval_config_unavailable"}, 503)
+
+    if req.method == "GET":
+        try:
+            item = container.read_item(item=CATALOG_ID, partition_key=CATALOG_ID)
+            return _catalog_response(item, "current", 200)
+        except Exception as error:
+            if getattr(error, "status_code", None) == 404:
+                return _json_response({"error": "catalog_not_found"}, 404)
+            logger.exception("retrieval catalog read failed")
+            return _json_response({"error": "retrieval_config_unavailable"}, 503)
+
+    assert isinstance(body, dict)
+    assert proposed is not None
+
+    try:
+        current = container.read_item(item=CATALOG_ID, partition_key=CATALOG_ID)
+    except Exception as error:
+        if getattr(error, "status_code", None) == 404:
+            current = None
+        else:
+            logger.exception("retrieval catalog precondition read failed")
+            return _json_response({"error": "retrieval_config_unavailable"}, 503)
+
+    if current is not None:
+        try:
+            current_snapshot = load_catalog_item(current)
+            if current_snapshot.operation_id == operation_id:
+                replay = build_catalog_item(
+                    source,
+                    operation_id=operation_id,
+                    changed_at=datetime.fromisoformat(
+                        current_snapshot.changed_at.replace("Z", "+00:00")
+                    ),
+                    reason=reason,
+                )
+                if catalog_body(current) != replay:
+                    return _json_response({"error": "operation_id_reused"}, 409)
+                return _catalog_response(current, "replayed", 200)
+        except CatalogError:
+            logger.exception("persisted retrieval catalog is invalid")
+            return _json_response({"error": "retrieval_config_unavailable"}, 503)
+
+    if bootstrap:
+        if current is not None:
+            return _json_response({"error": "catalog_already_exists"}, 412)
+        try:
+            created = container.create_item(body=proposed)
+            persisted = container.read_item(item=CATALOG_ID, partition_key=CATALOG_ID)
+            if catalog_body(created) != catalog_body(persisted):
+                raise CatalogConflictError("created catalog verification failed")
+            return _catalog_response(persisted, "created", 201)
+        except CatalogConflictError:
+            return _json_response({"error": "catalog_create_conflict"}, 409)
+        except Exception as error:
+            if getattr(error, "status_code", None) == 409:
+                return _json_response({"error": "catalog_already_exists"}, 412)
+            logger.exception("retrieval catalog create failed")
+            return _json_response({"error": "retrieval_config_unavailable"}, 503)
+
+    if current is None:
+        return _json_response({"error": "catalog_not_found"}, 412)
+    try:
+        snapshot = load_catalog_item(current)
+    except CatalogError:
+        logger.exception("persisted retrieval catalog is invalid")
+        return _json_response({"error": "retrieval_config_unavailable"}, 503)
+    if snapshot.etag != if_match:
+        return _json_response({"error": "catalog_etag_mismatch"}, 412)
+
+    try:
+        candidate, manifest = prepare_catalog_operation(
+            source,
+            operation_id=operation_id,
+            changed_at=datetime.now(timezone.utc),
+            expected_etag=if_match,
+            reason=reason,
+        )
+    except CatalogError:
+        return _json_response({"error": "invalid_catalog"}, 400)
+    try:
+        outcome = apply_catalog_operation(container, candidate, manifest)
+    except CatalogConflictError as error:
+        code = "catalog_etag_mismatch" if "ETag" in str(error) or "stale" in str(error) else "catalog_conflict"
+        return _json_response({"error": code}, 412 if code == "catalog_etag_mismatch" else 409)
+    except CatalogError:
+        logger.exception("retrieval catalog guarded write failed")
+        return _json_response({"error": "retrieval_config_unavailable"}, 503)
+    if outcome["status"] == "outcome-unknown":
+        return _json_response(
+            {"error": "catalog_outcome_unknown", "operationId": operation_id},
+            503,
+        )
+    try:
+        persisted = container.read_item(item=CATALOG_ID, partition_key=CATALOG_ID)
+    except Exception:
+        logger.exception("retrieval catalog verification read failed")
+        return _json_response(
+            {"error": "catalog_outcome_unknown", "operationId": operation_id},
+            503,
+        )
+    return _catalog_response(persisted, "updated", 200)
 
 
 _PARTITION_KEY_FIELD = {
@@ -788,7 +1336,7 @@ _PARTITION_KEY_FIELD = {
     "source-documents": "sourceRunId",
     "search-chunks": "documentKey",
     "service-audit": "id",
-    "retrieval-config": "deploymentInstanceId",
+    "retrieval-config": "id",
 }
 
 
@@ -814,7 +1362,6 @@ def purge_data(req: func.HttpRequest) -> func.HttpResponse:
     ids = body.get("ids")
     purge_all = body.get("purgeAll", False)
     confirm = body.get("confirm", "")
-    deployment_instance = (body.get("deploymentInstanceId") or "").strip()
     source_id = (body.get("sourceId") or "").strip()
 
     if not ids and not purge_all:
@@ -828,13 +1375,12 @@ def purge_data(req: func.HttpRequest) -> func.HttpResponse:
     if container_name in governed_containers and (not source_id or confirm != "yes"):
         return _json_response({"error": "sourceId and confirm:'yes' required for ingestion data purge"}, 400)
 
-    # retrieval-config holds runtime catalog config shared across deployments; require an
-    # explicit partition and confirmation, and never allow a catalog-wide purgeAll.
+    # retrieval-config is environment-local; require exact ids and confirmation.
     if container_name == "retrieval-config":
         if purge_all:
             return _json_response({"error": "purgeAll is not permitted for retrieval-config"}, 400)
-        if not deployment_instance:
-            return _json_response({"error": "deploymentInstanceId required for retrieval-config"}, 400)
+        if "deploymentInstanceId" in body:
+            return _json_response({"error": "deploymentInstanceId is not valid for retrieval-config"}, 400)
         if confirm != "yes":
             return _json_response({"error": "retrieval-config purge requires 'confirm':'yes'"}, 400)
 
@@ -847,14 +1393,15 @@ def purge_data(req: func.HttpRequest) -> func.HttpResponse:
     purge_registry = None
     purge_owner_id = None
     purge_maintenance_acquired = False
+    audit_business_name = None
 
     try:
         cosmos = create_cosmos_client(os.getenv("COSMOS_ENDPOINT", ""), os.getenv("AZURE_CLIENT_ID", ""))
         db = cosmos.get_database_client(os.getenv("COSMOS_DATABASE_NAME", ""))
-        container = db.get_container_client(container_name)
-        audit_container = db.get_container_client("service-audit")
+        resolved_container_name = container_name
         if container_name in governed_containers:
             from config import load_config
+            from ingestion.source_registry import config_for_source
 
             purge_config = load_config()
             purge_registry = _build_source_registry_repository(purge_config)
@@ -866,6 +1413,15 @@ def purge_data(req: func.HttpRequest) -> func.HttpResponse:
                 operation="operator-purge",
             )
             purge_maintenance_acquired = True
+            purge_config = config_for_source(purge_config, purge_plan)
+            audit_business_name = purge_config.business_name
+            resolved_container_name = (
+                purge_config.cosmos_source_documents_container
+                if container_name == "source-documents"
+                else purge_config.cosmos_search_chunks_container
+            )
+        container = db.get_container_client(resolved_container_name)
+        audit_container = db.get_container_client("service-audit")
         deleted_ids = []
         failed = 0
 
@@ -874,7 +1430,7 @@ def purge_data(req: func.HttpRequest) -> func.HttpResponse:
             for item_id in ids:
                 try:
                     if container_name == "retrieval-config":
-                        container.delete_item(item=item_id, partition_key=deployment_instance)
+                        container.delete_item(item=item_id, partition_key=item_id)
                         deleted_ids.append(item_id)
                         continue
                     items = list(container.query_items(
@@ -944,7 +1500,7 @@ def purge_data(req: func.HttpRequest) -> func.HttpResponse:
             "deletedCount": len(deleted_ids),
             "failedCount": failed,
             "purgeAll": purge_all,
-        })
+        }, business_name=audit_business_name)
         logger.warning("purge_executed container=%s deleted=%d failed=%d operator=%s", container_name, len(deleted_ids), failed, operator)
 
         return _json_response({"deleted": len(deleted_ids), "failed": failed, "auditId": audit_id}, 200)
@@ -964,145 +1520,6 @@ def purge_data(req: func.HttpRequest) -> func.HttpResponse:
             except Exception:
                 logger.exception("operator purge maintenance release failed")
         return _json_response({"error": "purge_failed"}, 503)
-
-
-@app.route(route="query", methods=["POST"], auth_level=func.AuthLevel.ANONYMOUS)
-def query_endpoint(req: func.HttpRequest) -> func.HttpResponse:
-    """Proxy RAG queries to the internal ACA retrieval service."""
-    import httpx
-    import uuid
-    from retrieval.auth import (
-        AuthorizationError,
-        GATEWAY_CONTEXT_HEADER,
-        GATEWAY_REQUEST_ID_HEADER,
-        gateway_context_from_easy_auth_user,
-    )
-
-    request_id = str(uuid.uuid4())
-
-    def error_response(code: str, message: str, status: int) -> func.HttpResponse:
-        return _json_response({
-            "error": {"code": code, "message": message},
-            "request_id": request_id,
-        }, status)
-
-    try:
-        body = req.get_json()
-        if not isinstance(body, dict):
-            return error_response("invalid_request", "Request body must be an object.", 400)
-        question = body.get("question")
-        if not isinstance(question, str) or not question.strip():
-            return error_response("question_required", "A question is required.", 400)
-        retrieval_url = os.getenv("RETRIEVAL_SERVICE_URL", "").strip()
-        if not retrieval_url:
-            return error_response("gateway_not_configured", "Retrieval is unavailable.", 503)
-        try:
-            retrieval_url = _validated_retrieval_service_url(retrieval_url)
-        except ValueError:
-            return error_response("gateway_not_configured", "Retrieval is unavailable.", 503)
-        context = gateway_context_from_easy_auth_user(
-            req.headers.get("X-MS-CLIENT-PRINCIPAL"),
-            expected_tenant_id=os.getenv("TENANT_ID", "").strip(),
-            expected_audience=os.getenv("FUNCTION_API_AUDIENCE", "").strip(),
-        )
-        scope = os.getenv("RETRIEVAL_SERVICE_SCOPE", "").strip()
-        if not scope:
-            return error_response("gateway_not_configured", "Retrieval is unavailable.", 503)
-        token = _build_retrieval_service_credential().get_token(scope)
-        proxy_timeout = float(os.getenv("QUERY_PROXY_TIMEOUT_SECONDS", "30.0"))
-        with httpx.Client(timeout=proxy_timeout) as client:
-            resp = client.post(
-                f"{retrieval_url}/api/query",
-                json=body,
-                headers={
-                    "Authorization": f"Bearer {token.token}",
-                    GATEWAY_CONTEXT_HEADER: context.encode(),
-                    GATEWAY_REQUEST_ID_HEADER: request_id,
-                },
-            )
-        if resp.status_code in (401, 403):
-            logger.warning(
-                "Retrieval gateway rejected request status=%d request_id=%s",
-                resp.status_code,
-                request_id,
-            )
-            return error_response("retrieval_auth_failed", "Retrieval is unavailable.", 502)
-        if resp.status_code >= 500:
-            if resp.status_code == 502 and len(resp.content) <= 1_048_576:
-                try:
-                    payload = resp.json()
-                except ValueError:
-                    payload = None
-                if (
-                    isinstance(payload, dict)
-                    and isinstance(payload.get("error"), dict)
-                    and payload["error"].get("code") == "answer_citation_invalid"
-                ):
-                    return error_response(
-                        "answer_citation_invalid",
-                        "The generated answer could not be validated.",
-                        502,
-                    )
-            return error_response("retrieval_unavailable", "Retrieval is unavailable.", 502)
-        if len(resp.content) > 1_048_576:
-            return error_response("invalid_retrieval_response", "Retrieval returned an invalid response.", 502)
-        try:
-            payload = resp.json()
-        except ValueError:
-            return error_response("invalid_retrieval_response", "Retrieval returned an invalid response.", 502)
-        if resp.status_code >= 400:
-            if (
-                resp.status_code == 422
-                and isinstance(payload, dict)
-                and isinstance(payload.get("error"), dict)
-                and payload["error"].get("code") == "content_filtered"
-            ):
-                return error_response(
-                    "content_filtered",
-                    "The request could not be completed under the content safety policy.",
-                    422,
-                )
-            return error_response("retrieval_request_failed", "The retrieval request failed.", resp.status_code)
-        if (
-            not isinstance(payload, dict)
-            or not isinstance(payload.get("answer"), str)
-            or not isinstance(payload.get("citations"), list)
-        ):
-            return error_response("invalid_retrieval_response", "Retrieval returned an invalid response.", 502)
-        payload["request_id"] = request_id
-        return _json_response(payload, 200)
-    except AuthorizationError:
-        return error_response("unauthorized", "Authentication is required.", 401)
-    except httpx.TimeoutException:
-        return error_response("retrieval_timeout", "Retrieval timed out.", 504)
-    except Exception:
-        logger.exception("Query proxy failed")
-        return error_response("service_unavailable", "Retrieval is unavailable.", 503)
-
-
-def _validated_retrieval_service_url(value: str) -> str:
-    from urllib.parse import urlsplit
-
-    parsed = urlsplit(value)
-    try:
-        port = parsed.port
-    except ValueError as error:
-        raise ValueError("invalid retrieval service URL") from error
-    host = parsed.hostname.lower() if parsed.hostname else ""
-    if (
-        parsed.scheme != "https"
-        or not host.endswith(".azurecontainerapps.io")
-        or len(host.split(".")) < 5
-        or parsed.username is not None
-        or parsed.password is not None
-        or port not in (None, 443)
-        or parsed.path not in ("", "/")
-        or parsed.query
-        or parsed.fragment
-    ):
-        raise ValueError("invalid retrieval service URL")
-    return f"https://{host}"
-
 
 
 def _current_full_sync_instance_id(repository, source_id: str) -> str | None:
@@ -1254,7 +1671,7 @@ def _load_validated_source_plans(config):
     continuation_token = None
     while True:
         page = registry.list_source_inventory_page(
-            page_size=SOURCE_DISPATCH_PAGE_SIZE,
+            page_size=EXECUTION_CONFIG.source_dispatch_page_size,
             continuation_token=continuation_token,
         )
         for source_id in page.duplicate_drive_source_ids:
@@ -1471,6 +1888,7 @@ async def webhook_sharepoint(req: func.HttpRequest, client) -> func.HttpResponse
                 )
                 _write_webhook_audit(
                     plan.source_id,
+                    plan.source.business_name,
                     "webhook_received",
                     {"action": "delta_sync_triggered"},
                 )
@@ -1693,12 +2111,21 @@ def multi_source_full_sync_orchestrator(context: df.DurableOrchestrationContext)
     pages_done = False
     fatal_error = None
     while True:
-        while queue and fatal_error is None and len(in_flight) < SOURCE_DISPATCH_PAGE_SIZE:
+        while (
+            queue
+            and fatal_error is None
+            and len(in_flight) < EXECUTION_CONFIG.source_dispatch_page_size
+        ):
             source_id, source = queue.pop(0)
             child_id = _source_dispatch_child_instance_id(dispatch_id, source_id)
             task = context.call_sub_orchestrator("full_sync_orchestrator", source, child_id)
             in_flight.append((task, source_id, child_id))
-        if not queue and not pages_done and fatal_error is None and len(in_flight) < SOURCE_DISPATCH_PAGE_SIZE:
+        if (
+            not queue
+            and not pages_done
+            and fatal_error is None
+            and len(in_flight) < EXECUTION_CONFIG.source_dispatch_page_size
+        ):
             page = yield context.call_activity(
                 "list_source_dispatch_page_activity",
                 {"dispatchId": dispatch_id, "continuationToken": continuation_token},
@@ -1757,7 +2184,7 @@ def multi_source_full_sync_orchestrator(context: df.DurableOrchestrationContext)
         "dispatchId": dispatch_id,
         "inventory": inventory_counts,
         "drives": dispatch_counts,
-        "outcomePageSize": SOURCE_DISPATCH_PAGE_SIZE,
+        "outcomePageSize": EXECUTION_CONFIG.source_dispatch_page_size,
     }
 
 
@@ -1774,7 +2201,7 @@ def prepare_source_inventory_page_activity(payload: dict) -> dict:
         registry = _build_source_registry_repository(config)
         registry.begin_source_dispatch(dispatch_id)
         page = registry.list_source_inventory_page(
-            page_size=SOURCE_DISPATCH_PAGE_SIZE,
+            page_size=EXECUTION_CONFIG.source_dispatch_page_size,
             continuation_token=payload.get("continuationToken"),
         )
         counts = {
@@ -1867,7 +2294,7 @@ def list_source_dispatch_page_activity(payload: dict) -> dict:
         registry = _build_source_registry_repository(config)
         page = registry.list_source_dispatch_page(
             payload["dispatchId"],
-            page_size=SOURCE_DISPATCH_PAGE_SIZE,
+            page_size=EXECUTION_CONFIG.source_dispatch_page_size,
             continuation_token=payload.get("continuationToken"),
         )
         return {"items": list(page.items), "continuationToken": page.continuation_token}
@@ -1901,7 +2328,7 @@ def list_source_dispatch_outcomes_page_activity(payload: dict) -> dict:
         registry = _build_source_registry_repository(config)
         page = registry.list_source_dispatch_outcomes_page(
             payload["dispatchId"],
-            page_size=SOURCE_DISPATCH_PAGE_SIZE,
+            page_size=EXECUTION_CONFIG.source_dispatch_page_size,
             continuation_token=payload.get("continuationToken"),
         )
         return {"items": list(page.items), "continuationToken": page.continuation_token}
@@ -2167,7 +2594,9 @@ def full_sync_orchestrator(context: df.DurableOrchestrationContext):
                 claim_failed = True
 
         if tasks:
-            deadline = context.current_utc_datetime + timedelta(minutes=WAVE_TIMEOUT_MINUTES)
+            deadline = context.current_utc_datetime + timedelta(
+                minutes=EXECUTION_CONFIG.wave_timeout_minutes
+            )
             timer = context.create_timer(deadline)
             wave_task = context.task_all(tasks)
             try:
@@ -2396,7 +2825,14 @@ def delta_sync_orchestrator(context: df.DurableOrchestrationContext):
     )
     if result.get("error"):
         return {"status": "failed", "error": result["error"]}
-    for key in ("createdOrUpdated", "deleted", "aclResynced", "failed", "pending"):
+    for key in (
+        "createdOrUpdated",
+        "deleted",
+        "aclResynced",
+        "quarantined",
+        "failed",
+        "pending",
+    ):
         totals[key] = totals.get(key, 0) + result.get(key, 0)
     totals["bootstrapped"] = result.get("bootstrapped", totals.get("bootstrapped", False))
     totals["itemsSeen"] = max(totals.get("itemsSeen", 0), result.get("itemsSeen", 0))
@@ -2861,7 +3297,8 @@ def audio_transcription_poll_page_activity(payload: dict) -> dict:
         outcome, token = run_audio_transcription_poll_page(
             config, repository, lifecycle_repository, connector, language_client, openai_client,
             speech_token_provider=speech_token_provider, blob_service_client=blob_service_client,
-            page_size=AUDIO_POLL_PAGE_SIZE, continuation_token=payload.get("continuationToken"),
+            page_size=EXECUTION_CONFIG.audio_poll_page_size,
+            continuation_token=payload.get("continuationToken"),
             audit_container=audit_container,
             settlement_only=settlement_only,
             work_registry=registry,
@@ -3100,7 +3537,9 @@ def retry_failed_orchestrator(context: df.DurableOrchestrationContext):
                     "coordinatorOwnerId": owner_instance_id,
                 },
             )
-            deadline = context.current_utc_datetime + timedelta(minutes=WAVE_TIMEOUT_MINUTES)
+            deadline = context.current_utc_datetime + timedelta(
+                minutes=EXECUTION_CONFIG.wave_timeout_minutes
+            )
             timer = context.create_timer(deadline)
             try:
                 winner = yield context.task_any([task, timer])
@@ -3275,7 +3714,9 @@ def retry_failed_orchestrator(context: df.DurableOrchestrationContext):
                 "coordinatorOwnerId": owner_instance_id,
             },
         )
-        deadline = context.current_utc_datetime + timedelta(minutes=WAVE_TIMEOUT_MINUTES)
+        deadline = context.current_utc_datetime + timedelta(
+            minutes=EXECUTION_CONFIG.wave_timeout_minutes
+        )
         timer = context.create_timer(deadline)
         try:
             winner = yield context.task_any([task, timer])
@@ -3458,7 +3899,7 @@ def list_discovered_documents_page_activity(payload: dict) -> dict:
         source_run_id = f"{config.source_id}:{payload['runId']}"
         page = repository.list_document_page(
             source_run_id,
-            page_size=WAVE_SIZE,
+            page_size=EXECUTION_CONFIG.wave_size,
             continuation_token=payload.get("continuationToken"),
         )
         return {
@@ -3584,7 +4025,7 @@ def process_document_activity(payload: dict) -> dict:
 
         sp_client = _build_sharepoint_client(config)
         connector = SharePointConnector(graph_client, config.drive_id, sp_client=sp_client, site_url=config.sharepoint_site_url)
-        for attempt in range(1, PROCESS_DOCUMENT_MAX_ATTEMPTS + 1):
+        for attempt in range(1, EXECUTION_CONFIG.process_document_max_attempts + 1):
             stored = repository.get_document(document_ref["sourceRunId"], document_ref["documentId"])
             if stored is None:
                 return record_outcome({
@@ -3631,7 +4072,11 @@ def process_document_activity(payload: dict) -> dict:
                     "chunksWritten": outcome.chunks_written,
                     "error": None,
                 })
-            if outcome.error is None or not outcome.error.retryable or attempt >= PROCESS_DOCUMENT_MAX_ATTEMPTS:
+            if (
+                outcome.error is None
+                or not outcome.error.retryable
+                or attempt >= EXECUTION_CONFIG.process_document_max_attempts
+            ):
                 return record_outcome({
                     "documentId": outcome.document_id,
                     "status": outcome.status.value,
@@ -3657,7 +4102,7 @@ def process_document_activity(payload: dict) -> dict:
                     "error": "retry_reset_conflict",
                 }
             jitter = int(document_ref["documentId"][:2], 16) % 30
-            delay = PROCESS_DOCUMENT_RETRY_DELAY_SECONDS + jitter
+            delay = EXECUTION_CONFIG.process_document_retry_delay_seconds + jitter
             logger.warning(
                 "process_document_activity retrying document=%s attempt=%d delay_seconds=%d error=%s",
                 document_ref["documentId"], attempt + 1, delay, outcome.error.code,
@@ -3810,7 +4255,7 @@ def delta_sync_activity(payload: Any) -> dict:
             owner_instance_id=owner_instance_id,
             delta_execution_id=payload.get("deltaExecutionId") or owner_instance_id,
             reduced_items_continuation_token=payload.get("reducedItemsContinuationToken"),
-            reduced_items_page_size=SOURCE_DISPATCH_PAGE_SIZE * 5,
+            reduced_items_page_size=EXECUTION_CONFIG.source_dispatch_page_size * 5,
             processing_phase=payload.get("processingPhase", "items"),
             phase_continuation_token=payload.get("phaseContinuationToken"),
             defer_cursor_commit=payload.get("deferCursorCommit") is True,
@@ -3819,9 +4264,10 @@ def delta_sync_activity(payload: Any) -> dict:
             round_start_link=payload.get("roundStartLink"),
         )
         logger.info(
-            "delta_sync_completed source=%s bootstrapped=%s created_or_updated=%d deleted=%d acl_resynced=%d failed=%d pending=%d items_seen=%d",
+            "delta_sync_completed source=%s bootstrapped=%s created_or_updated=%d deleted=%d acl_resynced=%d quarantined=%d failed=%d pending=%d items_seen=%d",
             config.source_id, outcome.bootstrapped, outcome.created_or_updated, outcome.deleted,
-            outcome.acl_resynced, outcome.failed, outcome.pending, outcome.items_seen,
+            outcome.acl_resynced, outcome.quarantined, outcome.failed, outcome.pending,
+            outcome.items_seen,
         )
         if (
             outcome.continuation_token is None
@@ -3844,6 +4290,7 @@ def delta_sync_activity(payload: Any) -> dict:
             "createdOrUpdated": outcome.created_or_updated,
             "deleted": outcome.deleted,
             "aclResynced": outcome.acl_resynced,
+            "quarantined": outcome.quarantined,
             "failed": outcome.failed,
             "pending": outcome.pending,
             "itemsSeen": outcome.items_seen,
@@ -3886,7 +4333,7 @@ def full_sync_absence_reconcile_page_activity(payload: dict) -> dict:
             lifecycle_repository,
             connector,
             current_source_run_id=create_source_run_id(config.source_id, payload["currentRunId"]),
-            page_size=LIFECYCLE_RECONCILE_PAGE_SIZE,
+            page_size=EXECUTION_CONFIG.lifecycle_reconcile_page_size,
             continuation_token=payload.get("continuationToken"),
             work_registry=registry,
             source_plan=source_plan,
@@ -4057,7 +4504,7 @@ def acl_resync_page_activity(payload: dict) -> dict:
         connector = SharePointConnector(graph_client, config.drive_id, sp_client=sp_client, site_url=config.sharepoint_site_url)
         outcome, token = run_acl_resync_page(
             config, lifecycle_repository, connector,
-            page_size=ACL_RESYNC_PAGE_SIZE,
+            page_size=EXECUTION_CONFIG.acl_resync_page_size,
             continuation_token=payload.get("continuationToken"),
             audit_container=audit_container,
             work_registry=registry,
@@ -4086,7 +4533,11 @@ def acl_resync_page_activity(payload: dict) -> dict:
 @app.activity_trigger(input_name="payload")
 def source_retirement_page_activity(payload: dict) -> dict:
     from config import load_config
-    from ingestion.source_registry import SourcePlan, SourceRegistryConflictError
+    from ingestion.source_registry import (
+        SourcePlan,
+        SourceRegistryConflictError,
+        config_for_source,
+    )
     from ingestion.services import run_source_retirement_page
 
     try:
@@ -4098,19 +4549,22 @@ def source_retirement_page_activity(payload: dict) -> dict:
             owner_instance_id=payload.get("coordinatorOwnerId"),
             operation="source-retirement",
         )
+        config = config_for_source(config, plan)
         lifecycle_repository = _build_lifecycle_repository(config)
         deleted = run_source_retirement_page(
             lifecycle_repository,
             _build_audit_container(config),
             source_id=plan.source_id,
-            page_size=LIFECYCLE_RECONCILE_PAGE_SIZE,
+            page_size=EXECUTION_CONFIG.lifecycle_reconcile_page_size,
             work_registry=registry,
             owner_instance_id=payload["coordinatorOwnerId"],
+            business_name=plan.source.business_name,
         )
         deleted_orphans = 0
         if not deleted:
             deleted_orphans = lifecycle_repository.delete_source_chunks_page(
-                source_id=plan.source_id, page_size=LIFECYCLE_RECONCILE_PAGE_SIZE,
+                source_id=plan.source_id,
+                page_size=EXECUTION_CONFIG.lifecycle_reconcile_page_size,
             )
         if registry.read_source_plan(plan.source_id) != plan:
             raise SourceRegistryConflictError("source_catalog_changed")
@@ -4162,7 +4616,7 @@ def source_reprovision_page_activity(payload: dict) -> dict:
             owner_instance_id=payload.get("coordinatorOwnerId"),
             operator_object_id=payload.get("operatorObjectId"),
             operator=payload.get("operator") or "unknown",
-            page_size=LIFECYCLE_RECONCILE_PAGE_SIZE,
+            page_size=EXECUTION_CONFIG.lifecycle_reconcile_page_size,
         )
         return {
             "deletedRecords": result["deletedRecords"],
@@ -4223,6 +4677,7 @@ def complete_source_reprovision_activity(payload: dict) -> dict:
             "source-reprovision",
             {
                 "operation": "source_reprovision_prepared",
+                "businessName": completed.source.business_name,
                 "desiredState": completed.source.desired_state,
                 "catalogEtag": completed.catalog_etag,
                 "deletedOperationalRecords": payload.get("deletedRecords", 0),
@@ -4267,6 +4722,7 @@ def complete_reprovision_full_sync_activity(payload: dict) -> dict:
             "source-reprovision",
             {
                 "operation": "source_reprovisioned",
+                "businessName": plan.source.business_name,
                 "desiredState": "paused",
                 "catalogEtag": plan.catalog_etag,
                 "fullSyncRequired": False,
@@ -4280,6 +4736,7 @@ def complete_reprovision_full_sync_activity(payload: dict) -> dict:
 @app.activity_trigger(input_name="payload")
 def lifecycle_reconcile_page_activity(payload: dict) -> dict:
     from ingestion.services import run_lifecycle_reconciliation_page
+    from ingestion.source_connector import SharePointConnector
 
     registry = None
     source_plan = None
@@ -4297,11 +4754,26 @@ def lifecycle_reconcile_page_activity(payload: dict) -> dict:
         )
         repository = _build_repository(config)
         lifecycle_repository = _build_lifecycle_repository(config)
+        connector: SharePointConnector | None = None
+
+        def connector_provider() -> SharePointConnector:
+            nonlocal connector
+            if connector is None:
+                connector = SharePointConnector(
+                    _build_graph_client(config),
+                    config.drive_id,
+                    sp_client=_build_sharepoint_client(config),
+                    site_url=config.sharepoint_site_url,
+                )
+            return connector
+
         outcome, token = run_lifecycle_reconciliation_page(
+            config,
             repository,
             lifecycle_repository,
+            connector_provider,
             source_id=config.source_id,
-            page_size=LIFECYCLE_RECONCILE_PAGE_SIZE,
+            page_size=EXECUTION_CONFIG.lifecycle_reconcile_page_size,
             continuation_token=payload.get("continuationToken"),
             work_registry=registry,
             source_plan=source_plan,
@@ -4353,7 +4825,7 @@ def duplicate_version_reconcile_page_activity(payload: dict) -> dict:
             config,
             repository,
             lifecycle_repository,
-            page_size=LIFECYCLE_RECONCILE_PAGE_SIZE,
+            page_size=EXECUTION_CONFIG.lifecycle_reconcile_page_size,
             continuation_token=payload.get("continuationToken"),
             work_registry=registry,
             source_plan=source_plan,
@@ -4397,7 +4869,7 @@ def orphan_chunk_reconcile_page_activity(payload: dict) -> dict:
             repository,
             lifecycle_repository,
             source_id=config.source_id,
-            page_size=LIFECYCLE_RECONCILE_PAGE_SIZE,
+            page_size=EXECUTION_CONFIG.lifecycle_reconcile_page_size,
             continuation_token=payload.get("continuationToken"),
             work_registry=registry,
             source_plan=source_plan,
@@ -4474,24 +4946,11 @@ def _retire_prior_version(
                 "operation": "document_deleted", "documentId": document_id,
                 "reason": "superseded", "method": method,
                 "replacedDocumentKey": ref.document_key,
-            })
+            }, business_name=config.business_name)
 
 
 # Built once per worker and reused across invocations (Azure Functions Python guidance).
 _client_cache: dict[str, Any] = {}
-
-
-def _build_retrieval_service_credential():
-    if "retrieval_service_credential" not in _client_cache:
-        from azure.identity import ManagedIdentityCredential
-
-        client_id = os.getenv("MANAGED_IDENTITY_CLIENT_ID", "").strip()
-        if not client_id:
-            raise EnvironmentError("MANAGED_IDENTITY_CLIENT_ID is required")
-        _client_cache["retrieval_service_credential"] = ManagedIdentityCredential(
-            client_id=client_id
-        )
-    return _client_cache["retrieval_service_credential"]
 
 
 def _build_cosmos_client(config):
@@ -4504,30 +4963,40 @@ def _build_cosmos_client(config):
     return _client_cache["cosmos_client"]
 
 
+def _content_repository_cache_key(config):
+    return (
+        config.cosmos_database,
+        config.cosmos_source_documents_container,
+        config.cosmos_search_chunks_container,
+    )
+
+
 def _build_repository(config):
-    if "repository" not in _client_cache:
+    cache_key = f"repository:{_content_repository_cache_key(config)}"
+    if cache_key not in _client_cache:
         from ingestion.repository import IngestionRepository
         cosmos = _build_cosmos_client(config)
         db = cosmos.get_database_client(config.cosmos_database)
-        _client_cache["repository"] = IngestionRepository(
+        _client_cache[cache_key] = IngestionRepository(
             db.get_container_client(config.cosmos_ingestion_runs_container),
             db.get_container_client(config.cosmos_source_documents_container),
             db.get_container_client(config.cosmos_search_chunks_container),
         )
-    return _client_cache["repository"]
+    return _client_cache[cache_key]
 
 
 def _build_lifecycle_repository(config):
-    if "lifecycle_repository" not in _client_cache:
+    cache_key = f"lifecycle_repository:{_content_repository_cache_key(config)}"
+    if cache_key not in _client_cache:
         from ingestion.lifecycle_repository import DocumentLifecycleRepository
         cosmos = _build_cosmos_client(config)
         db = cosmos.get_database_client(config.cosmos_database)
-        _client_cache["lifecycle_repository"] = DocumentLifecycleRepository(
+        _client_cache[cache_key] = DocumentLifecycleRepository(
             db.get_container_client(config.cosmos_ingestion_runs_container),
             db.get_container_client(config.cosmos_source_documents_container),
             db.get_container_client(config.cosmos_search_chunks_container),
         )
-    return _client_cache["lifecycle_repository"]
+    return _client_cache[cache_key]
 
 
 def _build_source_registry_repository(config):
@@ -4591,14 +5060,25 @@ def _resolve_source_config(payload: dict[str, Any]):
     return config_for_source(config, source_plan), source_plan, registry
 
 
-def _write_webhook_audit(source_id: str, operation: str, extra: dict) -> None:
+def _write_webhook_audit(
+    source_id: str,
+    business_name: str,
+    operation: str,
+    extra: dict,
+) -> None:
     """Best-effort audit record for webhook events."""
     try:
         from config import load_config
         config = load_config()
         container = _build_audit_container(config)
         from ingestion.telemetry import write_audit_record
-        write_audit_record(container, source_id, "webhook", {"operation": operation, **extra})
+        write_audit_record(
+            container,
+            source_id,
+            "webhook",
+            {"operation": operation, **extra},
+            business_name=business_name,
+        )
     except Exception:
         logger.warning("webhook_audit_write_failed", exc_info=True)
 
@@ -4607,13 +5087,13 @@ def _build_graph_client(config):
     """Cached across invocations — do not wrap call sites in `with graph_client:`, that
     would close this shared client after first use."""
     if "graph_client" not in _client_cache:
-        from azure.identity import CertificateCredential, DefaultAzureCredential
+        from azure.identity import CertificateCredential
         from azure.keyvault.secrets import SecretClient
         from ingestion.graph import GraphCredentialAuth
         import httpx
         import base64
 
-        credential = DefaultAzureCredential(managed_identity_client_id=config.managed_identity_client_id)
+        credential = create_azure_credential(config.managed_identity_client_id)
         secret_client = SecretClient(config.key_vault_uri, credential)
         try:
             cert_secret = secret_client.get_secret(config.certificate_secret_name)
@@ -4645,17 +5125,17 @@ def _build_sharepoint_client(config):
         _build_graph_client(config),
         config.drive_id,
         config.sharepoint_site_url,
-        config.acl_max_pages,
+        config.execution.acl_max_pages,
         expected_site_id=getattr(config, "sharepoint_site_id", None),
     )
     cache_key = f"sharepoint_client:{host}"
     if cache_key not in _client_cache:
-        from azure.identity import CertificateCredential, DefaultAzureCredential
+        from azure.identity import CertificateCredential
         from azure.keyvault.secrets import SecretClient
         import httpx
         import base64
 
-        credential = DefaultAzureCredential(managed_identity_client_id=config.managed_identity_client_id)
+        credential = create_azure_credential(config.managed_identity_client_id)
         secret_client = SecretClient(config.key_vault_uri, credential)
         cert_secret = secret_client.get_secret(config.certificate_secret_name)
         cert_data = base64.b64decode(cert_secret.value, validate=True)
@@ -4677,8 +5157,7 @@ def _build_sharepoint_client(config):
 def _build_di_client(config):
     if "di_client" not in _client_cache:
         from azure.ai.documentintelligence import DocumentIntelligenceClient
-        from azure.identity import DefaultAzureCredential
-        credential = DefaultAzureCredential(managed_identity_client_id=config.managed_identity_client_id)
+        credential = create_azure_credential(config.managed_identity_client_id)
         _client_cache["di_client"] = DocumentIntelligenceClient(endpoint=config.document_intelligence_endpoint, credential=credential)
     return _client_cache["di_client"]
 
@@ -4696,8 +5175,7 @@ def _build_extraction_clients(config):
 def _build_cu_client(config):
     if "cu_client" not in _client_cache:
         from azure.ai.contentunderstanding import ContentUnderstandingClient
-        from azure.identity import DefaultAzureCredential
-        credential = DefaultAzureCredential(managed_identity_client_id=config.managed_identity_client_id)
+        credential = create_azure_credential(config.managed_identity_client_id)
         _client_cache["cu_client"] = ContentUnderstandingClient(
             endpoint=config.content_understanding_endpoint.rstrip("/"),
             credential=credential,
@@ -4708,17 +5186,16 @@ def _build_cu_client(config):
 def _build_language_client(config):
     if "language_client" not in _client_cache:
         from azure.ai.textanalytics import TextAnalyticsClient
-        from azure.identity import DefaultAzureCredential
-        credential = DefaultAzureCredential(managed_identity_client_id=config.managed_identity_client_id)
+        credential = create_azure_credential(config.managed_identity_client_id)
         _client_cache["language_client"] = TextAnalyticsClient(endpoint=config.language_endpoint, credential=credential, api_version="2023-04-01")
     return _client_cache["language_client"]
 
 
 def _build_openai_client(config):
     if "openai_client" not in _client_cache:
-        from azure.identity import DefaultAzureCredential, get_bearer_token_provider
+        from azure.identity import get_bearer_token_provider
         from openai import AzureOpenAI
-        credential = DefaultAzureCredential(managed_identity_client_id=config.managed_identity_client_id)
+        credential = create_azure_credential(config.managed_identity_client_id)
         _client_cache["openai_client"] = AzureOpenAI(
             azure_endpoint=config.openai_endpoint,
             azure_ad_token_provider=get_bearer_token_provider(credential, "https://cognitiveservices.azure.com/.default"),
@@ -4729,8 +5206,8 @@ def _build_openai_client(config):
 
 def _build_speech_token_provider(config):
     if "speech_token_provider" not in _client_cache:
-        from azure.identity import DefaultAzureCredential, get_bearer_token_provider
-        credential = DefaultAzureCredential(managed_identity_client_id=config.managed_identity_client_id)
+        from azure.identity import get_bearer_token_provider
+        credential = create_azure_credential(config.managed_identity_client_id)
         _client_cache["speech_token_provider"] = get_bearer_token_provider(
             credential, "https://cognitiveservices.azure.com/.default",
         )
@@ -4739,9 +5216,8 @@ def _build_speech_token_provider(config):
 
 def _build_audio_staging_client(config):
     if "audio_staging_client" not in _client_cache:
-        from azure.identity import DefaultAzureCredential
         from azure.storage.blob import BlobServiceClient
-        credential = DefaultAzureCredential(managed_identity_client_id=config.managed_identity_client_id)
+        credential = create_azure_credential(config.managed_identity_client_id)
         _client_cache["audio_staging_client"] = BlobServiceClient(
             account_url=config.audio_staging_blob_endpoint, credential=credential,
         )
@@ -4757,5 +5233,15 @@ def _build_audit_container(config):
     return _client_cache["audit_container"]
 
 
-def _json_response(payload: dict, status_code: int) -> func.HttpResponse:
-    return func.HttpResponse(json.dumps(payload, default=str), status_code=status_code, mimetype="application/json")
+def _json_response(
+    payload: dict,
+    status_code: int,
+    *,
+    headers: dict[str, str] | None = None,
+) -> func.HttpResponse:
+    return func.HttpResponse(
+        json.dumps(payload, default=str),
+        status_code=status_code,
+        mimetype="application/json",
+        headers=headers,
+    )
