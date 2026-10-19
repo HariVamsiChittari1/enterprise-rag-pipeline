@@ -29,6 +29,8 @@ def write_audit_record(
     source_id: str,
     run_id: str,
     record: dict[str, Any],
+    *,
+    business_name: str | None = None,
 ) -> None:
     """Persist one audit item. Never raises; failures are logged only."""
     item = {
@@ -38,6 +40,8 @@ def write_audit_record(
         "recordedAt": datetime.now(timezone.utc).isoformat(),
         **record,
     }
+    if business_name is not None:
+        item["businessName"] = business_name
     try:
         container.create_item(item)
     except Exception:

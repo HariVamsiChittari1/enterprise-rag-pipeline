@@ -38,6 +38,9 @@ def write_audit_records(
     tenant_id: str,
     mode: str,
     usage: list[dict[str, Any]],
+    *,
+    source_id: str | None = None,
+    business_name: str | None = None,
 ) -> None:
     """Persist one Cosmos item per LLM call. Never raises; failures are logged only."""
     recorded_at = datetime.now(timezone.utc).isoformat()
@@ -51,6 +54,10 @@ def write_audit_records(
             "recordedAt": recorded_at,
             **record,
         }
+        if source_id is not None:
+            item["sourceId"] = source_id
+        if business_name is not None:
+            item["businessName"] = business_name
         try:
             container.create_item(item)
         except Exception:

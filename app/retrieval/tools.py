@@ -17,6 +17,7 @@ from retrieval.pipeline import (
     evidence_identity,
 )
 from retrieval.service import RagService, _sanitize_chunk
+from retrieval.source_policy import SourceEligibility, SourcePolicySnapshot
 
 
 def make_search_tool(
@@ -24,6 +25,7 @@ def make_search_tool(
     principal: Principal,
     retrieved_chunks: list[RetrievedChunk],
     *,
+    source_id: str | None = None,
     usage: list[dict[str, Any]] | None = None,
     scoring_profile: str | None = None,
     max_evidence: int = 5,
@@ -32,6 +34,8 @@ def make_search_tool(
     now: datetime | None = None,
     deadline_monotonic: float | None = None,
     policy: RequestPolicy | None = None,
+    source_policy_versions: dict[str, SourceEligibility] | None = None,
+    source_policy_snapshot: SourcePolicySnapshot | None = None,
 ):
     """Create a search tool closure bound to the caller's ACL.
 
@@ -39,6 +43,13 @@ def make_search_tool(
     evidence cap, stable citation labels, usage forwarding, and tool-text formatting.
     """
     policy = policy or rag_service.capture_policy(scoring_profile, expand_synonyms)
+    source_policy_captured = source_policy_snapshot is not None
+    if source_policy_snapshot is not None and source_policy_versions is not None:
+        source_policy_versions.update({
+            source.source_id: source
+            for source in source_policy_snapshot.sources
+        })
+    source_policy_lock = asyncio.Lock()
 
     async def search_knowledge_base(
         query: Annotated[str, "Search query describing what information to find"],
@@ -54,30 +65,55 @@ def make_search_tool(
             RetrievalMode(mode) if mode in RetrievalMode.__members__.values() else RetrievalMode.HYBRID
         )
         tool_start = time.perf_counter()
-        remaining = (
-            deadline_monotonic - time.monotonic()
-            if deadline_monotonic is not None
-            else None
-        )
-        if remaining is not None and remaining <= 0:
-            raise asyncio.TimeoutError("agent retrieval deadline exceeded")
-        operation = asyncio.to_thread(
-            rag_service.search,
-            query,
-            [query],
-            principal,
-            mode=retrieval_mode,
-            top_k=max_evidence,
-            scoring_profile=scoring_profile,
-            expand_synonyms=expand_synonyms,
-            now=now,
-            policy=policy,
-        )
-        result = (
-            await asyncio.wait_for(operation, timeout=remaining)
-            if remaining is not None
-            else await operation
-        )
+        nonlocal source_policy_snapshot, source_policy_captured
+
+        async def execute_search() -> Any:
+            remaining = (
+                deadline_monotonic - time.monotonic()
+                if deadline_monotonic is not None
+                else None
+            )
+            if remaining is not None and remaining <= 0:
+                raise asyncio.TimeoutError("agent retrieval deadline exceeded")
+            operation = asyncio.to_thread(
+                rag_service.search,
+                query,
+                [query],
+                principal,
+                mode=retrieval_mode,
+                top_k=max_evidence,
+                scoring_profile=scoring_profile,
+                expand_synonyms=expand_synonyms,
+                now=now,
+                policy=policy,
+                source_policy_snapshot=source_policy_snapshot,
+                source_id=source_id,
+                validate_source_policy=False,
+            )
+            return (
+                await asyncio.wait_for(operation, timeout=remaining)
+                if remaining is not None
+                else await operation
+            )
+
+        if source_policy_captured:
+            result = await execute_search()
+        else:
+            async with source_policy_lock:
+                result = await execute_search()
+                if not source_policy_captured:
+                    source_policy_snapshot = result.source_policy_snapshot
+                    source_policy_captured = True
+                    if (
+                        source_policy_snapshot is not None
+                        and source_policy_versions is not None
+                    ):
+                        source_policy_versions.update(
+                            {
+                                source.source_id: source
+                                for source in source_policy_snapshot.sources
+                            }
+                        )
         chunks = list(result.chunks)
         existing = {
             evidence_identity(chunk): index

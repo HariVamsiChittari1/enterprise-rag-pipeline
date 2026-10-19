@@ -12,20 +12,20 @@ import subprocess
 import sys
 import time
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "app"))
+OBSERVATION_STARTUP_LOOKBACK = timedelta(minutes=5)
 
 from azure.cosmos import CosmosClient
-from azure.identity import DefaultAzureCredential
-
+from azure_credentials import create_azure_credential
 from retrieval.catalog import (
     CATALOG_ID,
-    CatalogError,
     CatalogConflictError,
+    CatalogError,
     RuntimeCatalogLoader,
     apply_catalog_operation,
     build_catalog_item,
@@ -40,7 +40,6 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("action", choices=("validate", "prepare", "inspect", "observe", "update", "reconcile", "rollback"))
     parser.add_argument("--file", type=Path)
     parser.add_argument("--manifest", type=Path)
-    parser.add_argument("--deployment-instance-id", required=True)
     parser.add_argument("--endpoint")
     parser.add_argument("--database")
     parser.add_argument("--container", default="retrieval-config")
@@ -76,23 +75,24 @@ def _read_source(path: Path | None) -> tuple[dict, str]:
 def _container(args: argparse.Namespace):
     if not args.endpoint or not args.database:
         raise CatalogError("--endpoint and --database are required")
-    with DefaultAzureCredential() as credential, CosmosClient(args.endpoint, credential=credential) as client:
+    with create_azure_credential() as credential, CosmosClient(
+        args.endpoint, credential=credential,
+    ) as client:
         yield client.get_database_client(args.database).get_container_client(args.container)
 
 
-def _prepare_operation(path: Path, deployment_instance_id: str, expected_etag: str, reason: str) -> dict:
+def _prepare_operation(path: Path, expected_etag: str, reason: str) -> dict:
     if not isinstance(expected_etag, str) or not expected_etag.strip():
         raise CatalogError("--expected-etag is required")
     source, file_digest = _read_source(path)
     item = build_catalog_item(
-        source, deployment_instance_id, operation_id=str(uuid4()),
+        source, operation_id=str(uuid4()),
         changed_at=datetime.now(timezone.utc), reason=reason,
     )
     snapshot = load_catalog_item(item)
     return {
         "operationId": snapshot.operation_id,
         "createdAt": snapshot.changed_at,
-        "deploymentInstanceId": snapshot.deployment_instance_id,
         "expectedEtag": expected_etag,
         "candidateDigest": snapshot.digest,
         "candidateFileDigest": file_digest,
@@ -174,6 +174,7 @@ def _replica_inventory(args: argparse.Namespace, deadline: float) -> dict:
             members.append({
                 "revision": revision["name"], "replica": replica["name"],
                 "container": container["containerId"], "restart_count": container["restartCount"],
+                "created_at": replica["properties"]["createdTime"],
             })
     return {
         "startedAt": started, "observedAt": datetime.now(timezone.utc).isoformat(),
@@ -183,12 +184,10 @@ def _replica_inventory(args: argparse.Namespace, deadline: float) -> dict:
 
 def _observation_records(args: argparse.Namespace, since: str, deadline: float) -> list[dict]:
     application = json.dumps(args.application)
-    instance_hash = hashlib.sha256(args.deployment_instance_id.encode("utf-8")).hexdigest()
     query = (
         f"AppTraces | where TimeGenerated >= datetime({since}) "
         f"| where tostring(Properties.application) == {application} "
-        f"and tostring(Properties.deployment_instance_hash) == '{instance_hash}' "
-        "| where Message in ('catalog_observed', 'catalog_rejected', 'catalog_degraded') "
+        "and Message in ('catalog_observed', 'catalog_rejected', 'catalog_degraded') "
         "| project event=Message, revision=tostring(Properties.revision), replica=tostring(Properties.replica), "
         "process_incarnation=tostring(Properties.process_incarnation), etag_hash=tostring(Properties.etag_hash), "
         "digest=tostring(Properties.digest), accepted_at=tostring(Properties.accepted_at), observed_at=tostring(Properties.observed_at) "
@@ -217,20 +216,27 @@ def _observe(args: argparse.Namespace) -> dict:
         try:
             after = _replica_inventory(args, deadline)
             if before is not None and before["members"] == after["members"]:
-                records = _observation_records(args, before["observedAt"], deadline)
+                evidence_from = min(
+                    _member_evidence_start(member, before["observedAt"])
+                    for member in before["members"]
+                ).isoformat()
+                records = _observation_records(args, evidence_from, deadline)
                 members = []
                 changed_process = False
                 for member in before["members"]:
+                    member_evidence_from = _member_evidence_start(
+                        member, before["observedAt"],
+                    )
                     processes = {
                         record["process_incarnation"] for record in records
                         if record["revision"] == member["revision"] and record["replica"] == member["replica"]
-                        and _utc_timestamp(before["observedAt"]) <= _utc_timestamp(record["observed_at"]) <= _utc_timestamp(after["startedAt"])
+                        and member_evidence_from <= _utc_timestamp(record["observed_at"]) <= _utc_timestamp(after["observedAt"])
                     }
                     changed_process |= len(processes) > 1
                     members.append({**member, "process_incarnation": next(iter(processes)) if len(processes) == 1 else ""})
                 if _cohort_converged(
                     {**before, "members": members},
-                    {**after, "observedAt": after["startedAt"], "members": members},
+                    {**after, "members": members},
                     records, args.target_etag, args.target_digest,
                 ) and time.monotonic() < deadline:
                     return {"status": "converged", "catalogDigest": args.target_digest,
@@ -270,7 +276,8 @@ def _cohort_converged(before: dict, after: dict, records: list[dict], etag: str,
             observations = [
                 record for record in records
                 if record["revision"] == member["revision"] and record["replica"] == member["replica"]
-                and started <= _utc_timestamp(record["observed_at"]) <= finished
+                and _member_evidence_start(member, before["observedAt"])
+                <= _utc_timestamp(record["observed_at"]) <= finished
             ]
             if not observations or any(record["process_incarnation"] != identity[3] for record in observations):
                 return False
@@ -285,6 +292,14 @@ def _cohort_converged(before: dict, after: dict, records: list[dict], etag: str,
         return True
     except (KeyError, TypeError, ValueError):
         return False
+
+
+def _member_evidence_start(member: dict, stabilized_at: str) -> datetime:
+    stabilized = _utc_timestamp(stabilized_at)
+    if member["restart_count"] != 0:
+        return stabilized
+    created = _utc_timestamp(member["created_at"])
+    return max(created, stabilized - OBSERVATION_STARTUP_LOOKBACK)
 
 
 def _assure_operation(args: argparse.Namespace, outcome: dict, manifest: dict, container) -> dict:
@@ -323,7 +338,7 @@ def _assure_operation(args: argparse.Namespace, outcome: dict, manifest: dict, c
         outcome["adoptionStatus"] = observation["status"]
         if observation["status"] != "converged":
             return outcome
-        current = RuntimeCatalogLoader(container, args.deployment_instance_id).load()
+        current = RuntimeCatalogLoader(container).load()
         if current.etag != outcome["etag"] or current.digest != outcome["catalogDigest"]:
             outcome["status"] = "not-current"
             return outcome
@@ -333,14 +348,12 @@ def _assure_operation(args: argparse.Namespace, outcome: dict, manifest: dict, c
     return outcome
 
 
-def _load_candidate(manifest_path: Path | None, source_path: Path | None, deployment_instance_id: str):
+def _load_candidate(manifest_path: Path | None, source_path: Path | None):
     if manifest_path is None:
         raise CatalogError("--manifest is required; prepare an operation before mutation")
     manifest, _manifest_file_digest = _read_source(manifest_path)
     source, file_digest = _read_source(source_path)
     candidate = build_operation_candidate(manifest, source, file_digest)
-    if candidate["deploymentInstanceId"] != deployment_instance_id:
-        raise CatalogConflictError("manifest target does not match requested deployment instance")
     return manifest, candidate
 
 
@@ -354,7 +367,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.action == "validate":
             source, _file_digest = _read_source(args.file)
             item = build_catalog_item(
-                source, args.deployment_instance_id,
+                source,
                 operation_id="00000000-0000-4000-8000-000000000000",
                 changed_at=datetime(2000, 1, 1, tzinfo=timezone.utc), reason="Offline validation",
             )
@@ -363,26 +376,26 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.action == "prepare":
             manifest = _prepare_operation(
-                args.file, args.deployment_instance_id, args.expected_etag, args.reason,
+                args.file, args.expected_etag, args.reason,
             )
             _persist_manifest(args.manifest, manifest)
             print(json.dumps({"operationId": manifest["operationId"], "catalogDigest": manifest["candidateDigest"]}))
             return 0
         if args.action != "inspect":
-            manifest, candidate = _load_candidate(args.manifest, args.file, args.deployment_instance_id)
+            manifest, candidate = _load_candidate(args.manifest, args.file)
         with _container(args) as container:
             if args.action == "inspect":
-                snapshot = RuntimeCatalogLoader(container, args.deployment_instance_id).load()
+                snapshot = RuntimeCatalogLoader(container).load()
                 print(json.dumps(_summary(snapshot)))
                 return 0
             if args.action == "rollback":
                 if not args.history_id:
                     raise CatalogError("--history-id is required for rollback")
                 try:
-                    history = container.read_item(item=args.history_id, partition_key=args.deployment_instance_id)
+                    history = container.read_item(item=args.history_id, partition_key=args.history_id)
                 except Exception:
                     raise CatalogError("rollback history cannot be read") from None
-                preimage = load_catalog_history(history, args.deployment_instance_id)
+                preimage = load_catalog_history(history)
                 if history["id"] != args.history_id or preimage["config"] != candidate["config"]:
                     raise CatalogConflictError("rollback candidate does not match reviewed history")
             outcome = apply_catalog_operation(container, candidate, manifest, reconcile_only=args.action == "reconcile")

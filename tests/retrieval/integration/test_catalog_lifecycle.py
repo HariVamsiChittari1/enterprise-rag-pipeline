@@ -58,10 +58,10 @@ def _source(over_fetch_factor: int) -> dict:
 @pytest.fixture
 def live_catalog():
     from azure.cosmos import CosmosClient
-    from azure.identity import DefaultAzureCredential
+    from azure_credentials import create_azure_credential
 
     with ExitStack() as resources:
-        credential = resources.enter_context(DefaultAzureCredential())
+        credential = resources.enter_context(create_azure_credential())
         client = resources.enter_context(CosmosClient(
             os.environ["RAG_INTEGRATION_COSMOS_ENDPOINT"], credential=credential,
         ))
@@ -69,15 +69,14 @@ def live_catalog():
             client.get_database_client(os.environ["RAG_INTEGRATION_COSMOS_DATABASE"])
             .get_container_client(os.environ["RAG_INTEGRATION_COSMOS_CONFIG_CONTAINER"])
         )
-        environment = f"integration-{uuid.uuid4()}"
         created_ids: list[str] = []
         try:
-            yield container, environment, created_ids
+            yield container, created_ids
         finally:
             failures = 0
             for item_id in reversed(created_ids):
                 try:
-                    container.delete_item(item=item_id, partition_key=environment)
+                    container.delete_item(item=item_id, partition_key=item_id)
                 except CosmosResourceNotFoundError:
                     continue
                 except Exception:
@@ -87,9 +86,9 @@ def live_catalog():
 
 
 def test_publish_direct_edit_conflict_invalid_edit_and_recovery(live_catalog) -> None:
-    container, environment, created_ids = live_catalog
-    first_item = build_catalog_item(_source(3), environment)
-    second_item = build_catalog_item(_source(4), environment)
+    container, created_ids = live_catalog
+    first_item = build_catalog_item(_source(3))
+    second_item = build_catalog_item(_source(4))
     created_ids.append(first_item["id"])
     publish_catalog(container, first_item)
     publish_catalog(container, first_item)
@@ -97,7 +96,7 @@ def test_publish_direct_edit_conflict_invalid_edit_and_recovery(live_catalog) ->
         publish_catalog(container, second_item)
 
     async def exercise() -> None:
-        provider = RuntimeCatalogProvider(RuntimeCatalogLoader(container, environment), 60)
+        provider = RuntimeCatalogProvider(RuntimeCatalogLoader(container), 60)
         try:
             assert await provider.refresh()
             original = provider.snapshot

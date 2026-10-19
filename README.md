@@ -1,13 +1,13 @@
 # Enterprise RAG Pipeline
 
-Secure, ACL-trimmed RAG system that ingests Markdown, PDF, DOCX, PPTX, and XLSX — plus optional WAV, MP3, and FLAC audio (transcribed via Azure Speech batch) — from one SharePoint document library and serves grounded answers with per-document security trimming. Ingestion preserves native source identity, adds required visual descriptions, and then chunks, enriches, and embeds canonical content into Cosmos DB. Retrieval uses an LLM query planner to route one planned query through the standard path and two or more planned queries through an Agent Framework path with automatic fallback.
+Secure, ACL-trimmed RAG system that ingests Markdown, PDF, DOCX, PPTX, and XLSX — plus optional WAV, MP3, and FLAC audio (transcribed via Azure Speech batch) — from registered SharePoint document-library sources and serves grounded answers with per-document security trimming. Ingestion preserves native source identity, adds required visual descriptions, and then chunks, enriches, and embeds canonical content into Cosmos DB. Retrieval uses an LLM query planner to route one planned query through the standard path and two or more planned queries through an Agent Framework path with automatic fallback.
 
 ## Architecture
 
 - **Ingestion:** Azure Functions (Flex Consumption) with Durable Functions orchestration
 - **Retrieval:** Hybrid RAG (standard + agentic) on Azure Container Apps with automatic routing
 - **Durable Backend:** Durable Task Scheduler (fresh instance ID per run, tracked via Cosmos)
-- **Storage:** Cosmos DB NoSQL (ingestion-runs, source-documents, search-chunks, retrieval-config, service-audit)
+- **Storage:** Cosmos DB NoSQL (ingestion-sources, ingestion-runs, source-documents, search-chunks, retrieval-config, service-audit)
 - **AI Services:** Document Intelligence, optional Content Understanding rollback, Azure AI Language, Azure AI Speech (optional audio transcription), Azure OpenAI
 - **Auth:** Managed Identity (Azure services) + Certificate credential (Microsoft Graph)
 - **Networking:** VNet-integrated with Private Endpoints
@@ -52,12 +52,20 @@ See the [architecture security model and known limitations](docs/ARCHITECTURE.md
 
 ## Local Development
 
+Use [Azure-backed local development](docs/LOCAL_DEVELOPMENT.md) to run Azure
+Functions locally against approved Azure development data and services.
+Azurite remains local for Functions host and Durable task-hub state.
+
+Quick-start for a local developer:
+
 ```powershell
-python -m venv .venv-py312
-.\.venv-py312\Scripts\Activate.ps1
-python -m pip install -r requirements-dev.txt
-python -m pytest -q
+.\scripts\initialize-dev-environment.ps1 -CreateVenv
+python -m pip install -r requirements-dev.txt -r app\retrieval\requirements.txt
+python -m pytest tests\app_runtime -q
 ```
+
+After the Python environment is ready, continue with the local-development
+guide above.
 
 ## Deployment
 

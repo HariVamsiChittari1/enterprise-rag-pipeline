@@ -3,8 +3,13 @@ from __future__ import annotations
 from dataclasses import replace
 
 import pytest
-
-from config import ExtractionProvider, load_config
+from config import (
+    ExecutionBatchConfig,
+    ExtractionProvider,
+    load_config,
+    load_execution_batch_config,
+)
+from ingestion.models import SourceAdmissionConfig
 
 
 def _set_required_environment(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -27,9 +32,132 @@ def _set_required_environment(monkeypatch: pytest.MonkeyPatch) -> None:
         "COSMOS_ENDPOINT": "https://cosmos.example",
         "COSMOS_DATABASE_NAME": "database",
         "OPENAI_ENDPOINT": "https://openai.example",
+        "OPENAI_EMBEDDING_DEPLOYMENT_NAME": "test-embedding",
     }
     for name, value in values.items():
         monkeypatch.setenv(name, value)
+
+
+def test_load_config_uses_canonical_capacity_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_required_environment(monkeypatch)
+    monkeypatch.setenv("MAX_PAGES_PER_SOURCE", "2000")
+    monkeypatch.setenv("MAX_CONTENT_UNITS_PER_SOURCE", "1750")
+    monkeypatch.setenv("MAX_CHUNKS_PER_SOURCE", "9000")
+    monkeypatch.setenv("MAX_PDF_PAGES", "1")
+    monkeypatch.setenv("EMBEDDING_BATCH_SIZE", "64")
+
+    config = load_config()
+
+    assert config.admission.max_pages_per_source == 2_000
+    assert config.admission.max_content_units_per_source == 1_750
+    assert config.admission.max_chunks_per_source == 9_000
+    assert config.execution.embedding_batch_size == 64
+
+
+def test_load_config_defaults_match_typed_policy_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_required_environment(monkeypatch)
+
+    config = load_config()
+
+    assert config.admission == SourceAdmissionConfig()
+    assert config.execution == ExecutionBatchConfig()
+
+
+def test_load_execution_batch_config_owns_orchestration_settings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    values = {
+        "WAVE_SIZE": 8,
+        "WAVE_TIMEOUT_MINUTES": 30,
+        "PROCESS_DOCUMENT_MAX_ATTEMPTS": 3,
+        "PROCESS_DOCUMENT_RETRY_DELAY_SECONDS": 15,
+        "ACL_RESYNC_PAGE_SIZE": 40,
+        "LIFECYCLE_RECONCILE_PAGE_SIZE": 45,
+        "AUDIO_POLL_PAGE_SIZE": 12,
+        "SOURCE_DISPATCH_PAGE_SIZE": 6,
+    }
+    for name, value in values.items():
+        monkeypatch.setenv(name, str(value))
+
+    execution = load_execution_batch_config()
+
+    assert execution.wave_size == values["WAVE_SIZE"]
+    assert execution.wave_timeout_minutes == values["WAVE_TIMEOUT_MINUTES"]
+    assert (
+        execution.process_document_max_attempts
+        == values["PROCESS_DOCUMENT_MAX_ATTEMPTS"]
+    )
+    assert (
+        execution.process_document_retry_delay_seconds
+        == values["PROCESS_DOCUMENT_RETRY_DELAY_SECONDS"]
+    )
+    assert execution.acl_resync_page_size == values["ACL_RESYNC_PAGE_SIZE"]
+    assert (
+        execution.lifecycle_reconcile_page_size
+        == values["LIFECYCLE_RECONCILE_PAGE_SIZE"]
+    )
+    assert execution.audio_poll_page_size == values["AUDIO_POLL_PAGE_SIZE"]
+    assert (
+        execution.source_dispatch_page_size
+        == values["SOURCE_DISPATCH_PAGE_SIZE"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("name", "value", "message"),
+    [
+        ("MAX_PAGES_PER_SOURCE", "not-an-integer", "must be an integer"),
+        ("WAVE_SIZE", "not-an-integer", "must be an integer"),
+        ("DOWNLOAD_TIMEOUT_SECONDS", "not-a-number", "must be a number"),
+        ("DOWNLOAD_TIMEOUT_SECONDS", "nan", "must be finite"),
+        ("SPEECH_REQUEST_TIMEOUT_SECONDS", "inf", "must be finite"),
+    ],
+)
+def test_load_config_names_malformed_numeric_setting(
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    value: str,
+    message: str,
+) -> None:
+    _set_required_environment(monkeypatch)
+    monkeypatch.setenv(name, value)
+
+    with pytest.raises(ValueError, match=rf"^{name} {message}$"):
+        load_config()
+
+
+@pytest.mark.parametrize(
+    "policy",
+    [
+        lambda: SourceAdmissionConfig(max_pages_per_source=0),
+        lambda: SourceAdmissionConfig(max_chunks_per_source=True),
+        lambda: ExecutionBatchConfig(embedding_batch_size=0),
+        lambda: ExecutionBatchConfig(download_timeout_seconds=True),
+        lambda: ExecutionBatchConfig(download_timeout_seconds=float("nan")),
+        lambda: ExecutionBatchConfig(speech_request_timeout_seconds=float("inf")),
+        lambda: ExecutionBatchConfig(wave_size=0),
+        lambda: ExecutionBatchConfig(source_dispatch_page_size=True),
+    ],
+)
+def test_capacity_policies_reject_invalid_values(policy) -> None:
+    with pytest.raises(ValueError):
+        policy()
+
+
+@pytest.mark.parametrize("field", ["admission", "execution"])
+def test_ingestion_config_requires_typed_capacity_policies(
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+) -> None:
+    _set_required_environment(monkeypatch)
+    config = load_config()
+
+    with pytest.raises(TypeError, match=field):
+        replace(config, **{field: {}})
 
 
 def test_audio_configuration_defaults_off_without_changing_documents(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -145,7 +273,7 @@ def test_speech_batch_provider_accepted_with_staging(monkeypatch: pytest.MonkeyP
     config = replace(load_config(), **_BATCH_SETTINGS)
     assert config.audio_transcription_provider == "speech_batch"
     assert config.audio_staging_container == "audio-staging"
-    assert config.audio_batch_ttl_hours == 48
+    assert config.execution.audio_batch_ttl_hours == 48
 
 
 @pytest.mark.parametrize("field", ["audio_staging_blob_endpoint", "audio_staging_container"])
@@ -179,8 +307,12 @@ def test_speech_batch_rejects_non_blob_staging_endpoint(
 def test_audio_batch_ttl_out_of_range_is_rejected(monkeypatch: pytest.MonkeyPatch, ttl: int) -> None:
     _set_required_environment(monkeypatch)
     monkeypatch.setenv("SHAREPOINT_SITE_URL", "https://tenant.sharepoint.com/sites/site")
+    config = load_config()
     with pytest.raises(ValueError, match="AUDIO_BATCH_TTL_HOURS"):
-        replace(load_config(), audio_batch_ttl_hours=ttl)
+        replace(
+            config,
+            execution=replace(config.execution, audio_batch_ttl_hours=ttl),
+        )
 
 
 @pytest.mark.parametrize("endpoint", [
@@ -242,12 +374,19 @@ def test_audio_locale_allowlist(monkeypatch: pytest.MonkeyPatch, locale: str) ->
             load_config()
 
 
-def test_load_config_requires_sharepoint_site_url(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_legacy_single_source_settings_are_optional_for_registry_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     _set_required_environment(monkeypatch)
     monkeypatch.delenv("SHAREPOINT_SITE_URL", raising=False)
+    monkeypatch.delenv("SHAREPOINT_ASSIGNED_DRIVE_ID", raising=False)
+    monkeypatch.delenv("INGESTION_SOURCE_ID", raising=False)
 
-    with pytest.raises(EnvironmentError, match="SHAREPOINT_SITE_URL"):
-        load_config()
+    config = load_config()
+
+    assert config.source_id == ""
+    assert config.drive_id == ""
+    assert config.sharepoint_site_url == ""
 
 
 def test_load_config_reads_required_sharepoint_site_url(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -257,6 +396,36 @@ def test_load_config_reads_required_sharepoint_site_url(monkeypatch: pytest.Monk
     config = load_config()
 
     assert config.sharepoint_site_url == "https://tenant.sharepoint.com/sites/site"
+
+
+def test_load_config_reads_required_embedding_deployment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_required_environment(monkeypatch)
+    monkeypatch.setenv("OPENAI_EMBEDDING_DEPLOYMENT_NAME", " custom-embedding ")
+
+    config = load_config()
+
+    assert config.embedding_deployment == "custom-embedding"
+
+
+def test_load_config_requires_embedding_deployment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_required_environment(monkeypatch)
+    monkeypatch.delenv("OPENAI_EMBEDDING_DEPLOYMENT_NAME")
+
+    with pytest.raises(EnvironmentError, match="OPENAI_EMBEDDING_DEPLOYMENT_NAME"):
+        load_config()
+
+
+def test_programmatic_config_rejects_blank_embedding_deployment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_required_environment(monkeypatch)
+
+    with pytest.raises(ValueError, match="OPENAI_EMBEDDING_DEPLOYMENT_NAME"):
+        replace(load_config(), embedding_deployment=" ")
 
 
 def test_load_config_requires_vision_deployment_when_extraction_enabled(

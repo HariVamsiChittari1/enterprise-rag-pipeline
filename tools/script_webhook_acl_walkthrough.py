@@ -287,7 +287,11 @@ def _parse_args() -> DemoConfig:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--function-app", required=True, help="Azure Function App name")
     parser.add_argument("--client-id", required=True, help="Admin API application client ID")
-    parser.add_argument("--file-name", default="bfl-abac-policy-v1.pdf", help="Target SharePoint filename")
+    parser.add_argument(
+        "--file-name",
+        default="sample-abac-policy-v1.pdf",
+        help="Target SharePoint filename",
+    )
     parser.add_argument(
         "--editors-group-id",
         required=True,

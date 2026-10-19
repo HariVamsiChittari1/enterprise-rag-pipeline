@@ -23,6 +23,10 @@ outside maintained documentation; the historical results are summarized below.
 
 These results prove functional behavior for the tested corpus and target. A live non-member ACL denial and a direct private Container App probe were not completed because they required another identity or private DNS reachability from the workstation. The evidence does not prove production capacity, SLOs, disaster recovery, or multi-region behavior.
 
+The current candidate uses a newer temporary catalog job and Function-managed
+catalog API. Its live cutover is validated, but removal of the current
+temporary job remains a separate approved cleanup gate.
+
 ## Release Artifact Contract
 
 A release is one reviewed tuple:
@@ -59,10 +63,12 @@ application image.
 
 ## Required Post-Deployment Gates
 
-- Verify Function and ACA health, revision, traffic, image digest, catalog ETag/digest, and `ACL_ENABLED`.
+- Verify Function and ACA health, revision, traffic, image digest, catalog
+  ETag/digest, and each tested source's accepted `retrievalAclEnabled` value.
 - Prove private Entra-authenticated Data Explorer read/edit with keys disabled, effective editor/writer/reader denials, and separately approved removal of obsolete broad grants.
 - Prove valid-edit adoption, rejected-edit last-known-good behavior, recovery and restart behavior across a stable ready replica cohort, with target telemetry and Cosmos actor/request correlation.
-- Run authenticated and unauthenticated gateway tests.
+- Run authenticated and unauthenticated Function and direct ACA endpoint
+  tests.
 - Run authorized and denied ACL retrieval tests.
 - Validate full sync, delta update/delete, ACL resync/restoration, and lifecycle reconciliation as applicable to the release.
 - Run standard and agentic retrieval across required modes.
@@ -81,8 +87,8 @@ application image.
 | --- | --- | --- |
 | Function client allowlist | Required in Bicep | Verify exact approved caller before release |
 | Per-user admin authorization | Not enforced on destructive Function endpoints | Production release requires risk acceptance or implementation of app-role checks |
-| Lifecycle webhook | Excluded from EasyAuth and does not validate `clientState` | Security gap requiring risk acceptance or remediation |
-| Retrieval gateway | ACA and application code restrict calls to Function UAMI | Verify app-role assignment externally because Bicep does not mutate Entra |
+| Lifecycle webhook | Excluded from EasyAuth; validates `clientState` and requires a persisted subscription match before source-state actions | Verify protected secret delivery and invalid-state rejection before release |
+| Retrieval API | ACA and application code require approved delegated users with the exact tenant, audience, client, user identity, and `user_impersonation` scope | Verify the external app registration, delegated scope consent, and approved public-client allowlist because Bicep does not mutate Entra |
 | ACL model | Entra security groups only | Direct user shares are unsupported |
 | Permission-change metadata | Connector requests a Graph header documented with `Sites.FullControl.All`, which is absent from the approved prerequisite set | Resolve through separate security approval or an implementation change; do not grant as a diagnostic shortcut |
 | Rate limiting | In-memory per ACA replica | Not a hard distributed abuse control |
@@ -127,14 +133,20 @@ The evaluator verifies ranking/ground-truth hashes bound by the manifest. Source
 
 ## Readiness Verdict
 
-The results below describe the 2026-09-05 release, not the current worktree.
-The mutable-catalog candidate and [audio implementation](adr/0001-audio-batch-transcription.md)
-have not established same-source deployment and end-to-end acceptance here.
+The historical entries below describe the 2026-09-05 release. The current
+development candidate separately completed source-aware cutover, direct ACA
+retrieval, runtime-catalog validation, and the repository acceptance gate.
 
 - **Historical-release deployment smoke:** passed on 2026-09-05.
 - **Five-format local implementation:** complete local gate passed for the current Document Intelligence candidate on 2026-09-05.
 - **Five-format Azure deployment and smoke:** Document Intelligence production-default and Content Understanding rollback scenarios passed in the approved non-production environment.
 - **Same-release functional E2E:** full sync, delta create/update/delete, lifecycle reconciliation, authorized retrieval, unauthenticated rejection, and six retrieval scenarios passed. A live non-member denial and direct private Container App probe remain open.
-- **Current-worktree release readiness:** not established; local checks alone do not satisfy deployment and E2E gates.
+- **Current development-candidate functional readiness:** established for the
+  approved development scope, with the fresh deployed guest reauthentication
+  limitation still requiring fresh validation when that guest scenario is a
+  release requirement.
 - **General production readiness:** conditional on the gates in this document.
-- **Blocking evidence for production scale:** workload requirements, capacity/load evidence, recovery objectives/tests, the two open E2E checks, and acceptance of or fixes for the listed security gaps.
+- **Blocking evidence for production scale:** workload requirements,
+  capacity/load evidence, recovery objectives/tests, current temporary-job
+  cleanup, fresh guest reauthentication if required for release, and
+  acceptance of or fixes for the listed security gaps.

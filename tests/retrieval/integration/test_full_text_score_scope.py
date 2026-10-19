@@ -1,4 +1,4 @@
-"""Env-gated live-Cosmos smoke tests for Phase 2a retrieval features.
+"""Env-gated live-Cosmos smoke tests for retrieval features.
 
 Skipped by default so `pytest` runs green without a live container. To run:
 
@@ -8,8 +8,8 @@ Skipped by default so `pytest` runs green without a live container. To run:
   $env:RAG_INTEGRATION_COSMOS_MANIFESTS_CONTAINER="source-documents"
   python -m pytest tests/retrieval/integration/test_full_text_score_scope.py -q
 
-Uses DefaultAzureCredential (`az login` locally, or Managed Identity in Azure) per
-AGENTS.md. Verifies structural correctness only \u2014 no ordering assertions, so tests
+Uses the explicit credential mode selected by ``AZURE_AUTH_MODE``. Verifies
+structural correctness only \u2014 no ordering assertions, so tests
 pass whether the container is empty or populated.
 """
 
@@ -25,6 +25,12 @@ _REQUIRED_ENV = (
     "RAG_INTEGRATION_COSMOS_CHUNKS_CONTAINER",
     "RAG_INTEGRATION_COSMOS_MANIFESTS_CONTAINER",
 )
+_SHAREPOINT_FIXTURE_ENV = (
+    "RAG_SHAREPOINT_FIXTURE_DOCUMENT_ID",
+    "RAG_SHAREPOINT_FIXTURE_SOURCE_RUN_ID",
+    "RAG_SHAREPOINT_FIXTURE_ALLOWED_GROUP_ID",
+    "RAG_SHAREPOINT_FIXTURE_OUTSIDE_GROUP_ID",
+)
 
 pytestmark = pytest.mark.skipif(
     any(not os.getenv(var) for var in _REQUIRED_ENV),
@@ -35,9 +41,9 @@ pytestmark = pytest.mark.skipif(
 @pytest.fixture(scope="module")
 def containers():
     from azure.cosmos import CosmosClient
-    from azure.identity import DefaultAzureCredential
+    from azure_credentials import create_azure_credential
 
-    credential = DefaultAzureCredential()
+    credential = create_azure_credential()
     client = CosmosClient(os.environ["RAG_INTEGRATION_COSMOS_ENDPOINT"], credential=credential)
     db = client.get_database_client(os.environ["RAG_INTEGRATION_COSMOS_DATABASE"])
     yield (
@@ -126,3 +132,51 @@ def test_hybrid_query_with_max_candidate_pool_top_k_stays_under_sdk_cap(containe
     )
     assert isinstance(result, list)
     assert len(result) <= MAX_CANDIDATE_POOL_TOTAL
+
+
+@pytest.mark.skipif(
+    any(not os.getenv(name) for name in _SHAREPOINT_FIXTURE_ENV),
+    reason="SharePoint fixture test; set RAG_SHAREPOINT_FIXTURE_* environment variables",
+)
+def test_shared_link_fixture_authorizes_only_stored_group(containers) -> None:
+    chunks, manifests = containers
+    document_id = os.environ["RAG_SHAREPOINT_FIXTURE_DOCUMENT_ID"]
+    source_run_id = os.environ["RAG_SHAREPOINT_FIXTURE_SOURCE_RUN_ID"]
+    allowed_group_id = os.environ["RAG_SHAREPOINT_FIXTURE_ALLOWED_GROUP_ID"]
+    outside_group_id = os.environ["RAG_SHAREPOINT_FIXTURE_OUTSIDE_GROUP_ID"]
+    manifest = manifests.read_item(
+        item=document_id,
+        partition_key=source_run_id,
+    )
+
+    assert manifest["aclStatus"] == "Verified"
+    assert "SharedLink" in manifest["aclFeedback"]
+    assert allowed_group_id in manifest["allowedGroupIds"]
+    assert outside_group_id not in manifest["allowedGroupIds"]
+    assert all(
+        key not in manifest
+        for key in ("sharingLinkUrl", "linkToken", "permissionPayload")
+    )
+
+    query = (
+        "SELECT VALUE c.id FROM c "
+        "WHERE c.documentId = @documentId "
+        "AND c.sourceRunId = @sourceRunId "
+        "AND c.isRetrievable = true "
+        "AND EXISTS(SELECT VALUE gid FROM gid IN c.allowedGroupIds "
+        "WHERE ARRAY_CONTAINS(@principalIds, gid))"
+    )
+
+    def matching_chunk_ids(group_id: str) -> list[str]:
+        return list(chunks.query_items(
+            query=query,
+            parameters=[
+                {"name": "@documentId", "value": document_id},
+                {"name": "@sourceRunId", "value": source_run_id},
+                {"name": "@principalIds", "value": [group_id]},
+            ],
+            enable_cross_partition_query=True,
+        ))
+
+    assert matching_chunk_ids(allowed_group_id)
+    assert matching_chunk_ids(outside_group_id) == []

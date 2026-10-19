@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import logging
+import hashlib
+import json
 import time
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
-from typing import Any, Callable
+from itertools import chain
+from typing import Any, Callable, Iterator
 
 from config import ExtractionProvider, IngestionConfig
 from ingestion.audio_staging import delete_audio, upload_audio
@@ -34,6 +37,7 @@ from ingestion.extraction import (
 )
 from ingestion.graph import (
     DeltaResetRequired,
+    GraphPageLimitExceeded,
     DiscoveryState,
     ResolvedMarkdownImage,
     VerifiedAcl,
@@ -65,9 +69,7 @@ from ingestion.models import (
     RunStage,
     RunStatus,
     SafeError,
-    ScaleLimits,
     SearchChunkRecord,
-    Settings,
     SUPPORTED_AUDIO_MIME_TYPES,
     SourceControlRecord,
     SourceDocumentRecord,
@@ -114,6 +116,14 @@ class _AuthorizedImage:
 
 def activate(config: IngestionConfig, repository: IngestionRepository, orchestration_instance_id: str) -> ActivatedRun:
     """Create a new run and atomically update currentRunId."""
+    current_control = repository.get_source_control(config.source_id)
+    if (
+        current_control is not None
+        and current_control.record.current_orchestration_instance_id == orchestration_instance_id
+    ):
+        current_run = repository.get_run(config.source_id, current_control.record.current_run_id)
+        if current_run is not None:
+            return ActivatedRun(current_run, current_control)
     now = _utc_now()
     run_id = create_run_id(now, config.source_id)
     instance_id = orchestration_instance_id
@@ -153,42 +163,185 @@ def discover_all(
     run_id: str,
     repository: IngestionRepository,
     connector: SourceConnector,
+    *,
+    work_registry: Any | None = None,
+    source_plan: Any | None = None,
+    owner_instance_id: str | None = None,
 ) -> tuple[list[SourceDocumentRecord], int]:
     """Discover all eligible files from the source and persist as documents."""
-    settings = Settings(source_id=config.source_id, drive_id=config.drive_id, code_version="durable-sync")
     state = DiscoveryState.initial()
     documents: list[SourceDocumentRecord] = []
     skipped = 0
+    rejected = 0
+    while not state.complete:
+        state, page_documents, page_skipped, page_rejected = discover_next_page(
+            config,
+            run_id,
+            repository,
+            connector,
+            state,
+            work_registry=work_registry,
+            source_plan=source_plan,
+            owner_instance_id=owner_instance_id,
+        )
+        documents.extend(page_documents)
+        skipped += page_skipped
+        rejected += page_rejected
+    logger.info(
+        "Discovery complete: %d to process, %d skipped, %d rejected, %d items scanned",
+        len(documents), skipped, rejected, state.items_scanned,
+    )
+    return documents, state.items_scanned
 
-    # Check previous run for skip-if-ready optimization
+
+def discover_next_page(
+    config: IngestionConfig,
+    run_id: str,
+    repository: IngestionRepository,
+    connector: SourceConnector,
+    state: DiscoveryState,
+    *,
+    work_registry: Any | None = None,
+    source_plan: Any | None = None,
+    owner_instance_id: str | None = None,
+) -> tuple[DiscoveryState, list[SourceDocumentRecord], int, int]:
+    """Capture and persist one bounded Graph children page."""
+    if work_registry is not None and (
+        source_plan is None or not isinstance(owner_instance_id, str) or not owner_instance_id
+    ):
+        raise ValueError("discovery_work_context_required")
+    documents: list[SourceDocumentRecord] = []
+    skipped = 0
+
     control = repository.get_source_control(config.source_id)
     prev_run_id = control.record.last_completed_run_id if control else None
     prev_source_run_id = create_source_run_id(config.source_id, prev_run_id) if prev_run_id else None
-
-    while not state.complete:
-        step = connector.discover_next_page(
-            state, settings.limits, allowed_extensions=config.allowed_extensions,
+    step = connector.discover_next_page(
+        state, config.admission, allowed_extensions=config.allowed_extensions,
+    )
+    for pdf in step.pdfs:
+        doc_id = create_document_id(config.source_id, config.drive_id, pdf.item_id)
+        winner = (
+            work_registry.get_document_winner(config.source_id, doc_id)
+            if work_registry is not None else None
         )
-        state = step.state
-        for pdf in step.pdfs:
-            doc_id = create_document_id(config.source_id, config.drive_id, pdf.item_id)
-            if prev_source_run_id:
-                try:
-                    prev = repository.get_document(prev_source_run_id, doc_id)
-                except Exception:
-                    logger.warning("Skip-if-ready lookup failed for %s", doc_id, exc_info=True)
-                    prev = None
-                if prev and prev.record.status is DocumentStatus.READY and prev.record.e_tag == pdf.e_tag:
-                    discovered_modified = getattr(pdf, "last_modified_date_time", None)
-                    if discovered_modified is None or prev.record.source_modified_at == discovered_modified:
-                        skipped += 1
-                        continue
-            doc = _source_to_document(pdf, config, run_id)
+        winner_source_run_id = (
+            winner.get("sourceRunId")
+            if isinstance(winner, dict)
+            and winner.get("sourceId") == config.source_id
+            and winner.get("documentId") == doc_id
+            else None
+        )
+        baseline_source_run_id = (
+            winner_source_run_id
+            if isinstance(winner_source_run_id, str) and winner_source_run_id
+            else prev_source_run_id
+        )
+        if baseline_source_run_id:
+            try:
+                prev = repository.get_document(baseline_source_run_id, doc_id)
+            except Exception:
+                logger.warning("Skip-if-ready lookup failed for %s", doc_id, exc_info=True)
+                prev = None
+            if prev and prev.record.status is DocumentStatus.READY and prev.record.e_tag == pdf.e_tag:
+                discovered_modified = getattr(pdf, "last_modified_date_time", None)
+                if discovered_modified is None or prev.record.source_modified_at == discovered_modified:
+                    if work_registry is None or _winner_matches_document_record(
+                        winner,
+                        prev.record,
+                        source_id=config.source_id,
+                        drive_id=config.drive_id,
+                        source_etag=pdf.e_tag,
+                        profile_digest=_processing_profile_digest(config),
+                    ):
+                        try:
+                            current_item = connector.read_item(pdf.item_id)
+                            current_acl = connector.read_verified_acl(
+                                pdf.item_id,
+                                config.execution.acl_max_pages,
+                            )
+                            reusable = (
+                                current_item is not None
+                                and current_item.get("eTag") == pdf.e_tag
+                                and _verified_acl_matches_document(
+                                    current_acl,
+                                    prev.record,
+                                )
+                            )
+                        except Exception:
+                            logger.warning(
+                                "Winner reuse verification failed for %s; reprocessing",
+                                doc_id,
+                                exc_info=True,
+                            )
+                            reusable = False
+                        if reusable:
+                            skipped += 1
+                            continue
+        doc = _source_to_document(pdf, config, run_id)
+        if work_registry is not None:
+            claim = work_registry.begin_document_operation(
+                source_plan,
+                owner_instance_id=owner_instance_id,
+                physical_run_id=doc.source_run_id,
+                item_id=doc.document_id,
+                operation_kind="full-sync",
+            )
+            if claim.get("status") not in {"acquired", "completed"}:
+                raise RepositoryConflictError("discovery_document_work_not_acquired")
+            if claim.get("status") == "completed":
+                stored = repository.get_document(doc.source_run_id, doc.document_id)
+                if stored is None:
+                    raise RepositoryConflictError("completed_discovery_document_missing")
+            else:
+                # Leave the operation claimed; process_document_activity owns the start.
+                stored = repository.create_discovered_document(doc)
+        else:
             stored = repository.create_discovered_document(doc)
-            documents.append(stored.record)
+        documents.append(stored.record)
+    return step.state, documents, skipped, step.rejected_count
 
-    logger.info("Discovery complete: %d to process, %d skipped (unchanged), %d items scanned", len(documents), skipped, state.items_scanned)
-    return documents, state.items_scanned
+
+def _winner_matches_document_record(
+    winner: Any,
+    record: SourceDocumentRecord,
+    *,
+    source_id: str,
+    drive_id: str,
+    source_etag: str,
+    profile_digest: str,
+) -> bool:
+    return (
+        isinstance(winner, dict)
+        and record.status is DocumentStatus.READY
+        and record.stage is DocumentStage.TERMINAL
+        and all((
+            winner.get("recordType") == "document-winner",
+            winner.get("schemaVersion") == 1,
+            winner.get("sourceId") == source_id == record.source_id,
+            winner.get("documentId") == record.document_id,
+            winner.get("driveId") == drive_id == record.drive_id,
+            winner.get("itemId") == record.item_id,
+            winner.get("sourceRunId") == record.source_run_id,
+            winner.get("documentKey") == record.document_key,
+            winner.get("sourceEtag") == source_etag == record.e_tag,
+            winner.get("lifecycleGeneration") == record.lifecycle_generation,
+            winner.get("processingProfileDigest") == profile_digest,
+            record.processing_profile_digest == profile_digest,
+        ))
+    )
+
+
+def _verified_acl_matches_document(
+    acl: VerifiedAcl,
+    record: Any,
+) -> bool:
+    return (
+        getattr(record, "acl_status", None) is acl.acl_status
+        and getattr(record, "acl_feedback", None) == acl.acl_feedback
+        and getattr(record, "allowed_group_ids", None) == acl.allowed_group_ids
+        and getattr(record, "acl_hash", None) == acl.acl_hash
+    )
 
 
 def process_document(
@@ -206,8 +359,12 @@ def process_document(
     cu_client: Any | None = None,
     speech_token_provider: Callable[[], str] | None = None,
     blob_service_client: Any | None = None,
+    document_work_id: str | None = None,
+    document_work_attempt_id: str | None = None,
 ) -> ActivityOutcome:
     """Process a single document through the full pipeline."""
+    if (document_work_id is None) != (document_work_attempt_id is None):
+        raise ValueError("document work and attempt IDs must be set together")
     try:
         processing = repository.mark_document_processing(
             replace(
@@ -226,16 +383,18 @@ def process_document(
     current_doc = processing.record
     current_etag = processing.etag
     try:
-        limits = ScaleLimits()
+        admission = config.admission
         source_snapshot = _read_and_validate_source_snapshot(connector, current_doc)
         source_format = source_snapshot.source_format
-        acl = connector.read_verified_acl(current_doc.item_id, config.acl_max_pages)
+        acl = connector.read_verified_acl(
+            current_doc.item_id, config.execution.acl_max_pages
+        )
         authorized_images: list[_AuthorizedImage] = []
 
         content = connector.download_content_sync(
             current_doc.item_id,
-            limits.max_source_bytes,
-            config.download_timeout_seconds,
+            admission.max_source_bytes,
+            config.execution.download_timeout_seconds,
         )
         validate_source_signature(source_format, content)
 
@@ -260,21 +419,23 @@ def process_document(
                     content_urls=[content_url],
                     locale=config.audio_locale,
                     display_name=current_doc.document_id,
-                    time_to_live_hours=config.audio_batch_ttl_hours,
+                    time_to_live_hours=config.execution.audio_batch_ttl_hours,
                     token_provider=speech_token_provider,
-                    timeout_seconds=config.speech_request_timeout_seconds,
+                    timeout_seconds=config.execution.speech_request_timeout_seconds,
                 )
                 submitted = replace(
                     current_doc, stage=DocumentStage.TRANSCRIBING,
                     content_hash=source_content_hash,
                     extraction_mode=config.audio_transcription_provider,
                     transcription_job_url=job_url, staging_blob_name=blob_name,
+                    transcription_work_id=document_work_id,
+                    transcription_attempt_id=document_work_attempt_id,
                     updated_at=_fmt(_utc_now()),
                 )
                 repository.update_processing_document(submitted, current_etag)
                 # Submit succeeded; the poller finalizes this doc once the batch job completes.
                 return ActivityOutcome(
-                    document_id=document.document_id, status=ActivityStatus.SUCCEEDED,
+                    document_id=document.document_id, status=ActivityStatus.PENDING,
                     chunks_written=0, retry_count=document.attempt_count,
                 )
             response = transcribe_audio(
@@ -285,7 +446,7 @@ def process_document(
                 locale=config.audio_locale,
                 token_provider=speech_token_provider,
                 max_response_bytes=config.audio_max_response_bytes,
-                timeout_seconds=config.speech_request_timeout_seconds,
+                timeout_seconds=config.execution.speech_request_timeout_seconds,
             )
             audio, segments = build_transcript(
                 response,
@@ -294,8 +455,8 @@ def process_document(
                 source_version=current_doc.e_tag,
                 source_content_hash=source_content_hash,
                 max_response_bytes=config.audio_max_response_bytes,
-                max_phrases=config.audio_max_phrases,
-                max_words=config.audio_max_words,
+                max_phrases=admission.max_audio_phrases_per_source,
+                max_words=admission.max_audio_words_per_source,
             )
             written = _finalize_audio_document(
                 config, current_doc, current_etag, audio, segments, acl, source_snapshot,
@@ -316,22 +477,19 @@ def process_document(
             vision_config = VisionExtractionConfig(
                 deployment=config.vision_deployment,
                 max_output_tokens=config.vision_max_output_tokens,
-                max_image_bytes=config.vision_max_image_bytes,
-                max_figures=min(
-                    config.vision_max_figures,
-                    limits.max_visual_descriptions,
-                ),
+                max_image_bytes=admission.max_visual_asset_bytes,
+                max_figures=admission.max_visual_assets_per_source,
             )
             if source_format == ".md":
                 def load_markdown_image(path: str) -> bytes:
                     image = connector.resolve_relative_markdown_image_sync(
                         current_doc.parent_item_id,
                         path,
-                        config.vision_max_image_bytes,
+                        admission.max_visual_asset_bytes,
                     )
                     image_acl = connector.read_verified_acl(
                         image.item_id,
-                        config.acl_max_pages,
+                        config.execution.acl_max_pages,
                     )
                     if not set(acl.allowed_group_ids).issubset(
                         image_acl.allowed_group_ids
@@ -341,8 +499,8 @@ def process_document(
                         )
                     image_content = connector.download_content_sync(
                         image.item_id,
-                        config.vision_max_image_bytes,
-                        config.download_timeout_seconds,
+                        admission.max_visual_asset_bytes,
+                        config.execution.download_timeout_seconds,
                     )
                     authorized_images.append(_AuthorizedImage(image, image_acl))
                     return image_content
@@ -364,7 +522,7 @@ def process_document(
                         cu_client,
                         content,
                         source_snapshot.mime_type,
-                        max_pages=min(config.max_pdf_pages, limits.max_document_units),
+                        max_pages=admission.max_pages_per_source,
                         analyzer_id=config.content_understanding_analyzer_id,
                     )
                     extraction_provider = ExtractionProvider.CONTENT_UNDERSTANDING.value
@@ -377,10 +535,7 @@ def process_document(
                     extraction = extract_pdf(
                         di_client,
                         content,
-                        max_pdf_pages=min(
-                            config.max_pdf_pages,
-                            limits.max_document_units,
-                        ),
+                        max_pdf_pages=admission.max_pages_per_source,
                         openai_client=openai_client,
                         vision_config=vision_config,
                     )
@@ -390,9 +545,9 @@ def process_document(
                 inventory = inventory_office_visuals(
                     content,
                     source_snapshot.mime_type,
-                    max_content_units=limits.max_document_units,
+                    max_content_units=admission.max_content_units_per_source,
                 )
-                if len(inventory.required) > limits.max_visual_descriptions:
+                if len(inventory.required) > admission.max_visual_assets_per_source:
                     raise TerminalDocumentError(
                         "visual_description_limit_exceeded"
                     )
@@ -403,8 +558,8 @@ def process_document(
                         )
                     analysis_content = connector.download_content_as_pdf_sync(
                         current_doc.item_id,
-                        limits.max_rendered_pdf_bytes,
-                        config.download_timeout_seconds,
+                        admission.max_rendered_derivative_bytes,
+                        config.execution.download_timeout_seconds,
                     )
                     analysis_content_type = "application/pdf"
                     derivative_used = True
@@ -412,7 +567,7 @@ def process_document(
                         cu_client,
                         analysis_content,
                         analysis_content_type,
-                        max_pages=min(config.max_pdf_pages, limits.max_document_units),
+                        max_pages=admission.max_pages_per_source,
                         analyzer_id=config.content_understanding_analyzer_id,
                     )
                     if (
@@ -440,23 +595,20 @@ def process_document(
                         di_client,
                         content,
                         source_snapshot.mime_type,
-                        max_pages=min(config.max_pdf_pages, limits.max_document_units),
+                        max_pages=admission.max_pages_per_source,
                     )
                     native_segment_count = len(native_extraction.segments)
                     rendered_visuals = ()
                     if inventory.required:
                         rendered_pdf = connector.download_content_as_pdf_sync(
                             current_doc.item_id,
-                            limits.max_rendered_pdf_bytes,
-                            config.download_timeout_seconds,
+                            admission.max_rendered_derivative_bytes,
+                            config.execution.download_timeout_seconds,
                         )
                         rendered_visuals = extract_rendered_pdf_visuals(
                             di_client,
                             rendered_pdf,
-                            max_pdf_pages=min(
-                                config.max_pdf_pages,
-                                limits.max_document_units,
-                            ),
+                            max_pdf_pages=admission.max_pages_per_source,
                             openai_client=openai_client,
                             vision_config=vision_config,
                         )
@@ -479,12 +631,12 @@ def process_document(
                 native_segment_count = len(extraction.segments)
             if (
                 extraction.visual_coverage.described_count
-                > limits.max_visual_descriptions
+                > admission.max_visual_assets_per_source
             ):
                 raise TerminalDocumentError("visual_description_limit_exceeded")
             if source_format not in {".md", ".pdf"} and sum(
                 len(segment.text) for segment in extraction.segments
-            ) > limits.max_office_characters:
+            ) > admission.max_office_characters:
                 raise TerminalDocumentError("office_character_limit_exceeded")
             pages = _pages_from_extraction(extraction)
             if sum(len(page.text) for page in pages) < MIN_TEXT_CHARACTERS:
@@ -517,11 +669,16 @@ def process_document(
                     "unsupportedReasons": unsupported_reasons,
                     "latency_ms": int((time.perf_counter() - extraction_start) * 1000),
                     "documentId": current_doc.document_id, "sourceName": current_doc.source_name,
-                })
+                }, business_name=current_doc.business_name)
         else:
             raise TerminalDocumentError("extraction_disabled_no_alternative")
 
-        chunks = chunk_pages(pages)
+        chunks = chunk_pages(
+            pages,
+            max_chunks_per_source=config.admission.max_chunks_per_source,
+            max_tokens=config.chunk_max_tokens,
+            overlap_tokens=config.chunk_overlap_tokens,
+        )
 
         if config.enrichment_enabled and language_client is not None:
             enrichment_start = time.perf_counter()
@@ -539,7 +696,7 @@ def process_document(
                     "entities": "succeeded" if any(s.entities.value == "succeeded" for s in statuses) else "failed",
                     "summary": "succeeded" if config.summary_enabled and any(s.summary.value == "succeeded" for s in statuses) else "not_requested",
                     "latency_ms": int((time.perf_counter() - enrichment_start) * 1000),
-                })
+                }, business_name=current_doc.business_name)
         else:
             enrichments = enrich_chunks(None, [chunk.content for chunk in chunks])
 
@@ -550,10 +707,12 @@ def process_document(
 
         embeddings = embed_texts(
             openai_client, searchable_texts,
+            deployment=config.embedding_deployment,
             audit_container=audit_container,
             source_id=config.source_id,
             run_id=current_doc.source_run_id,
-            batch_size=config.embedding_batch_size,
+            business_name=current_doc.business_name,
+            batch_size=config.execution.embedding_batch_size,
         )
 
         now = _fmt(_utc_now())
@@ -585,7 +744,7 @@ def process_document(
         )
         final_acl = connector.read_verified_acl(
             current_doc.item_id,
-            config.acl_max_pages,
+            config.execution.acl_max_pages,
         )
         if final_acl != acl:
             raise TerminalDocumentError("source_acl_changed_during_processing")
@@ -596,7 +755,7 @@ def process_document(
             )
             final_image_acl = connector.read_verified_acl(
                 authorized_image.image.item_id,
-                config.acl_max_pages,
+                config.execution.acl_max_pages,
             )
             if final_image_acl != authorized_image.acl:
                 raise TerminalDocumentError(
@@ -613,6 +772,8 @@ def process_document(
             stage=DocumentStage.VERIFYING,
             allowed_group_ids=acl.allowed_group_ids,
             acl_hash=acl.acl_hash,
+            acl_status=acl.acl_status,
+            acl_feedback=acl.acl_feedback,
             acl_evaluated_at=_fmt(_utc_now()),
             expected_chunk_count=len(chunk_records),
             written_chunk_count=written,
@@ -640,7 +801,13 @@ def process_document(
 
     except TerminalDocumentError as error:
         _fail_document(current_doc, current_etag, error, repository)
-        return ActivityOutcome(document_id=document.document_id, status=ActivityStatus.FAILED, chunks_written=0, retry_count=document.attempt_count, error=SafeError(str(error), current_doc.stage.value, False))
+        return ActivityOutcome(
+            document_id=document.document_id,
+            status=ActivityStatus.QUARANTINED,
+            chunks_written=0,
+            retry_count=document.attempt_count,
+            error=SafeError(str(error), current_doc.stage.value, False),
+        )
     except RepositoryConflictError:
         return ActivityOutcome(document_id=document.document_id, status=ActivityStatus.SKIPPED, chunks_written=0, retry_count=document.attempt_count)
     except Exception as error:
@@ -673,7 +840,13 @@ def _finalize_audio_document(
     audit_container: Any | None,
 ) -> int:
     """Chunk, enrich, embed, persist, admit, and mark ready a transcribed audio document."""
-    chunks = chunk_audio_segments(segments, audio)
+    chunks = chunk_audio_segments(
+        segments,
+        audio,
+        max_chunks_per_source=config.admission.max_chunks_per_source,
+        max_tokens=config.chunk_max_tokens,
+        overlap_tokens=config.chunk_overlap_tokens,
+    )
     if config.enrichment_enabled and language_client is not None:
         enrichments = enrich_chunks(
             language_client, [chunk.content for chunk in chunks],
@@ -689,10 +862,12 @@ def _finalize_audio_document(
     ]
     embeddings = embed_texts(
         openai_client, searchable_texts,
+        deployment=config.embedding_deployment,
         audit_container=audit_container,
         source_id=config.source_id,
         run_id=current_doc.source_run_id,
-        batch_size=config.embedding_batch_size,
+        business_name=current_doc.business_name,
+        batch_size=config.execution.embedding_batch_size,
     )
     now = _fmt(_utc_now())
     chunk_records = _build_chunk_records(
@@ -709,12 +884,15 @@ def _finalize_audio_document(
     current_doc, current_etag = updated.record, updated.etag
     written = repository.write_chunks(chunk_records)
     _read_and_validate_source_snapshot(connector, current_doc, expected_snapshot=source_snapshot)
-    final_acl = connector.read_verified_acl(current_doc.item_id, config.acl_max_pages)
+    final_acl = connector.read_verified_acl(
+        current_doc.item_id, config.execution.acl_max_pages
+    )
     if final_acl != acl:
         raise TerminalDocumentError("source_acl_changed_during_processing")
     admitting_doc = replace(
         current_doc, status=DocumentStatus.ADMITTING, stage=DocumentStage.VERIFYING,
         allowed_group_ids=acl.allowed_group_ids, acl_hash=acl.acl_hash,
+        acl_status=acl.acl_status, acl_feedback=acl.acl_feedback,
         acl_evaluated_at=_fmt(_utc_now()), expected_chunk_count=len(chunk_records),
         written_chunk_count=written, source_verified_at=_fmt(_utc_now()),
         updated_at=_fmt(_utc_now()),
@@ -764,7 +942,7 @@ def finalize_audio_transcription(
     try:
         job = get_transcription(
             transcription_url=job_url, token_provider=speech_token_provider,
-            timeout_seconds=config.speech_request_timeout_seconds,
+            timeout_seconds=config.execution.speech_request_timeout_seconds,
         )
     except TimeoutError:
         return "pending"
@@ -779,9 +957,12 @@ def finalize_audio_transcription(
                 source_version=current_doc.e_tag,
                 source_content_hash=current_doc.content_hash or "",
                 max_response_bytes=config.audio_max_response_bytes,
-                max_phrases=config.audio_max_phrases, max_words=config.audio_max_words,
+                max_phrases=config.admission.max_audio_phrases_per_source,
+                max_words=config.admission.max_audio_words_per_source,
             )
-            acl = connector.read_verified_acl(current_doc.item_id, config.acl_max_pages)
+            acl = connector.read_verified_acl(
+                current_doc.item_id, config.execution.acl_max_pages
+            )
             source_snapshot = _read_and_validate_source_snapshot(connector, current_doc)
             _finalize_audio_document(
                 config, current_doc, current_etag, audio, segments, acl, source_snapshot,
@@ -819,7 +1000,7 @@ def _download_batch_transcript(config: IngestionConfig, job: Any, token_provider
         raise TerminalDocumentError("audio_batch_files_link_missing")
     files = list_transcription_files(
         files_url=job.files_url, token_provider=token_provider,
-        timeout_seconds=config.speech_request_timeout_seconds,
+        timeout_seconds=config.execution.speech_request_timeout_seconds,
     )
     transcript = next((entry for entry in files if entry.kind == "Transcription"), None)
     if transcript is None:
@@ -827,7 +1008,7 @@ def _download_batch_transcript(config: IngestionConfig, job: Any, token_provider
     return download_transcription_result(
         content_url=transcript.content_url,
         max_response_bytes=config.audio_max_response_bytes,
-        timeout_seconds=config.speech_request_timeout_seconds,
+        timeout_seconds=config.execution.speech_request_timeout_seconds,
     )
 
 
@@ -839,7 +1020,7 @@ def _cleanup_batch_job(
     try:
         delete_transcription(
             transcription_url=job_url, token_provider=token_provider,
-            timeout_seconds=config.speech_request_timeout_seconds,
+            timeout_seconds=config.execution.speech_request_timeout_seconds,
         )
     except Exception:
         logger.warning("failed to delete batch transcription job", exc_info=True)
@@ -933,8 +1114,12 @@ class DeltaSyncOutcome:
     created_or_updated: int = 0
     deleted: int = 0
     acl_resynced: int = 0
+    quarantined: int = 0
     failed: int = 0
+    pending: int = 0
     items_seen: int = 0
+    continuation_token: str | None = None
+    continuation_phase: str | None = None
 
 
 def run_delta_sync(
@@ -950,30 +1135,222 @@ def run_delta_sync(
     cu_client: Any | None = None,
     speech_token_provider: Callable[[], str] | None = None,
     blob_service_client: Any | None = None,
+    work_registry: Any | None = None,
+    source_plan: Any | None = None,
+    owner_instance_id: str | None = None,
+    delta_execution_id: str | None = None,
+    reduced_items_continuation_token: str | None = None,
+    reduced_items_page_size: int = 50,
+    processing_phase: str = "items",
+    phase_continuation_token: str | None = None,
+    defer_cursor_commit: bool = False,
+    force_full_baseline: bool = False,
+    enumerate_only: bool = False,
+    round_start_link: str | None = None,
 ) -> DeltaSyncOutcome:
     """One delta-sync tick: process adds/updates/deletes for source_id since the last
     cursor. Uses its own run_id per tick purely as a schema-compliant namespacing device
     (sourceRunId/documentKey); it does not touch full-sync's source-control singleton."""
-    cursor = lifecycle_repository.get_delta_cursor(config.source_id)
-    if cursor is None:
-        bootstrap_link = connector.bootstrap_delta_cursor()
-        lifecycle_repository.save_delta_cursor(config.source_id, bootstrap_link)
-        return DeltaSyncOutcome(bootstrapped=True)
-
+    if work_registry is not None and (
+        source_plan is None or not owner_instance_id or not delta_execution_id
+    ):
+        raise ValueError("delta_document_work_context_required")
+    committed_cursor = lifecycle_repository.get_delta_cursor(config.source_id)
+    round_anchor = None if force_full_baseline else (
+        round_start_link if round_start_link is not None else committed_cursor
+    )
+    request_cursor = None if force_full_baseline else (
+        round_start_link if round_start_link is not None else committed_cursor
+    )
+    if work_registry is not None:
+        round_state = work_registry.begin_delta_round(
+            source_plan, owner_instance_id, delta_execution_id, round_anchor,
+        )
+        if round_state.get("state") in {"cursor_ready", "committed"}:
+            if enumerate_only:
+                return DeltaSyncOutcome(
+                    bootstrapped=True,
+                    items_seen=work_registry.count_delta_round_entries(
+                        config.source_id, delta_execution_id,
+                    ),
+                    continuation_token=round_state.get("candidateDeltaLink"),
+                    continuation_phase="baseline_complete",
+                )
+            if defer_cursor_commit and round_state.get("state") == "cursor_ready":
+                candidate = round_state.get("candidateDeltaLink")
+                if not isinstance(candidate, str) or not candidate:
+                    raise RepositoryConflictError("delta_round_candidate_link_missing")
+                return DeltaSyncOutcome(
+                    **(round_state.get("outcome") or {}),
+                    continuation_token=candidate,
+                    continuation_phase="commit",
+                )
+            if round_state.get("state") == "cursor_ready":
+                candidate = round_state.get("candidateDeltaLink")
+                if not isinstance(candidate, str) or not candidate:
+                    raise RepositoryConflictError("delta_round_candidate_link_missing")
+                lifecycle_repository.save_delta_cursor(config.source_id, candidate)
+                round_state = work_registry.complete_delta_round(
+                    config.source_id, delta_execution_id, owner_instance_id,
+                )
+            return DeltaSyncOutcome(**(round_state.get("outcome") or {}))
+    page_capture = (
+        work_registry.delta_page_capture(source_plan, owner_instance_id, delta_execution_id)
+        if work_registry is not None else None
+    )
+    if processing_phase not in {"enumerating", "items", "baseline", "acl"}:
+        raise ValueError("delta_processing_phase_invalid")
+    resume_state = None
+    if page_capture is not None:
+        resume_reader = getattr(page_capture, "resume_state", None)
+        if callable(resume_reader):
+            resume_state = resume_reader()
+            resume_url = (
+                resume_state.get("requestUrl")
+                if resume_state.get("deltaLink")
+                else resume_state.get("nextLink") or resume_state.get("roundStartUrl")
+            )
+            if (
+                processing_phase == "enumerating"
+                and phase_continuation_token is not None
+                and phase_continuation_token != resume_url
+            ):
+                raise RepositoryConflictError("delta_round_resume_token_mismatch")
+            if isinstance(resume_url, str) and resume_url:
+                request_cursor = resume_url
     try:
-        delta = connector.read_drive_delta(config.delta_max_pages, delta_link=cursor)
-    except DeltaResetRequired:
-        # Cursor permanently invalidated; re-bootstrap per MS Graph guidance
-        logger.warning("delta_cursor_invalidated, re-bootstrapping")
-        bootstrap_link = connector.bootstrap_delta_cursor()
-        lifecycle_repository.save_delta_cursor(config.source_id, bootstrap_link)
-        return DeltaSyncOutcome(bootstrapped=True)
-    run_id = create_run_id(_utc_now(), f"{config.source_id}:delta")
+        try:
+            if page_capture is None:
+                delta = connector.read_drive_delta(
+                    config.execution.delta_max_pages, delta_link=request_cursor,
+                )
+            else:
+                delta = connector.read_drive_delta(
+                    config.execution.delta_max_pages,
+                    delta_link=request_cursor,
+                    page_capture=page_capture,
+                )
+        except DeltaResetRequired as reset:
+            logger.warning("delta_cursor_invalidated, following explicit reset location")
+            if page_capture is None:
+                delta = connector.read_drive_delta(
+                    config.execution.delta_max_pages,
+                    delta_link=reset.location,
+                )
+            else:
+                delta = connector.read_drive_delta(
+                    config.execution.delta_max_pages,
+                    delta_link=reset.location,
+                    page_capture=page_capture,
+                )
+            delta = replace(delta, is_full_baseline=True)
+    except GraphPageLimitExceeded as limit:
+        if page_capture is None or not limit.next_link:
+            raise
+        accepted = page_capture.resume_state()
+        if accepted.get("nextLink") != limit.next_link:
+            raise RepositoryConflictError("delta_round_resume_token_mismatch")
+        return DeltaSyncOutcome(
+            bootstrapped=accepted.get("roundStartKind") in {"initial", "reset"},
+            items_seen=page_capture.count_observed_entries(),
+            continuation_token=limit.next_link,
+            continuation_phase="enumerating",
+        )
+    if resume_state is not None and resume_state.get("roundStartKind") in {"initial", "reset"}:
+        delta = replace(delta, is_full_baseline=True)
+    if processing_phase == "enumerating":
+        processing_phase = "items"
+        phase_continuation_token = None
+    if page_capture is not None and processing_phase in {"items", "enumerating"} and not enumerate_only:
+        reduced_page = page_capture.list_reduced_items_page(
+            page_size=reduced_items_page_size,
+            continuation_token=reduced_items_continuation_token,
+        )
+        delta = replace(delta, items=list(reduced_page.items))
+        reduced_items_continuation_token = reduced_page.continuation_token
+    elif page_capture is not None:
+        delta = replace(delta, items=[])
+    else:
+        reduced_items_continuation_token = None
+    if enumerate_only:
+        if work_registry is None or page_capture is None or not delta.delta_link:
+            raise RepositoryConflictError("full_sync_baseline_capture_required")
+        observed_entries = page_capture.count_observed_entries()
+        outcome = {
+            "bootstrapped": True,
+            "created_or_updated": 0,
+            "deleted": 0,
+            "acl_resynced": 0,
+            "quarantined": 0,
+            "failed": 0,
+            "pending": 0,
+            "items_seen": observed_entries,
+        }
+        work_registry.mark_delta_round_cursor_ready(
+            config.source_id,
+            delta_execution_id,
+            owner_instance_id,
+            delta.delta_link,
+            outcome,
+        )
+        return DeltaSyncOutcome(
+            bootstrapped=True,
+            items_seen=observed_entries,
+            continuation_token=delta.delta_link,
+            continuation_phase="baseline_complete",
+        )
+    run_id = (
+        f"delta-{delta_execution_id}"
+        if delta_execution_id is not None
+        else create_run_id(_utc_now(), f"{config.source_id}:delta")
+    )
 
     created_or_updated = 0
     deleted = 0
     acl_resynced = 0
+    quarantined = 0
     failed = 0
+    pending = 0
+    delta_source_run_id = create_source_run_id(config.source_id, run_id)
+
+    def claim_delta_item(document_id: str, operation_kind: str) -> dict[str, Any]:
+        if work_registry is None:
+            return {"status": "untracked"}
+        claim = work_registry.begin_document_operation(
+            source_plan,
+            owner_instance_id=owner_instance_id,
+            physical_run_id=delta_source_run_id,
+            item_id=document_id,
+            operation_kind=operation_kind,
+        )
+        claim["operationKind"] = operation_kind
+        if claim.get("status") != "acquired":
+            return claim
+        started = work_registry.start_document_operation(
+            config.source_id,
+            owner_instance_id,
+            claim["operationId"],
+            delta_source_run_id,
+            document_id,
+            operation_kind,
+        )
+        return claim if started.get("status") == "started" else started
+
+    def settle_delta_item(
+        claim: dict[str, Any], document_id: str, status: str, outcome: dict[str, Any],
+    ) -> None:
+        if claim.get("status") == "acquired":
+            work_registry.settle_document_operation(
+                config.source_id,
+                owner_instance_id,
+                claim["operationId"],
+                physical_run_id=delta_source_run_id,
+                item_id=document_id,
+                operation_kind=claim["operationKind"],
+                status="succeeded" if status == "completed" else status,
+                outcome=outcome,
+            )
+
     for ordinal, item in enumerate(delta.items):
         item_id = item.get("id")
         if not isinstance(item_id, str) or not item_id:
@@ -982,9 +1359,31 @@ def run_delta_sync(
         document_id = create_document_id(config.source_id, config.drive_id, item_id)
 
         if item.get("deleted") is not None:
+            claim = claim_delta_item(document_id, "delta-delete")
+            if claim.get("status") == "completed":
+                prior = claim.get("outcome") or {}
+                deleted += int(prior.get("status") == "succeeded" and prior.get("deleted") is True)
+                failed += int(prior.get("status") not in {"succeeded", "skipped"})
+                continue
+            if claim.get("status") not in {"acquired", "untracked"}:
+                pending += 1
+                continue
             try:
-                ref = lifecycle_repository.find_ready_document_by_document_id(document_id)
-                if ref is not None:
+                versions = _iter_ready_document_versions(
+                    lifecycle_repository, config.source_id, document_id,
+                )
+                removed = False
+                cleanup_ok = True
+                for ref in versions:
+                    if (
+                        ref.source_id != config.source_id
+                        or ref.drive_id != config.drive_id
+                        or ref.item_id != item_id
+                        or _document_version_has_unsettled_mutation(ref)
+                    ):
+                        failed += 1
+                        cleanup_ok = False
+                        continue
                     try:
                         lifecycle_repository.delete_document_and_chunks(
                             source_run_id=ref.source_run_id,
@@ -993,17 +1392,30 @@ def run_delta_sync(
                             etag=ref.etag,
                         )
                     except LifecycleConflictError:
-                        pass  # already deleted/changed concurrently -- acceptable no-op
+                        failed += 1
+                        cleanup_ok = False
                     else:
-                        deleted += 1
-                        if audit_container is not None:
-                            write_audit_record(audit_container, config.source_id, run_id, {
-                                "operation": "document_deleted", "documentId": document_id,
-                                "reason": "deleted",
-                                "sourceName": getattr(ref, "source_name", ""),
-                                "sourceUrl": getattr(ref, "source_url", ""),
-                                "method": "delta_sync",
-                            })
+                        removed = True
+                        _clear_winner_if_points_to(
+                            work_registry,
+                            config.source_id,
+                            owner_instance_id,
+                            document_id,
+                            ref.source_run_id,
+                            ref.document_key,
+                        )
+                if removed:
+                    deleted += 1
+                    if audit_container is not None:
+                        write_audit_record(audit_container, config.source_id, run_id, {
+                            "operation": "document_deleted", "documentId": document_id,
+                            "reason": "deleted", "method": "delta_sync",
+                        }, business_name=config.business_name)
+                if cleanup_ok:
+                    settle_delta_item(
+                        claim, document_id, "completed",
+                        {"documentId": document_id, "status": "succeeded", "deleted": removed},
+                    )
             except Exception:
                 logger.error("delta_sync delete failed for item %s", item_id, exc_info=True)
                 failed += 1
@@ -1012,23 +1424,52 @@ def run_delta_sync(
         # Per-item permission change: Graph only surfaces this for file-level ACL edits;
         # library-level permission changes are caught by the zero-delta ACL resync path.
         if item.get("@microsoft.graph.sharedChanged") is True:
-            ref = lifecycle_repository.find_ready_document_by_document_id(document_id)
+            ref = lifecycle_repository.find_ready_document_by_document_id(
+                config.source_id, document_id,
+            )
             if ref is None:
                 ref = lifecycle_repository.find_acl_revoked_document_by_document_id(
-                    document_id
+                    config.source_id, document_id,
                 )
             if ref is None:
                 continue
+            acl_claim = claim_delta_item(document_id, "delta-acl")
+            if acl_claim.get("status") == "completed":
+                prior = acl_claim.get("outcome") or {}
+                result = prior.get("aclResult")
+                if result not in {"updated", "retired", "unchanged"}:
+                    failed += 1
+                    continue
+                acl_resynced += 1
+            elif acl_claim.get("status") not in {"acquired", "untracked"}:
+                pending += 1
+                continue
+            else:
+                result = None
             try:
                 old_groups = list(ref.allowed_group_ids)
-                result = resync_document_acl(config, ref, lifecycle_repository, connector)
+                if result is None:
+                    result = resync_document_acl(config, ref, lifecycle_repository, connector)
+                    if result == "retired":
+                        _clear_winner_if_points_to(
+                            work_registry,
+                            config.source_id,
+                            owner_instance_id,
+                            document_id,
+                            ref.source_run_id,
+                            ref.document_key,
+                        )
+                    settle_delta_item(
+                        acl_claim, document_id, "completed",
+                        {"documentId": document_id, "status": "succeeded", "aclResult": result},
+                    )
                 acl_resynced += 1
                 if audit_container is not None:
                     write_audit_record(audit_container, config.source_id, run_id, {
                         "operation": "acl_resynced", "documentId": document_id,
                         "result": result, "method": "delta_sync",
                         "previousGroupIds": old_groups,
-                    })
+                    }, business_name=config.business_name)
             except Exception:
                 logger.error("delta_sync acl_resync failed for item %s", item_id, exc_info=True)
                 failed += 1
@@ -1036,11 +1477,225 @@ def run_delta_sync(
             if result == "retired" or not _source_etag_changed(item, ref.source_etag):
                 continue
 
+        pending_document = lifecycle_repository.find_transcribing_document_by_document_id(
+            config.source_id, document_id,
+        )
+        if pending_document is not None:
+            pending += 1
+            continue
+
         try:
             document = _delta_item_to_document(item, config, run_id, ordinal)
             if document is None:
+                previous_versions = _iter_ready_document_versions(
+                    lifecycle_repository, config.source_id, document_id,
+                )
+                first_previous = next(previous_versions, None)
+                claim = claim_delta_item(document_id, "delta-cleanup") if first_previous is not None else {
+                    "status": "untracked",
+                }
+                if claim.get("status") == "completed":
+                    prior = claim.get("outcome") or {}
+                    deleted += int(prior.get("status") == "succeeded")
+                    failed += int(prior.get("status") != "succeeded")
+                    continue
+                if first_previous is not None and claim.get("status") not in {"acquired", "untracked"}:
+                    pending += 1
+                    continue
+                cleanup_ok = True
+                for previous in chain((first_previous,), previous_versions) if first_previous is not None else ():
+                    if (
+                        previous.source_id != config.source_id
+                        or previous.drive_id != config.drive_id
+                        or previous.item_id != item_id
+                        or _document_version_has_unsettled_mutation(previous)
+                    ):
+                        failed += 1
+                        cleanup_ok = False
+                        continue
+                    try:
+                        lifecycle_repository.delete_document_and_chunks(
+                            source_run_id=previous.source_run_id,
+                            document_id=document_id,
+                            document_key=previous.document_key,
+                            etag=previous.etag,
+                        )
+                    except Exception:
+                        failed += 1
+                        cleanup_ok = False
+                    else:
+                        deleted += 1
+                        _clear_winner_if_points_to(
+                            work_registry,
+                            config.source_id,
+                            owner_instance_id,
+                            document_id,
+                            previous.source_run_id,
+                            previous.document_key,
+                        )
+                if cleanup_ok:
+                    settle_delta_item(
+                        claim, document_id, "completed",
+                        {"documentId": document_id, "status": "succeeded"},
+                    )
                 continue
-            prev_ref = lifecycle_repository.find_ready_document_by_document_id(document_id)
+            prev_ref = lifecycle_repository.find_ready_document_by_document_id(
+                config.source_id, document_id,
+            )
+            if prev_ref is not None and prev_ref.source_etag == document.e_tag:
+                if work_registry is None:
+                    continue
+                get_winner = getattr(work_registry, "get_document_winner", None)
+                winner = get_winner(config.source_id, document_id) if callable(get_winner) else None
+                if _winner_matches_ready_ref(
+                    winner,
+                    prev_ref,
+                    source_id=config.source_id,
+                    drive_id=config.drive_id,
+                    source_etag=document.e_tag,
+                    profile_digest=_processing_profile_digest(config),
+                ):
+                    acl_claim = claim_delta_item(document_id, "delta-acl")
+                    if acl_claim.get("status") == "acquired":
+                        current_item = connector.read_item(item_id)
+                        if current_item is None or current_item.get("eTag") != document.e_tag:
+                            raise RepositoryConflictError("winner_source_version_changed")
+                        acl_result = resync_document_acl(
+                            config, prev_ref, lifecycle_repository, connector,
+                            audit_container=audit_container,
+                        )
+                        if acl_result == "retired":
+                            _clear_winner_if_points_to(
+                                work_registry,
+                                config.source_id,
+                                owner_instance_id,
+                                document_id,
+                                prev_ref.source_run_id,
+                                prev_ref.document_key,
+                            )
+                            settle_delta_item(
+                                acl_claim,
+                                document_id,
+                                "completed",
+                                {"documentId": document_id, "status": "succeeded", "aclResult": "retired"},
+                            )
+                        else:
+                            verified_ref = next((
+                                ref for ref in _iter_ready_document_versions(
+                                    lifecycle_repository, config.source_id, document_id,
+                                )
+                                if ref.source_run_id == winner.get("sourceRunId")
+                                and ref.document_key == winner.get("documentKey")
+                            ), None)
+                            current_item = connector.read_item(item_id)
+                            if (
+                                verified_ref is None
+                                or verified_ref.status is not DocumentStatus.READY
+                                or verified_ref.source_id != config.source_id
+                                or verified_ref.drive_id != config.drive_id
+                                or verified_ref.item_id != item_id
+                                or verified_ref.source_etag != document.e_tag
+                                or verified_ref.processing_profile_digest != _processing_profile_digest(config)
+                                or current_item is None
+                                or current_item.get("eTag") != document.e_tag
+                            ):
+                                raise RepositoryConflictError("winner_reuse_verification_failed")
+                            work_registry.record_document_winner(
+                                config.source_id,
+                                owner_instance_id,
+                                document_id=verified_ref.document_id,
+                                drive_id=verified_ref.drive_id,
+                                item_id=verified_ref.item_id,
+                                source_run_id=verified_ref.source_run_id,
+                                document_key=verified_ref.document_key,
+                                source_etag=verified_ref.source_etag,
+                                lifecycle_generation=verified_ref.lifecycle_generation,
+                                processing_profile_digest=verified_ref.processing_profile_digest,
+                            )
+                            cleanup_ok = True
+                            for previous in _iter_ready_document_versions(
+                                lifecycle_repository, config.source_id, document_id,
+                            ):
+                                if (
+                                    previous.source_run_id == verified_ref.source_run_id
+                                    and previous.document_key == verified_ref.document_key
+                                ):
+                                    continue
+                                if (
+                                    previous.source_id != config.source_id
+                                    or previous.drive_id != config.drive_id
+                                    or previous.item_id != item_id
+                                    or _document_version_has_unsettled_mutation(previous)
+                                ):
+                                    cleanup_ok = False
+                                    failed += 1
+                                    continue
+                                lifecycle_repository.delete_document_and_chunks(
+                                    source_run_id=previous.source_run_id,
+                                    document_id=document_id,
+                                    document_key=previous.document_key,
+                                    etag=previous.etag,
+                                )
+                            if cleanup_ok:
+                                settle_delta_item(
+                                    acl_claim,
+                                    document_id,
+                                    "completed",
+                                    {"documentId": document_id, "status": "succeeded", "aclResult": acl_result},
+                                )
+                                acl_resynced += int(acl_result in {"updated", "retired"})
+                                continue
+                            pending += 1
+                            continue
+                    elif acl_claim.get("status") not in {"completed", "untracked"}:
+                        pending += 1
+                        continue
+            operation_id = None
+            if work_registry is not None:
+                claim = work_registry.begin_document_operation(
+                    source_plan,
+                    owner_instance_id=owner_instance_id,
+                    physical_run_id=document.source_run_id,
+                    item_id=document.document_id,
+                    operation_kind="delta-sync",
+                )
+                if claim.get("status") == "completed":
+                    prior = claim.get("outcome") or {}
+                    if prior.get("status") == "succeeded":
+                        created_or_updated += 1
+                    elif prior.get("status") == "quarantined":
+                        quarantined += 1
+                    elif prior.get("status") == "pending":
+                        pending += 1
+                    else:
+                        failed += 1
+                    continue
+                if claim.get("status") != "acquired":
+                    pending += 1
+                    continue
+                operation_id = claim["operationId"]
+                started = work_registry.start_document_operation(
+                    config.source_id,
+                    owner_instance_id,
+                    operation_id,
+                    document.source_run_id,
+                    document.document_id,
+                    "delta-sync",
+                )
+                if started.get("status") == "completed":
+                    prior = started.get("outcome") or {}
+                    if prior.get("status") == "succeeded":
+                        created_or_updated += 1
+                    elif prior.get("status") == "quarantined":
+                        quarantined += 1
+                    elif prior.get("status") == "pending":
+                        pending += 1
+                    else:
+                        failed += 1
+                    continue
+                if started.get("status") != "started":
+                    pending += 1
+                    continue
             stored = repository.create_discovered_document(document)
             outcome = process_document(
                 config, stored.record, stored.etag, repository, lifecycle_repository,
@@ -1049,52 +1704,534 @@ def run_delta_sync(
                 cu_client=cu_client,
                 speech_token_provider=speech_token_provider,
                 blob_service_client=blob_service_client,
+                document_work_id=operation_id,
+                document_work_attempt_id=operation_id,
             )
+            if work_registry is not None and outcome.status is ActivityStatus.PENDING:
+                work_registry.settle_document_operation(
+                    config.source_id, owner_instance_id, operation_id,
+                    physical_run_id=document.source_run_id,
+                    item_id=document.document_id,
+                    operation_kind="delta-sync",
+                    status="unresolved",
+                    outcome={"documentId": document.document_id, "status": "pending"},
+                )
+                pending += 1
+                continue
+            if outcome.status is ActivityStatus.QUARANTINED:
+                try:
+                    if outcome.error is None:
+                        raise RepositoryConflictError(
+                            "terminal_quarantine_error_missing"
+                        )
+                    quarantine_error = outcome.error
+                    failed_replacement = repository.get_document(
+                        document.source_run_id,
+                        document.document_id,
+                    )
+                    if (
+                        failed_replacement is None
+                        or failed_replacement.record.status is not DocumentStatus.FAILED
+                        or failed_replacement.record.stage is not DocumentStage.TERMINAL
+                        or failed_replacement.record.error is None
+                        or failed_replacement.record.error.retryable
+                        or failed_replacement.record.source_id != config.source_id
+                        or failed_replacement.record.drive_id != config.drive_id
+                        or failed_replacement.record.item_id != item_id
+                    ):
+                        raise RepositoryConflictError(
+                            "terminal_quarantine_record_unverified"
+                        )
+                    retired_versions = 0
+                    for previous in _iter_ready_document_versions(
+                        lifecycle_repository,
+                        config.source_id,
+                        document_id,
+                    ):
+                        if (
+                            previous.source_id != config.source_id
+                            or previous.drive_id != config.drive_id
+                            or previous.item_id != item_id
+                            or _document_version_has_unsettled_mutation(previous)
+                        ):
+                            raise RepositoryConflictError(
+                                "terminal_quarantine_previous_identity_invalid"
+                            )
+                        winner = (
+                            work_registry.get_document_winner(
+                                config.source_id,
+                                previous.document_id,
+                            )
+                            if work_registry is not None
+                            else None
+                        )
+                        winner_matches_previous = (
+                            winner is not None
+                            and winner.get("sourceRunId") == previous.source_run_id
+                            and winner.get("documentKey") == previous.document_key
+                        )
+                        winner_cleared = _clear_winner_if_points_to(
+                            work_registry,
+                            config.source_id,
+                            owner_instance_id,
+                            previous.document_id,
+                            previous.source_run_id,
+                            previous.document_key,
+                        )
+                        if winner_matches_previous and not winner_cleared:
+                            raise RepositoryConflictError(
+                                "terminal_quarantine_winner_clear_failed"
+                            )
+                        lifecycle_repository.retire_document(
+                            source_run_id=previous.source_run_id,
+                            document_id=previous.document_id,
+                            document_key=previous.document_key,
+                            etag=previous.etag,
+                            reason="replacement_failed",
+                        )
+                        retired_versions += 1
+                    if audit_container is not None:
+                        write_audit_record(
+                            audit_container,
+                            config.source_id,
+                            run_id,
+                            {
+                                "operation": "document_quarantined",
+                                "documentId": document_id,
+                                "sourceName": document.source_name,
+                                "sourceUrl": document.source_url,
+                                "method": "delta_sync",
+                                "errorCode": quarantine_error.code,
+                                "retiredPreviousVersions": retired_versions,
+                            },
+                            business_name=config.business_name,
+                        )
+                    if work_registry is not None:
+                        work_registry.settle_document_operation(
+                            config.source_id,
+                            owner_instance_id,
+                            operation_id,
+                            physical_run_id=document.source_run_id,
+                            item_id=document.document_id,
+                            operation_kind="delta-sync",
+                            status="quarantined",
+                            outcome={
+                                "documentId": document.document_id,
+                                "status": "quarantined",
+                                "error": quarantine_error.code,
+                                "retiredPreviousVersions": retired_versions,
+                            },
+                        )
+                    quarantined += 1
+                except Exception:
+                    logger.exception(
+                        "delta_sync terminal quarantine failed for item %s",
+                        item_id,
+                    )
+                    if work_registry is not None:
+                        try:
+                            work_registry.settle_document_operation(
+                                config.source_id,
+                                owner_instance_id,
+                                operation_id,
+                                physical_run_id=document.source_run_id,
+                                item_id=document.document_id,
+                                operation_kind="delta-sync",
+                                status="failed",
+                                outcome={
+                                    "documentId": document.document_id,
+                                    "status": "failed",
+                                    "error": "terminal_quarantine_settlement_failed",
+                                },
+                            )
+                        except Exception:
+                            logger.exception(
+                                "delta_sync failed to settle quarantine failure "
+                                "for item %s",
+                                item_id,
+                            )
+                    failed += 1
+                continue
+            if work_registry is not None and outcome.status is not ActivityStatus.SUCCEEDED:
+                work_registry.settle_document_operation(
+                    config.source_id, owner_instance_id, operation_id,
+                    physical_run_id=document.source_run_id,
+                    item_id=document.document_id,
+                    operation_kind="delta-sync",
+                    status="failed",
+                    outcome={"documentId": document.document_id, "status": "failed"},
+                )
+                failed += 1
+                continue
         except Exception:
             logger.error("delta_sync item %s failed", item_id, exc_info=True)
             failed += 1
             continue
 
+        if outcome.status is ActivityStatus.PENDING:
+            pending += 1
+            continue
         if outcome.status is not ActivityStatus.SUCCEEDED:
             failed += 1
             continue
         created_or_updated += 1
+        if work_registry is not None:
+            ready = repository.get_document(document.source_run_id, document.document_id)
+            if (
+                ready is None
+                or ready.record.status is not DocumentStatus.READY
+                or ready.record.stage is not DocumentStage.TERMINAL
+            ):
+                failed += 1
+                continue
+            work_registry.record_document_winner(
+                config.source_id,
+                owner_instance_id,
+                document_id=ready.record.document_id,
+                drive_id=ready.record.drive_id,
+                item_id=ready.record.item_id,
+                source_run_id=ready.record.source_run_id,
+                document_key=ready.record.document_key,
+                source_etag=ready.record.e_tag,
+                lifecycle_generation=ready.record.lifecycle_generation,
+                processing_profile_digest=ready.record.processing_profile_digest,
+            )
         if audit_container is not None:
             write_audit_record(audit_container, config.source_id, run_id, {
                 "operation": "document_ingested", "documentId": document_id,
                 "sourceName": document.source_name, "sourceUrl": document.source_url,
                 "method": "delta_sync", "action": "updated" if prev_ref else "created",
                 "chunks": outcome.chunks_written,
-            })
-        if prev_ref is not None and prev_ref.document_key != document.document_key:
-            try:
+            }, business_name=config.business_name)
+        try:
+            cleanup_failed = False
+            versions = _iter_ready_document_versions(
+                lifecycle_repository, config.source_id, document_id,
+            )
+            for previous in versions:
+                if previous.document_key == document.document_key:
+                    continue
+                if _document_version_has_unsettled_mutation(previous):
+                    failed += 1
+                    cleanup_failed = True
+                    continue
                 lifecycle_repository.delete_document_and_chunks(
-                    source_run_id=prev_ref.source_run_id,
+                    source_run_id=previous.source_run_id,
                     document_id=document_id,
-                    document_key=prev_ref.document_key,
-                    etag=prev_ref.etag,
+                    document_key=previous.document_key,
+                    etag=previous.etag,
                 )
-            except LifecycleConflictError:
-                pass  # already deleted/changed concurrently (e.g. ACL resync) -- acceptable no-op
-            else:
                 if audit_container is not None:
                     write_audit_record(audit_container, config.source_id, run_id, {
                         "operation": "document_deleted", "documentId": document_id,
                         "reason": "superseded", "method": "delta_sync",
-                        "replacedDocumentKey": prev_ref.document_key,
+                        "replacedDocumentKey": previous.document_key,
                         "newDocumentKey": document.document_key,
                         "sourceName": document.source_name,
-                    })
+                    }, business_name=config.business_name)
+        except LifecycleConflictError:
+            failed += 1
+            cleanup_failed = True
+        except Exception:
+            logger.exception("delta_sync version cleanup failed for item %s", item_id)
+            failed += 1
+            cleanup_failed = True
+        if work_registry is not None and not cleanup_failed:
+            work_registry.settle_document_operation(
+                config.source_id, owner_instance_id, operation_id,
+                physical_run_id=document.source_run_id,
+                item_id=document.document_id,
+                operation_kind="delta-sync",
+                status="succeeded",
+                outcome={"documentId": document.document_id, "status": "succeeded"},
+            )
 
-    if failed == 0:
-        lifecycle_repository.save_delta_cursor(config.source_id, delta.delta_link)
-    return DeltaSyncOutcome(
+    observed_entries = (
+        page_capture.count_observed_entries()
+        if page_capture is not None
+        else len(delta.items)
+    )
+    if reduced_items_continuation_token is not None and failed == 0 and pending == 0:
+        return DeltaSyncOutcome(
+            bootstrapped=request_cursor is None or delta.is_full_baseline,
+            created_or_updated=created_or_updated,
+            deleted=deleted,
+            acl_resynced=acl_resynced,
+            quarantined=quarantined,
+            failed=failed,
+            pending=pending,
+            items_seen=observed_entries,
+            continuation_token=reduced_items_continuation_token,
+            continuation_phase="items",
+        )
+
+    if work_registry is None and delta.is_full_baseline and failed == 0 and pending == 0:
+        continuation_token: str | None = None
+        reconciled_documents: set[str] = set()
+        try:
+            while True:
+                page = lifecycle_repository.list_ready_documents_page(
+                    source_id=config.source_id,
+                    page_size=50,
+                    continuation_token=continuation_token,
+                )
+                for ref in page.items:
+                    item_is_present = (
+                        page_capture.has_reduced_item(ref.item_id)
+                        if page_capture is not None
+                        else any(item.get("id") == ref.item_id for item in delta.items)
+                    )
+                    if item_is_present or ref.document_id in reconciled_documents:
+                        continue
+                    reconciled_documents.add(ref.document_id)
+                    if connector.read_item(ref.item_id) is not None:
+                        continue
+                    claim = claim_delta_item(ref.document_id, "delta-delete")
+                    if claim.get("status") == "completed":
+                        prior = claim.get("outcome") or {}
+                        if prior.get("status") != "succeeded":
+                            failed += 1
+                            continue
+                        deleted += int(prior.get("deleted", False))
+                        continue
+                    if claim.get("status") not in {"acquired", "untracked"}:
+                        pending += 1
+                        continue
+                    versions = _iter_ready_document_versions(
+                        lifecycle_repository, config.source_id, ref.document_id,
+                    )
+                    cleanup_ok = True
+                    versions_found = False
+                    for version in versions:
+                        versions_found = True
+                        if _document_version_has_unsettled_mutation(version):
+                            failed += 1
+                            cleanup_ok = False
+                            break
+                        try:
+                            lifecycle_repository.delete_document_and_chunks(
+                                source_run_id=version.source_run_id,
+                                document_id=version.document_id,
+                                document_key=version.document_key,
+                                etag=version.etag,
+                            )
+                            _clear_winner_if_points_to(
+                                work_registry,
+                                config.source_id,
+                                owner_instance_id,
+                                version.document_id,
+                                version.source_run_id,
+                                version.document_key,
+                            )
+                        except Exception:
+                            failed += 1
+                            cleanup_ok = False
+                            break
+                    if cleanup_ok:
+                        deleted += 1
+                        settle_delta_item(
+                            claim, ref.document_id, "completed",
+                            {
+                                "documentId": ref.document_id,
+                                "status": "succeeded",
+                                "deleted": versions_found,
+                            },
+                        )
+                continuation_token = page.continuation_token
+                if continuation_token is None:
+                    break
+        except Exception:
+            logger.exception("delta_sync baseline absence reconciliation failed")
+            failed += 1
+
+    if work_registry is None and failed == 0 and pending == 0:
+        continuation_token: str | None = None
+        try:
+            while True:
+                acl_page, continuation_token = run_acl_resync_page(
+                    config,
+                    lifecycle_repository,
+                    connector,
+                    page_size=50,
+                    continuation_token=continuation_token,
+                    audit_container=audit_container,
+                    work_registry=work_registry,
+                    source_plan=source_plan,
+                    owner_instance_id=owner_instance_id,
+                    work_scope_id=delta_execution_id,
+                )
+                acl_resynced += acl_page.updated + acl_page.retired
+                if continuation_token is None:
+                    break
+        except Exception:
+            logger.exception("delta_sync full ACL reconciliation failed")
+            failed += 1
+    if work_registry is not None and failed == 0 and pending == 0:
+        if processing_phase == "items":
+            processing_phase = "baseline" if delta.is_full_baseline else "acl"
+            phase_continuation_token = None
+        if processing_phase == "baseline":
+            try:
+                page = lifecycle_repository.list_ready_documents_page(
+                    source_id=config.source_id,
+                    page_size=50,
+                    continuation_token=phase_continuation_token,
+                )
+                for ref in page.items:
+                    if (
+                        page_capture is not None and page_capture.has_reduced_item(ref.item_id)
+                    ) or ref.source_id != config.source_id or ref.drive_id != config.drive_id:
+                        if ref.source_id != config.source_id or ref.drive_id != config.drive_id:
+                            failed += 1
+                        continue
+                    if connector.read_item(ref.item_id) is not None:
+                        continue
+                    claim = claim_delta_item(ref.document_id, "delta-delete")
+                    if claim.get("status") == "completed":
+                        prior = claim.get("outcome") or {}
+                        if prior.get("status") != "succeeded":
+                            failed += 1
+                        else:
+                            deleted += int(prior.get("deleted", False))
+                        continue
+                    if claim.get("status") not in {"acquired", "untracked"}:
+                        pending += 1
+                        continue
+                    cleanup_ok = True
+                    versions_found = False
+                    for version in _iter_ready_document_versions(
+                        lifecycle_repository, config.source_id, ref.document_id,
+                    ):
+                        versions_found = True
+                        if (
+                            version.source_id != config.source_id
+                            or version.drive_id != config.drive_id
+                            or _document_version_has_unsettled_mutation(version)
+                        ):
+                            failed += 1
+                            cleanup_ok = False
+                            break
+                        try:
+                            lifecycle_repository.delete_document_and_chunks(
+                                source_run_id=version.source_run_id,
+                                document_id=version.document_id,
+                                document_key=version.document_key,
+                                etag=version.etag,
+                            )
+                        except Exception:
+                            failed += 1
+                            cleanup_ok = False
+                            break
+                    if cleanup_ok:
+                        deleted += int(versions_found)
+                        settle_delta_item(
+                            claim,
+                            ref.document_id,
+                            "completed",
+                            {
+                                "documentId": ref.document_id,
+                                "status": "succeeded",
+                                "deleted": versions_found,
+                            },
+                        )
+                phase_continuation_token = page.continuation_token
+            except Exception:
+                logger.exception("delta_sync baseline absence page failed")
+                failed += 1
+            if failed == 0 and pending == 0 and phase_continuation_token is not None:
+                return DeltaSyncOutcome(
+                    bootstrapped=True,
+                    created_or_updated=created_or_updated,
+                    deleted=deleted,
+                    acl_resynced=acl_resynced,
+                    quarantined=quarantined,
+                    failed=failed,
+                    pending=pending,
+                    items_seen=observed_entries,
+                    continuation_token=phase_continuation_token,
+                    continuation_phase="baseline",
+                )
+            if failed == 0 and pending == 0:
+                processing_phase = "acl"
+                phase_continuation_token = None
+        if processing_phase == "acl" and failed == 0 and pending == 0:
+            try:
+                acl_page, phase_continuation_token = run_acl_resync_page(
+                    config,
+                    lifecycle_repository,
+                    connector,
+                    page_size=50,
+                    continuation_token=phase_continuation_token,
+                    audit_container=audit_container,
+                    work_registry=work_registry,
+                    source_plan=source_plan,
+                    owner_instance_id=owner_instance_id,
+                    work_scope_id=delta_execution_id,
+                )
+                acl_resynced += acl_page.updated + acl_page.retired
+            except Exception:
+                logger.exception("delta_sync ACL page failed")
+                failed += 1
+            if failed == 0 and pending == 0 and phase_continuation_token is not None:
+                return DeltaSyncOutcome(
+                    bootstrapped=request_cursor is None or delta.is_full_baseline,
+                    created_or_updated=created_or_updated,
+                    deleted=deleted,
+                    acl_resynced=acl_resynced,
+                    quarantined=quarantined,
+                    failed=failed,
+                    pending=pending,
+                    items_seen=observed_entries,
+                    continuation_token=phase_continuation_token,
+                    continuation_phase="acl",
+                )
+    if (
+        failed == 0
+        and pending == 0
+        and work_registry is not None
+        and work_registry.get_unresolved_document_operation_count(config.source_id) > 0
+    ):
+        pending += 1
+    outcome = DeltaSyncOutcome(
+        bootstrapped=request_cursor is None or delta.is_full_baseline,
         created_or_updated=created_or_updated,
         deleted=deleted,
         acl_resynced=acl_resynced,
+        quarantined=quarantined,
         failed=failed,
-        items_seen=len(delta.items),
+        pending=pending,
+        items_seen=observed_entries,
     )
+    if failed == 0 and pending == 0:
+        if work_registry is not None:
+            work_registry.mark_delta_round_cursor_ready(
+                config.source_id,
+                delta_execution_id,
+                owner_instance_id,
+                delta.delta_link,
+                {
+                    "bootstrapped": outcome.bootstrapped,
+                    "created_or_updated": outcome.created_or_updated,
+                    "deleted": outcome.deleted,
+                    "acl_resynced": outcome.acl_resynced,
+                    "quarantined": outcome.quarantined,
+                    "failed": outcome.failed,
+                    "pending": outcome.pending,
+                    "items_seen": outcome.items_seen,
+                },
+            )
+        if defer_cursor_commit:
+            return replace(
+                outcome,
+                continuation_token=delta.delta_link,
+                continuation_phase="commit",
+            )
+        lifecycle_repository.save_delta_cursor(config.source_id, delta.delta_link)
+        if work_registry is not None:
+            work_registry.complete_delta_round(
+                config.source_id, delta_execution_id, owner_instance_id,
+            )
+    return outcome
 
 
 def _delta_item_to_document(
@@ -1113,6 +2250,101 @@ def _delta_item_to_document(
         return None
     pdf = discovered_pdf_from_item(item, ordinal)
     return _source_to_document(pdf, config, run_id, ingestion_mode="delta-sync")
+
+
+def _winner_matches_ready_ref(
+    winner: Any,
+    ref: ReadyDocumentRef,
+    *,
+    source_id: str,
+    drive_id: str,
+    source_etag: str,
+    profile_digest: str,
+) -> bool:
+    return (
+        isinstance(winner, dict)
+        and ref.status is DocumentStatus.READY
+        and ref.source_id == source_id
+        and ref.drive_id == drive_id
+        and ref.source_etag == source_etag
+        and all((
+            winner.get("recordType") == "document-winner",
+            winner.get("sourceId") == source_id,
+            winner.get("documentId") == ref.document_id,
+            winner.get("driveId") == drive_id,
+            winner.get("itemId") == ref.item_id,
+            winner.get("sourceRunId") == ref.source_run_id,
+            winner.get("documentKey") == ref.document_key,
+            winner.get("sourceEtag") == source_etag,
+            winner.get("lifecycleGeneration") == ref.lifecycle_generation,
+            winner.get("processingProfileDigest") == profile_digest,
+            ref.processing_profile_digest == profile_digest,
+        ))
+    )
+
+
+def _clear_winner_if_points_to(
+    work_registry: Any | None,
+    source_id: str,
+    owner_instance_id: str | None,
+    document_id: str,
+    source_run_id: str,
+    document_key: str,
+) -> bool:
+    if work_registry is None or not owner_instance_id:
+        return False
+    get_winner = getattr(work_registry, "get_document_winner", None)
+    clear_winner = getattr(work_registry, "clear_document_winner", None)
+    if not callable(get_winner) or not callable(clear_winner):
+        return False
+    winner = get_winner(source_id, document_id)
+    if (
+        winner is None
+        or winner.get("sourceRunId") != source_run_id
+        or winner.get("documentKey") != document_key
+    ):
+        return False
+    return clear_winner(
+        source_id,
+        owner_instance_id,
+        document_id=document_id,
+        expected_source_run_id=source_run_id,
+        expected_document_key=document_key,
+    )
+
+
+def _document_version_has_unsettled_mutation(ref: ReadyDocumentRef) -> bool:
+    return ref.status in {
+        DocumentStatus.DISCOVERED,
+        DocumentStatus.PROCESSING,
+        DocumentStatus.ADMITTING,
+        DocumentStatus.ACL_REFRESHING,
+        DocumentStatus.RETIRING,
+        DocumentStatus.DELETING,
+    }
+
+
+def _iter_ready_document_versions(
+    lifecycle_repository: Any,
+    source_id: str,
+    document_id: str,
+) -> Iterator[ReadyDocumentRef]:
+    page_method = getattr(lifecycle_repository, "list_ready_document_versions_page", None)
+    if not callable(page_method):
+        yield from lifecycle_repository.list_ready_document_versions(source_id, document_id)
+        return
+    continuation_token: str | None = None
+    while True:
+        page = page_method(
+            source_id=source_id,
+            document_id=document_id,
+            page_size=50,
+            continuation_token=continuation_token,
+        )
+        yield from page.items
+        continuation_token = page.continuation_token
+        if continuation_token is None:
+            return
 
 
 def _source_etag_changed(item: dict[str, Any], persisted_etag: str | None) -> bool:
@@ -1136,12 +2368,91 @@ class LifecycleReconciliationOutcome:
 
 
 @dataclass(frozen=True)
+class AudioWorkSettlement:
+    source_run_id: str
+    document_id: str
+    work_id: str
+    attempt_id: str
+    status: str
+
+
+@dataclass(frozen=True)
 class AudioPollOutcome:
     checked: int = 0
     succeeded: int = 0
     failed: int = 0
     pending: int = 0
     skipped: int = 0
+    terminal_work: tuple[AudioWorkSettlement, ...] = ()
+
+
+def _claim_registered_item_work(
+    work_registry: Any | None,
+    source_plan: Any | None,
+    owner_instance_id: str | None,
+    work_scope_id: str | None,
+    document_id: str,
+    operation_kind: str,
+) -> dict[str, Any]:
+    if work_registry is None:
+        return {"status": "untracked"}
+    if source_plan is None or not owner_instance_id or not work_scope_id:
+        raise ValueError("registered_item_work_context_required")
+    source_run_id = create_source_run_id(source_plan.source_id, work_scope_id)
+    claim = work_registry.begin_document_operation(
+        source_plan,
+        owner_instance_id=owner_instance_id,
+        physical_run_id=source_run_id,
+        item_id=document_id,
+        operation_kind=operation_kind,
+    )
+    claim["operationKind"] = operation_kind
+    if claim.get("status") != "acquired":
+        return {
+            **claim, "sourceId": source_plan.source_id,
+            "workSourceRunId": source_run_id,
+        }
+    started = work_registry.start_document_operation(
+        source_plan.source_id,
+        owner_instance_id,
+        claim["operationId"],
+        source_run_id,
+        document_id,
+        operation_kind,
+    )
+    if started.get("status") == "started":
+        claim_status = "acquired"
+    else:
+        claim_status = started.get("status")
+    return {
+        **claim,
+        "sourceId": source_plan.source_id,
+        "status": claim_status,
+        "workSourceRunId": source_run_id,
+        "operationId": claim.get("operationId"),
+        "outcome": started.get("outcome", claim.get("outcome")),
+    }
+
+
+def _settle_registered_item_work(
+    work_registry: Any | None,
+    owner_instance_id: str | None,
+    claim: dict[str, Any],
+    document_id: str,
+    status: str,
+    outcome: dict[str, Any],
+) -> None:
+    if claim.get("status") == "acquired":
+        work_registry.settle_document_operation(
+            claim["sourceId"],
+            owner_instance_id,
+            claim["operationId"],
+            physical_run_id=claim["workSourceRunId"],
+            item_id=document_id,
+            operation_kind=claim["operationKind"],
+            status="succeeded" if status == "completed" else status,
+            outcome=outcome,
+        )
 
 
 def run_audio_transcription_poll_page(
@@ -1157,45 +2468,185 @@ def run_audio_transcription_poll_page(
     page_size: int,
     continuation_token: str | None = None,
     audit_container: Any | None = None,
+    settlement_only: bool = False,
+    work_registry: Any | None = None,
+    owner_instance_id: str | None = None,
 ) -> tuple[AudioPollOutcome, str | None]:
     """Poll one bounded page of documents awaiting batch transcription and advance each."""
     page = lifecycle_repository.list_transcribing_documents_page(
-        page_size=page_size, continuation_token=continuation_token,
+        source_id=config.source_id,
+        page_size=page_size,
+        continuation_token=continuation_token,
+        settlement_only=settlement_only,
     )
     tally = {"succeeded": 0, "failed": 0, "pending": 0, "skipped": 0}
+    terminal_work: list[AudioWorkSettlement] = []
     for ref in page.items:
-        result = finalize_audio_transcription(
-            config, ref.source_run_id, ref.document_id,
-            repository, lifecycle_repository, connector, language_client, openai_client,
-            speech_token_provider=speech_token_provider,
-            blob_service_client=blob_service_client,
-            audit_container=audit_container,
-        )
+        if ref.status in {DocumentStatus.READY, DocumentStatus.FAILED}:
+            result = "succeeded" if ref.status is DocumentStatus.READY else "failed"
+        elif ref.status is DocumentStatus.PROCESSING and ref.stage is DocumentStage.TRANSCRIBING:
+            if work_registry is not None:
+                if (
+                    not ref.transcription_work_id
+                    or not ref.transcription_attempt_id
+                    or not owner_instance_id
+                ):
+                    tally["pending"] += 1
+                    continue
+                operation_kind = work_registry.get_document_operation_kind(
+                    config.source_id,
+                    ref.transcription_work_id,
+                    ref.source_run_id,
+                    ref.document_id,
+                )
+                work_registry.assert_document_operation_unresolved(
+                    config.source_id,
+                    owner_instance_id,
+                    ref.transcription_work_id,
+                    ref.source_run_id,
+                    ref.document_id,
+                    operation_kind,
+                    allow_pending=True,
+                )
+            result = finalize_audio_transcription(
+                config, ref.source_run_id, ref.document_id,
+                repository, lifecycle_repository, connector, language_client, openai_client,
+                speech_token_provider=speech_token_provider,
+                blob_service_client=blob_service_client,
+                audit_container=audit_container,
+            )
+        else:
+            result = "pending"
+
+        if result in {"succeeded", "failed"} and ref.transcription_work_id:
+            terminal = repository.get_document(ref.source_run_id, ref.document_id)
+            expected_status = (
+                DocumentStatus.READY if result == "succeeded" else DocumentStatus.FAILED
+            )
+            if (
+                terminal is None
+                or terminal.record.status is not expected_status
+                or terminal.record.stage is not DocumentStage.TERMINAL
+                or terminal.record.transcription_work_id != ref.transcription_work_id
+                or terminal.record.transcription_attempt_id != ref.transcription_attempt_id
+            ):
+                result = "pending"
         tally[result] = tally.get(result, 0) + 1
+        if (
+            result in {"succeeded", "failed"}
+            and ref.transcription_work_id
+            and ref.transcription_attempt_id
+        ):
+            terminal_work.append(AudioWorkSettlement(
+                ref.source_run_id,
+                ref.document_id,
+                ref.transcription_work_id,
+                ref.transcription_attempt_id,
+                result,
+            ))
     outcome = AudioPollOutcome(
         checked=len(page.items), succeeded=tally["succeeded"], failed=tally["failed"],
         pending=tally["pending"], skipped=tally["skipped"],
+        terminal_work=tuple(terminal_work),
     )
     return outcome, page.continuation_token
 
 
+def run_source_retirement_page(
+    lifecycle_repository: DocumentLifecycleRepository,
+    audit_container: Any,
+    *,
+    source_id: str,
+    page_size: int,
+    work_registry: Any,
+    owner_instance_id: str,
+    business_name: str | None = None,
+) -> int:
+    """Delete a bounded source page using the existing document-deletion and audit path."""
+    page = lifecycle_repository.list_source_documents_for_deletion_page(
+        source_id=source_id, page_size=page_size,
+    )
+    for ref in page.items:
+        _clear_winner_if_points_to(
+            work_registry, source_id, owner_instance_id,
+            ref.document_id, ref.source_run_id, ref.document_key,
+        )
+        lifecycle_repository.delete_document_and_chunks(
+            source_run_id=ref.source_run_id,
+            document_id=ref.document_id,
+            document_key=ref.document_key,
+            etag=ref.etag,
+            allow_unready=True,
+        )
+        write_audit_record(audit_container, source_id, owner_instance_id, {
+            "operation": "document_deleted",
+            "documentId": ref.document_id,
+            "sourceRunId": ref.source_run_id,
+            "documentKey": ref.document_key,
+            "reason": "source_retired",
+            "method": "source_retirement",
+        }, business_name=business_name)
+    return len(page.items)
+
+
 def run_lifecycle_reconciliation_page(
+    config: IngestionConfig,
     repository: IngestionRepository,
     lifecycle_repository: DocumentLifecycleRepository,
+    connector_provider: Callable[[], SourceConnector],
     *,
+    source_id: str,
     page_size: int,
     continuation_token: str | None = None,
+    work_registry: Any | None = None,
+    source_plan: Any | None = None,
+    owner_instance_id: str | None = None,
+    work_scope_id: str | None = None,
 ) -> tuple[LifecycleReconciliationOutcome, str | None]:
     page = lifecycle_repository.list_lifecycle_transitions_page(
+        source_id=source_id,
         page_size=page_size,
         continuation_token=continuation_token,
     )
     repaired = 0
     failed = 0
     for ref in page.items:
+        claim = _claim_registered_item_work(
+            work_registry, source_plan, owner_instance_id, work_scope_id,
+            ref.document_id, "lifecycle-reconcile",
+        )
+        if claim.get("status") == "completed":
+            prior = claim.get("outcome") or {}
+            if prior.get("status") == "succeeded":
+                repaired += 1
+            else:
+                failed += 1
+            continue
+        if claim.get("status") not in {"acquired", "untracked"}:
+            failed += 1
+            continue
         try:
-            _reconcile_lifecycle_document(repository, lifecycle_repository, ref)
+            _reconcile_lifecycle_document(
+                config,
+                repository,
+                lifecycle_repository,
+                connector_provider,
+                ref,
+            )
+            if ref.status in {DocumentStatus.RETIRING, DocumentStatus.DELETING}:
+                _clear_winner_if_points_to(
+                    work_registry,
+                    source_id,
+                    owner_instance_id,
+                    ref.document_id,
+                    ref.source_run_id,
+                    ref.document_key,
+                )
             repaired += 1
+            _settle_registered_item_work(
+                work_registry, owner_instance_id, claim, ref.document_id, "completed",
+                {"documentId": ref.document_id, "status": "succeeded"},
+            )
         except Exception:
             failed += 1
             logger.warning(
@@ -1213,6 +2664,142 @@ def run_lifecycle_reconciliation_page(
     )
 
 
+def run_full_sync_absence_reconciliation_page(
+    config: IngestionConfig,
+    lifecycle_repository: DocumentLifecycleRepository,
+    connector: SourceConnector,
+    *,
+    current_source_run_id: str,
+    page_size: int,
+    continuation_token: str | None,
+    work_registry: Any,
+    source_plan: Any,
+    owner_instance_id: str,
+) -> tuple[LifecycleReconciliationOutcome, str | None]:
+    page = lifecycle_repository.list_ready_documents_page(
+        source_id=config.source_id,
+        page_size=page_size,
+        continuation_token=continuation_token,
+    )
+    repaired = failed = 0
+    seen_document_ids: set[str] = set()
+    for ref in page.items:
+        if ref.document_id in seen_document_ids or ref.source_run_id == current_source_run_id:
+            continue
+        seen_document_ids.add(ref.document_id)
+        if ref.source_id != config.source_id or ref.drive_id != config.drive_id:
+            failed += 1
+            continue
+        current_item = connector.read_item(ref.item_id)
+        if current_item is not None and _is_current_source_item_supported(current_item, config.allowed_extensions):
+            continue
+        claim = work_registry.begin_document_operation(
+            source_plan,
+            owner_instance_id=owner_instance_id,
+            physical_run_id=current_source_run_id,
+            item_id=ref.document_id,
+            operation_kind="delta-delete",
+        )
+        if claim.get("status") == "completed":
+            prior = claim.get("outcome") or {}
+            if prior.get("status") == "succeeded":
+                repaired += int(prior.get("deleted", False))
+            else:
+                failed += 1
+            continue
+        if claim.get("status") != "acquired":
+            failed += 1
+            continue
+        started = work_registry.start_document_operation(
+            config.source_id,
+            owner_instance_id,
+            claim["operationId"],
+            current_source_run_id,
+            ref.document_id,
+            "delta-delete",
+        )
+        if started.get("status") != "started":
+            failed += 1
+            continue
+        cleanup_ok = True
+        versions_found = False
+        try:
+            for version in _iter_ready_document_versions(
+                lifecycle_repository, config.source_id, ref.document_id,
+            ):
+                versions_found = True
+                if (
+                    version.source_id != config.source_id
+                    or version.drive_id != config.drive_id
+                    or version.item_id != ref.item_id
+                    or _document_version_has_unsettled_mutation(version)
+                ):
+                    raise RepositoryConflictError("full_sync_absence_version_identity_mismatch")
+                lifecycle_repository.delete_document_and_chunks(
+                    source_run_id=version.source_run_id,
+                    document_id=version.document_id,
+                    document_key=version.document_key,
+                    etag=version.etag,
+                )
+                _clear_winner_if_points_to(
+                    work_registry,
+                    config.source_id,
+                    owner_instance_id,
+                    version.document_id,
+                    version.source_run_id,
+                    version.document_key,
+                )
+        except Exception:
+            cleanup_ok = False
+            failed += 1
+            logger.warning(
+                "Full-sync absence cleanup failed for document %s",
+                ref.document_id,
+                exc_info=True,
+            )
+        if cleanup_ok:
+            work_registry.settle_document_operation(
+                config.source_id,
+                owner_instance_id,
+                claim["operationId"],
+                physical_run_id=current_source_run_id,
+                item_id=ref.document_id,
+                operation_kind="delta-delete",
+                status="succeeded",
+                outcome={
+                    "documentId": ref.document_id,
+                    "status": "succeeded",
+                    "deleted": versions_found,
+                },
+            )
+            repaired += int(versions_found)
+    return (
+        LifecycleReconciliationOutcome(checked=len(page.items), repaired=repaired, failed=failed),
+        page.continuation_token,
+    )
+
+
+def _is_current_source_item_supported(
+    item: dict[str, Any],
+    allowed_extensions: tuple[str, ...],
+) -> bool:
+    if item.get("folder") is not None or item.get("package") is not None:
+        return False
+    file_facet = item.get("file")
+    if file_facet is None:
+        return False
+    if not isinstance(file_facet, dict):
+        raise RepositoryConflictError("full_sync_source_item_malformed")
+    name = item.get("name")
+    if not isinstance(name, str) or not any(name.lower().endswith(ext) for ext in allowed_extensions):
+        return False
+    try:
+        resolve_source_format(name, file_facet.get("mimeType"))
+    except TerminalDocumentError:
+        return False
+    return True
+
+
 def run_duplicate_version_reconciliation_page(
     config: IngestionConfig,
     repository: IngestionRepository,
@@ -1220,8 +2807,13 @@ def run_duplicate_version_reconciliation_page(
     *,
     page_size: int,
     continuation_token: str | None = None,
+    work_registry: Any | None = None,
+    source_plan: Any | None = None,
+    owner_instance_id: str | None = None,
+    work_scope_id: str | None = None,
 ) -> tuple[LifecycleReconciliationOutcome, str | None]:
     page = lifecycle_repository.list_duplicate_ready_document_ids_page(
+        source_id=config.source_id,
         page_size=page_size,
         continuation_token=continuation_token,
     )
@@ -1234,13 +2826,36 @@ def run_duplicate_version_reconciliation_page(
     repaired = 0
     failed = 0
     for document_id in page.document_ids:
+        claim = _claim_registered_item_work(
+            work_registry, source_plan, owner_instance_id, work_scope_id,
+            document_id, "duplicate-reconcile",
+        )
+        if claim.get("status") == "completed":
+            prior = claim.get("outcome") or {}
+            if prior.get("status") in {"succeeded", "skipped"}:
+                repaired += int(prior.get("deletedVersions", 0))
+            else:
+                failed += 1
+            continue
+        if claim.get("status") not in {"acquired", "untracked"}:
+            failed += 1
+            continue
         try:
-            versions = lifecycle_repository.list_ready_document_versions(document_id)
+            versions = _iter_ready_document_versions(
+                lifecycle_repository, config.source_id, document_id,
+            )
             if current_source_run_id is None or not any(
                 ref.source_run_id == current_source_run_id for ref in versions
             ):
+                _settle_registered_item_work(
+                    work_registry, owner_instance_id, claim, document_id, "completed",
+                    {"documentId": document_id, "status": "skipped", "deletedVersions": 0},
+                )
                 continue
-            for ref in versions:
+            deleted_versions = 0
+            for ref in _iter_ready_document_versions(
+                lifecycle_repository, config.source_id, document_id,
+            ):
                 if ref.source_run_id == current_source_run_id:
                     continue
                 lifecycle_repository.delete_document_and_chunks(
@@ -1250,6 +2865,15 @@ def run_duplicate_version_reconciliation_page(
                     etag=ref.etag,
                 )
                 repaired += 1
+                deleted_versions += 1
+            _settle_registered_item_work(
+                work_registry, owner_instance_id, claim, document_id, "completed",
+                {
+                    "documentId": document_id,
+                    "status": "succeeded",
+                    "deletedVersions": deleted_versions,
+                },
+            )
         except Exception:
             failed += 1
             logger.warning(
@@ -1271,10 +2895,16 @@ def run_orphan_chunk_reconciliation_page(
     repository: IngestionRepository,
     lifecycle_repository: DocumentLifecycleRepository,
     *,
+    source_id: str,
     page_size: int,
     continuation_token: str | None = None,
+    work_registry: Any | None = None,
+    source_plan: Any | None = None,
+    owner_instance_id: str | None = None,
+    work_scope_id: str | None = None,
 ) -> tuple[LifecycleReconciliationOutcome, str | None]:
     page = lifecycle_repository.list_chunk_manifest_refs_page(
+        source_id=source_id,
         page_size=page_size,
         continuation_token=continuation_token,
     )
@@ -1284,11 +2914,30 @@ def run_orphan_chunk_reconciliation_page(
         try:
             manifest = repository.get_document(ref.source_run_id, ref.document_id)
             if manifest is None:
+                work_document_id = f"orphan:{ref.document_key}:{ref.chunk_id}"
+                claim = _claim_registered_item_work(
+                    work_registry, source_plan, owner_instance_id, work_scope_id,
+                    work_document_id, "orphan-reconcile",
+                )
+                if claim.get("status") == "completed":
+                    prior = claim.get("outcome") or {}
+                    if prior.get("status") == "succeeded":
+                        repaired += 1
+                    else:
+                        failed += 1
+                    continue
+                if claim.get("status") not in {"acquired", "untracked"}:
+                    failed += 1
+                    continue
                 lifecycle_repository.delete_orphan_chunk(
                     chunk_id=ref.chunk_id,
                     document_key=ref.document_key,
                 )
                 repaired += 1
+                _settle_registered_item_work(
+                    work_registry, owner_instance_id, claim, work_document_id, "completed",
+                    {"documentId": ref.document_id, "chunkId": ref.chunk_id, "status": "succeeded"},
+                )
         except Exception:
             failed += 1
             logger.warning(
@@ -1307,8 +2956,10 @@ def run_orphan_chunk_reconciliation_page(
 
 
 def _reconcile_lifecycle_document(
+    config: IngestionConfig,
     repository: IngestionRepository,
     lifecycle_repository: DocumentLifecycleRepository,
+    connector_provider: Callable[[], SourceConnector],
     ref: LifecycleDocumentRef,
 ) -> None:
     if ref.status is DocumentStatus.ADMITTING:
@@ -1337,15 +2988,40 @@ def _reconcile_lifecycle_document(
         )
         return
     if ref.status is DocumentStatus.ACL_REFRESHING:
-        if ref.pending_allowed_group_ids is None or not ref.pending_acl_hash:
+        if (
+            ref.pending_allowed_group_ids is None
+            or not ref.pending_acl_hash
+            or ref.pending_acl_status is None
+            or ref.pending_acl_feedback is None
+        ):
             raise RepositoryConflictError("ACL refresh intent is incomplete")
-        lifecycle_repository.refresh_document_acl(
-            source_run_id=ref.source_run_id,
-            document_id=ref.document_id,
-            document_key=ref.document_key,
-            etag=ref.etag,
-            allowed_group_ids=ref.pending_allowed_group_ids,
-            acl_hash=ref.pending_acl_hash,
+        stored = repository.get_document(ref.source_run_id, ref.document_id)
+        if (
+            stored is None
+            or stored.etag != ref.etag
+            or stored.record.status is not DocumentStatus.ACL_REFRESHING
+        ):
+            raise RepositoryConflictError(
+                "ACL-refreshing document changed during reconciliation"
+            )
+        resync_document_acl(
+            config,
+            ReadyDocumentRef(
+                document_id=ref.document_id,
+                source_run_id=ref.source_run_id,
+                document_key=ref.document_key,
+                item_id=stored.record.item_id,
+                allowed_group_ids=ref.allowed_group_ids,
+                acl_hash=ref.acl_hash,
+                etag=stored.etag,
+                acl_status=stored.record.acl_status,
+                acl_feedback=stored.record.acl_feedback,
+                source_etag=stored.record.e_tag,
+                lifecycle_generation=ref.lifecycle_generation,
+                status=ref.status,
+            ),
+            lifecycle_repository,
+            connector_provider(),
         )
         return
     if ref.status is DocumentStatus.RETIRING:
@@ -1379,7 +3055,9 @@ def resync_document_acl(
 ) -> str:
     """Re-verify one ACL-eligible document. Returns unchanged, updated, or retired."""
     try:
-        acl = connector.read_verified_acl(ref.item_id, config.acl_max_pages)
+        acl = connector.read_verified_acl(
+            ref.item_id, config.execution.acl_max_pages
+        )
     except TerminalDocumentError:
         if ref.status is DocumentStatus.RETIRED:
             return "unchanged"
@@ -1392,7 +3070,7 @@ def resync_document_acl(
                 reason="acl_revoked",
             )
         except LifecycleConflictError:
-            pass
+            raise
         else:
             if audit_container is not None:
                 write_audit_record(audit_container, config.source_id, ref.source_run_id, {
@@ -1400,17 +3078,34 @@ def resync_document_acl(
                     "retiredReason": "acl_revoked",
                     "sourceName": getattr(ref, "source_name", ""),
                     "sourceUrl": getattr(ref, "source_url", ""),
-                })
+                }, business_name=config.business_name)
         return "retired"
 
-    if acl.acl_hash == ref.acl_hash and ref.status is DocumentStatus.READY:
-        return "unchanged"
+    authorization_unchanged = (
+        acl.acl_hash == ref.acl_hash
+        and acl.allowed_group_ids == ref.allowed_group_ids
+    )
+    if authorization_unchanged and ref.status is DocumentStatus.READY:
+        if (
+            acl.acl_status is ref.acl_status
+            and acl.acl_feedback == ref.acl_feedback
+        ):
+            return "unchanged"
+        lifecycle_repository.update_document_acl_feedback(
+            source_run_id=ref.source_run_id,
+            document_id=ref.document_id,
+            etag=ref.etag,
+            acl_status=acl.acl_status,
+            acl_feedback=acl.acl_feedback,
+        )
+        return "updated"
     if ref.status is DocumentStatus.RETIRED:
         source_item = connector.read_item(ref.item_id)
         source_etag = source_item.get("eTag") if source_item is not None else None
         if not isinstance(source_etag, str) or source_etag != ref.source_etag:
             return "unchanged"
         if not lifecycle_repository.is_authoritative_document_version(
+            source_id=config.source_id,
             document_id=ref.document_id,
             source_run_id=ref.source_run_id,
             source_etag=source_etag,
@@ -1424,9 +3119,11 @@ def resync_document_acl(
             etag=ref.etag,
             allowed_group_ids=acl.allowed_group_ids,
             acl_hash=acl.acl_hash,
+            acl_status=acl.acl_status,
+            acl_feedback=acl.acl_feedback,
         )
     except LifecycleConflictError:
-        return "unchanged"
+        raise
     return "updated"
 
 
@@ -1438,14 +3135,53 @@ def run_acl_resync_page(
     page_size: int,
     continuation_token: str | None,
     audit_container: Any | None = None,
+    work_registry: Any | None = None,
+    source_plan: Any | None = None,
+    owner_instance_id: str | None = None,
+    work_scope_id: str | None = None,
 ) -> tuple[AclResyncOutcome, str | None]:
     """Re-verify ACLs for one bounded page of ready documents (Durable-activity-sized)."""
     page = lifecycle_repository.list_ready_documents_page(
-        page_size=page_size, continuation_token=continuation_token
+        source_id=config.source_id,
+        page_size=page_size,
+        continuation_token=continuation_token,
     )
     unchanged = updated = retired = 0
     for ref in page.items:
-        result = resync_document_acl(config, ref, lifecycle_repository, connector, audit_container=audit_container)
+        claim = _claim_registered_item_work(
+            work_registry, source_plan, owner_instance_id, work_scope_id,
+            ref.document_id, "acl-resync",
+        )
+        if claim.get("status") == "completed":
+            prior = claim.get("outcome") or {}
+            result = prior.get("aclResult")
+            if result == "unchanged":
+                unchanged += 1
+            elif result == "updated":
+                updated += 1
+            elif result == "retired":
+                retired += 1
+            else:
+                raise RepositoryConflictError("ACL resync work replay outcome is invalid")
+            continue
+        if claim.get("status") not in {"acquired", "untracked"}:
+            raise RepositoryConflictError("ACL resync work remains unresolved")
+        result = resync_document_acl(
+            config, ref, lifecycle_repository, connector, audit_container=audit_container,
+        )
+        if result == "retired":
+            _clear_winner_if_points_to(
+                work_registry,
+                config.source_id,
+                owner_instance_id,
+                ref.document_id,
+                ref.source_run_id,
+                ref.document_key,
+            )
+        _settle_registered_item_work(
+            work_registry, owner_instance_id, claim, ref.document_id, "completed",
+            {"documentId": ref.document_id, "status": "succeeded", "aclResult": result},
+        )
         if result == "unchanged":
             unchanged += 1
         elif result == "updated":
@@ -1548,10 +3284,82 @@ def _source_to_document(source: Any, config: IngestionConfig, run_id: str, inges
         attempt_count=0, discovered_at=now, updated_at=now,
         source_modified_at=getattr(source, "last_modified_date_time", None),
         ingestion_mode=ingestion_mode,
+        processing_profile_digest=_processing_profile_digest(config),
+        business_name=config.business_name,
         id=document_id, document_id=document_id,
         source_run_id=create_source_run_id(config.source_id, run_id),
         document_key=create_document_key(config.source_id, run_id, document_id),
     )
+
+
+def _processing_profile_digest(config: IngestionConfig) -> str:
+    extraction_provider = config.extraction_provider
+    payload = {
+        "profileVersion": 1,
+        "extraction": {
+            "enabled": config.extraction_enabled,
+            "provider": (
+                extraction_provider.value
+                if extraction_provider is not None
+                else None
+            ),
+            "contentUnderstandingAnalyzerId": (
+                config.content_understanding_analyzer_id
+                if extraction_provider is ExtractionProvider.CONTENT_UNDERSTANDING
+                else None
+            ),
+        },
+        "chunking": {
+            "maxTokens": config.chunk_max_tokens,
+            "overlapTokens": config.chunk_overlap_tokens,
+        },
+        "enrichment": {
+            "enabled": config.enrichment_enabled,
+            "summaryEnabled": config.summary_enabled,
+            "keyPhrasesEnabled": config.key_phrases_enabled,
+            "entitiesEnabled": config.entities_enabled,
+        },
+        "embedding": {
+            "deployment": config.embedding_deployment,
+        },
+        "vision": {
+            "deployment": config.vision_deployment,
+            "maxOutputTokens": config.vision_max_output_tokens,
+        },
+        "audio": {
+            "enabled": config.audio_writer_enabled,
+            "provider": config.audio_transcription_provider,
+            "locale": config.audio_locale,
+        },
+        "processingAdmission": {
+            "maxRenderedDerivativeBytes": (
+                config.admission.max_rendered_derivative_bytes
+            ),
+            "maxPagesPerSource": config.admission.max_pages_per_source,
+            "maxContentUnitsPerSource": (
+                config.admission.max_content_units_per_source
+            ),
+            "maxOfficeCharacters": config.admission.max_office_characters,
+            "maxVisualAssetBytes": config.admission.max_visual_asset_bytes,
+            "maxVisualAssetsPerSource": (
+                config.admission.max_visual_assets_per_source
+            ),
+            "maxAudioPhrasesPerSource": (
+                config.admission.max_audio_phrases_per_source
+            ),
+            "maxAudioWordsPerSource": (
+                config.admission.max_audio_words_per_source
+            ),
+            "maxChunksPerSource": config.admission.max_chunks_per_source,
+        },
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _build_chunk_records(

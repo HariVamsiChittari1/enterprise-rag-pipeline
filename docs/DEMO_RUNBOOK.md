@@ -1,33 +1,83 @@
 # Enterprise RAG Pipeline Demo and E2E Runbook
 
-This runbook validates the deployed Function gateway, ACA retrieval service, ingestion lifecycle, ACL trimming, scoring profiles, freshness, synonyms, telemetry, and cleanup. Use only an approved non-production test site and disposable fixtures.
+This runbook validates the ingestion Function, direct delegated-user ACA retrieval service, ingestion lifecycle, ACL trimming, scoring profiles, freshness, synonyms, telemetry, and cleanup. Use only an approved non-production test site and disposable fixtures.
+
+## Current validated development boundary (2026-10-18)
+
+The table below records the validated development boundary as of 2026-10-18.
+Do not reuse image digests, catalog ETags, source states, or identities from
+this or an older rehearsal without revalidating the live target.
+
+| Source | Scope | State | Fresh ready documents / chunks |
+|---|---|---|---|
+| `sharepoint-drive` | Business A | active | 36 / 2,318 |
+| `poc-auth-demo` | Business A | active | 3 / 11 |
+| `poc-pg` | Business B | active | 11 / 113 |
+| `poc-auth` | Common | paused | 5 / 6 |
+
+The deployed direct-ACA matrix returned five source-isolated citations for
+each active business source, canonical no-evidence with zero citations for the
+paused Common source, and `401` for an anonymous request. The complete suite
+passed 2,705 tests with nine explicit live-environment skips. A fresh deployed
+guest token was unavailable; use the limitation recorded in the implementation
+plan's acceptance evidence rather than claiming a new guest-login proof.
+
+### Ten-minute rehearsal
+
+1. Show the four-source inventory and identify the three active business
+   sources and paused Common source.
+2. State the fresh-ingestion results above; do not rerun ingestion during a
+   short demo.
+3. Query each active business source directly through ACA and show that every
+   citation belongs to the selected `sourceId`.
+4. Query the paused Common source and show canonical no-evidence with zero
+   citations.
+5. Show that an anonymous ACA request returns `401`.
+6. Show the exact current image/catalog binding and accepted source policies.
+7. Mutate source state only with explicit approval and restore the approved
+   state before ending the demo.
+
+Store generated rehearsal reports under `C:\DevEnvs\enterprise-rag-pipeline\reports`, not in the OneDrive working copy.
 
 ## Preconditions
 
 - The deployed Function, ACA revision, image digest, and current catalog ETag/digest are known.
-- The caller can obtain a delegated token for `FUNCTION_API_AUDIENCE` with `user_impersonation`.
+- The caller can obtain a delegated token for `RETRIEVAL_API_AUDIENCE` with `user_impersonation` through the approved public client.
 - Disposable SharePoint fixtures inherit the target site's permissions.
 - The image is immutable; coordinate catalog editors so the expected generation remains stable during each evidence window.
 
 ```powershell
 $funcApp = '<function-app-name>'
 $clientId = '<function-api-client-id>'
-$baseUrl = "https://$funcApp.azurewebsites.net"
-$token = az account get-access-token --resource "api://$clientId" --query accessToken -o tsv
+$functionBaseUrl = "https://$funcApp.azurewebsites.net"
+$retrievalBaseUrl = 'https://<retrieval-container-app-fqdn>'
+$token = az account get-access-token --scope "api://$clientId/.default" --query accessToken -o tsv
 $headers = @{ Authorization = "Bearer $token"; 'Content-Type' = 'application/json' }
 ```
 
 Never print the token or persist it in reports.
 
+Acquire the retrieval API token separately through the approved public-client
+delegated flow, then create `$retrievalHeaders` with that token. A Function API
+token is not a retrieval API token; the audiences are intentionally different.
+
+```powershell
+$retrievalToken = '<delegated retrieval API token>'
+$retrievalHeaders = @{
+  Authorization = "Bearer $retrievalToken"
+  'Content-Type' = 'application/json'
+}
+```
+
 ## Verify Deployment Identity
 
 Capture:
 
-- Function App name and gateway target.
+- Function App name for ingestion operations.
 - ACA latest ready revision and 100% traffic assignment.
 - Full `repository@sha256:<digest>` image reference.
 - `DEPLOYMENT_INSTANCE_ID` and the inspected current catalog ETag/digest.
-- `ACL_ENABLED=true`.
+- Each tested source's accepted `retrievalAclEnabled` value.
 
 Any relevant Function deployment, ACA revision/traffic, image, catalog, profile, synonym, or timeout change invalidates affected live evidence.
 
@@ -36,9 +86,9 @@ Any relevant Function deployment, ACA revision/traffic, image, catalog, profile,
 ```powershell
 function Invoke-AuditedRagQuery([hashtable] $payload) {
   $response = Invoke-RestMethod `
-    -Uri "$baseUrl/api/query" `
+    -Uri "$retrievalBaseUrl/api/query" `
     -Method Post `
-    -Headers $headers `
+    -Headers $retrievalHeaders `
     -Body ($payload | ConvertTo-Json -Depth 5 -Compress) `
     -TimeoutSec 90
 
@@ -46,7 +96,7 @@ function Invoke-AuditedRagQuery([hashtable] $payload) {
   1..15 | ForEach-Object {
     if (-not $audit) {
       $rows = (Invoke-RestMethod `
-        -Uri "$baseUrl/api/ingestion/inspect?container=service-audit&limit=200" `
+        -Uri "$functionBaseUrl/api/ingestion/inspect?container=service-audit&limit=200" `
         -Headers $headers).rows
       $audit = $rows |
         Where-Object { $_.requestId -eq $response.request_id -and $_.operation -eq 'query_request' } |
@@ -63,17 +113,12 @@ The inspect endpoint is capped at 200 rows. If an exact audit is absent from tha
 
 ## Retrieval Matrix
 
-Run the repository tool against the Function gateway:
-
-```powershell
-python tools/script_query_retrieval.py `
-  --function-app $funcApp `
-  --client-id $clientId `
-  --scenario-matrix `
-  --expected-catalog-sha 'sha256:<catalog-digest>' `
-  --expected-catalog-etag '<exact-cosmos-etag>' `
-  --report demo-output/retrieval-scenario-matrix.json
-```
+Run the retrieval matrix directly against the ACA endpoint with real delegated
+users. The legacy `script_query_retrieval.py` Function-gateway interface does
+not prove the current direct ACA contract and must not be used for acceptance
+until its interface is migrated. Acquire tokens without printing them and call
+`https://<retrieval-fqdn>/api/query`; never supply
+`X-MS-CLIENT-PRINCIPAL` yourself.
 
 Required coverage:
 
@@ -98,15 +143,10 @@ and preserve protected generation-bound evidence after restoration.
 
 ## Scoring Profiles
 
-Use the existing `tools/script_query_retrieval.py` helper; no separate scoring demo script is required. For a quick interactive query, pass `--scoring-profile` without `--scenario-matrix`. When `--question` is omitted, the helper prompts for a question; press Enter to use the displayed verified default. It writes no report and prints the question, request parameters, answer, and citations; add `--json` only when the raw response is needed. For auditable evidence, use the matrix command below so the helper verifies path, mode, degradation, citations, selected profile, and catalog digest.
-
-```powershell
-python tools/script_query_retrieval.py `
-  --function-app $funcApp `
-  --client-id $clientId `
-  --mode hybrid `
-  --scoring-profile 'hr-relevance'
-```
+Send `scoring_profile` in the direct ACA query body. Preserve the query
+`request_id`, inspect the corresponding audit record through the approved
+operator path, and verify the effective profile and catalog generation. Do not
+use the legacy Function-gateway helper for current acceptance evidence.
 
 Run the matrix separately for each deployed profile:
 
@@ -117,7 +157,10 @@ Run the matrix separately for each deployed profile:
 | `hr-relevance-minimum` | `minimum` | none |
 | `hr-relevance-maximum` | `maximum` | none |
 
-For each run pass both `--scoring-profile` and `--expected-scoring-profile`. Require six passing scenarios, at least one citation per scenario, the exact catalog digest, and no degraded retrieval. HTTP 200 alone does not prove profile selection.
+For each run assert the requested and audited effective profile. Require six
+passing scenarios, at least one citation per scenario, the exact catalog
+digest, and no degraded retrieval. HTTP 200 alone does not prove profile
+selection.
 
 ## Freshness
 
@@ -171,7 +214,7 @@ Require:
 Start full sync and use the returned status URL:
 
 ```powershell
-$start = Invoke-RestMethod -Uri "$baseUrl/api/ingestion/full-sync" -Method Post -Headers $headers
+$start = Invoke-RestMethod -Uri "$functionBaseUrl/api/ingestion/full-sync" -Method Post -Headers $headers
 $status = Invoke-RestMethod -Uri $start.statusQueryGetUri -Headers $headers
 $status.output | Select-Object status, runStatus, discovered, succeeded, failed
 ```
@@ -195,9 +238,11 @@ Validate:
 - Unauthenticated Function requests return 401 from EasyAuth.
 - Authorized group membership returns evidence.
 - A denied principal returns no citations.
-- Public callers cannot call ACA directly; ACA Authentication accepts only the Function UAMI application/principal.
-- SharePoint notifications with an invalid `clientState` return 403.
-- The lifecycle webhook is excluded from EasyAuth and currently does not validate `clientState`; record this known gap rather than treating it as a passing security control.
+- Approved public-client users call ACA directly with delegated
+  `user_impersonation` tokens; anonymous, app-only, wrong-tenant,
+  wrong-audience, and unapproved-client requests fail authentication.
+- SharePoint change and lifecycle notifications with an invalid `clientState` return 403.
+- Lifecycle notifications with valid `clientState` still require a persisted subscription match before any source-state action.
 
 ## Telemetry Checks
 

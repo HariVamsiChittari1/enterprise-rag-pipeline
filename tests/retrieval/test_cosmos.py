@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
-from unittest.mock import Mock, patch
+from unittest.mock import Mock
 
 import pytest
 
@@ -40,9 +39,6 @@ def active_manifest(**overrides: object) -> dict[str, object]:
     return manifest
 
 
-NOW = datetime(2026, 9, 18, 12, tzinfo=timezone.utc)
-
-
 def audio_candidate() -> dict[str, object]:
     return candidate() | {
         "locatorKind": "time", "locatorLabel": "00:00-00:02",
@@ -63,27 +59,19 @@ def audio_manifest() -> dict[str, object]:
         mimeType="audio/wav", audio=row["audio"], lifecycleGeneration=1,
         documentId=row["documentId"], sourceRunId=row["sourceRunId"],
         documentKey=row["documentKey"], eTag="etag-1", contentHash="a" * 64,
-        allowedGroupIds=["group"], aclEvaluatedAt=NOW.isoformat(), sourceVerifiedAt=NOW.isoformat(),
+        allowedGroupIds=["group"],
     )
 
 
 @pytest.mark.parametrize("raw", [False, True])
 @pytest.mark.parametrize("mode", list(RetrievalMode))
-def test_audio_is_opt_in_and_bound_to_fresh_manifest(raw: bool, mode: RetrievalMode) -> None:
+def test_audio_transcript_is_retrieved_and_bound_to_manifest(raw: bool, mode: RetrievalMode) -> None:
     chunks, manifests = Mock(), Mock()
     chunks.query_items.return_value = [audio_candidate()]
     manifests.read_item.return_value = audio_manifest()
-    assert SecureCosmosRetriever(chunks, manifests).retrieve(
+    results = SecureCosmosRetriever(chunks, manifests).retrieve(
         "policy", [0.1], ["group"], mode=mode, raw=raw,
-    ) == []
-    retriever = SecureCosmosRetriever(
-        chunks, manifests, audio_retrieval_enabled=True,
-        audio_max_acl_age_seconds=60, audio_max_source_age_seconds=60,
     )
-    with patch("retrieval.cosmos.datetime") as clock:
-        clock.now.return_value = NOW
-        clock.fromisoformat = datetime.fromisoformat
-        results = retriever.retrieve("policy", [0.1], ["group"], mode=mode, raw=raw)
     assert len(results) == 1
     if not raw:
         assert (results[0].start_ms, results[0].end_ms, results[0].evidence_version) == (0, 2000, "etag-1")
@@ -93,14 +81,8 @@ def test_audio_is_opt_in_and_bound_to_fresh_manifest(raw: bool, mode: RetrievalM
 
 @pytest.mark.parametrize("raw", [False, True])
 @pytest.mark.parametrize("overrides", [
-    {"aclEvaluatedAt": (NOW - timedelta(seconds=61)).isoformat()},
-    {"sourceVerifiedAt": (NOW - timedelta(seconds=61)).isoformat()},
-    {"sourceVerifiedAt": (NOW + timedelta(seconds=1)).isoformat()},
-    {"aclEvaluatedAt": None}, {"sourceVerifiedAt": "bad"},
-    {"aclEvaluatedAt": "2026-09-18T12:00:00"},
     {"lifecycleGeneration": 2}, {"lifecycleGeneration": True},
     {"eTag": "updated"}, {"contentHash": "b" * 64},
-    {"allowedGroupIds": ["other-group"]}, {"allowedGroupIds": []},
     {"status": "retired"}, {"documentKey": "wrong"}, {"audio": {}},
     {"schemaVersion": 2}, {"mimeType": "application/pdf"},
 ])
@@ -108,14 +90,9 @@ def test_audio_manifest_validation_fails_closed(raw: bool, overrides: dict[str, 
     chunks, manifests = Mock(), Mock()
     chunks.query_items.return_value = [audio_candidate()]
     manifests.read_item.return_value = audio_manifest() | overrides
-    retriever = SecureCosmosRetriever(
-        chunks, manifests, audio_retrieval_enabled=True,
-        audio_max_acl_age_seconds=60, audio_max_source_age_seconds=60,
-    )
-    with patch("retrieval.cosmos.datetime") as clock:
-        clock.now.return_value = NOW
-        clock.fromisoformat = datetime.fromisoformat
-        assert retriever.retrieve("policy", [0.1], ["group"], raw=raw) == []
+    assert SecureCosmosRetriever(chunks, manifests).retrieve(
+        "policy", [0.1], ["group"], raw=raw,
+    ) == []
 
 
 @pytest.mark.parametrize("overrides", [
@@ -152,23 +129,18 @@ def test_audio_rejects_mismatched_transcription_profile(overrides: dict[str, obj
 
 @pytest.mark.parametrize("raw", [False, True])
 @pytest.mark.parametrize("mode", list(RetrievalMode))
-@pytest.mark.parametrize("enabled", [False, True])
-def test_shared_schema_retrieves_mixed_media_only_when_enabled(
-    raw: bool, mode: RetrievalMode, enabled: bool,
+def test_shared_schema_retrieves_mixed_document_and_transcript_text(
+    raw: bool, mode: RetrievalMode,
 ) -> None:
     chunks, manifests = Mock(), Mock()
     chunks.query_items.return_value = [candidate(), audio_candidate()]
     manifests.read_item.side_effect = [active_manifest(), audio_manifest()]
-    retriever = SecureCosmosRetriever(
-        chunks, manifests, audio_retrieval_enabled=enabled,
-        audio_max_acl_age_seconds=60, audio_max_source_age_seconds=60,
+    results = SecureCosmosRetriever(chunks, manifests).retrieve(
+        "policy", [0.1], ["group"], mode=mode, raw=raw,
     )
-    with patch("retrieval.cosmos.datetime") as clock:
-        clock.now.return_value = NOW
-        clock.fromisoformat = datetime.fromisoformat
-        results = retriever.retrieve("policy", [0.1], ["group"], mode=mode, raw=raw)
-    expected = ["page", "time"] if enabled else ["page"]
-    assert [row["locatorKind"] if raw else row.locator_kind.value for row in results] == expected
+    assert [row["locatorKind"] if raw else row.locator_kind.value for row in results] == [
+        "page", "time",
+    ]
 
 
 @pytest.mark.parametrize("raw", [False, True])
@@ -182,22 +154,16 @@ def test_matching_unsupported_manifest_and_chunk_schemas_are_rejected(
     manifest = audio_manifest() if is_audio else active_manifest()
     chunks.query_items.return_value = [row | {"schemaVersion": schema_version}]
     manifests.read_item.return_value = manifest | {"schemaVersion": schema_version}
-    retriever = SecureCosmosRetriever(
-        chunks, manifests, audio_retrieval_enabled=True,
-        audio_max_acl_age_seconds=60, audio_max_source_age_seconds=60,
-    )
-    with patch("retrieval.cosmos.datetime") as clock:
-        clock.now.return_value = NOW
-        clock.fromisoformat = datetime.fromisoformat
-        assert retriever.retrieve("policy", [0.1], ["group"], raw=raw) == []
+    assert SecureCosmosRetriever(chunks, manifests).retrieve(
+        "policy", [0.1], ["group"], raw=raw,
+    ) == []
 
 
 @pytest.mark.parametrize("raw", [False, True])
-@pytest.mark.parametrize("enabled", [False, True])
 @pytest.mark.parametrize("mime_type", ["audio/wav", "audio/mpeg", "audio/flac"])
 @pytest.mark.parametrize("metadata_state", ["present", "null", "missing"])
 def test_document_locator_cannot_bypass_audio_manifest_guards(
-    raw: bool, enabled: bool, mime_type: str, metadata_state: str,
+    raw: bool, mime_type: str, metadata_state: str,
 ) -> None:
     chunks, manifests = Mock(), Mock()
     chunks.query_items.return_value = [candidate()]
@@ -207,22 +173,45 @@ def test_document_locator_cannot_bypass_audio_manifest_guards(
     elif metadata_state == "null":
         manifest["audio"] = None
     manifests.read_item.return_value = manifest
+    assert SecureCosmosRetriever(chunks, manifests).retrieve(
+        "policy", [0.1], ["group"], raw=raw,
+    ) == []
+
+
+def test_acl_disabled_retrieves_audio_without_principals_or_acl_freshness() -> None:
+    chunks, manifests = Mock(), Mock()
+    chunks.query_items.return_value = [audio_candidate()]
+    manifests.read_item.return_value = audio_manifest() | {
+        "allowedGroupIds": None,
+        "aclEvaluatedAt": None,
+    }
     retriever = SecureCosmosRetriever(
-        chunks, manifests, audio_retrieval_enabled=enabled,
-        audio_max_acl_age_seconds=60, audio_max_source_age_seconds=60,
+        chunks,
+        manifests,
+        acl_enabled=False,
     )
-    assert retriever.retrieve("policy", [0.1], ["group"], raw=raw) == []
+
+    results = retriever.retrieve("policy", [0.1], [])
+
+    assert [result.locator_kind for result in results] == [RetrievalLocatorKind.TIME]
+    query = chunks.query_items.call_args.kwargs["query"]
+    assert "allowedGroupIds" not in query
+    assert "@principalIds" not in query
 
 
-@pytest.mark.parametrize("options", [
-    {}, {"audio_max_acl_age_seconds": 60},
-    {"audio_max_acl_age_seconds": 0, "audio_max_source_age_seconds": 60},
-    {"audio_max_acl_age_seconds": True, "audio_max_source_age_seconds": 60},
-    {"acl_enabled": False, "audio_max_acl_age_seconds": 60, "audio_max_source_age_seconds": 60},
-])
-def test_enabling_audio_requires_authorization_policy(options: dict[str, object]) -> None:
-    with pytest.raises(ValueError, match="audio_requires_acl_and_freshness_limits"):
-        SecureCosmosRetriever(Mock(), Mock(), audio_retrieval_enabled=True, **options)
+def test_audio_transcript_does_not_expire_by_file_format() -> None:
+    chunks, manifests = Mock(), Mock()
+    chunks.query_items.return_value = [audio_candidate()]
+    manifests.read_item.return_value = audio_manifest() | {
+        "aclEvaluatedAt": "2020-01-01T00:00:00+00:00",
+        "sourceVerifiedAt": "2020-01-01T00:00:00+00:00",
+    }
+
+    results = SecureCosmosRetriever(chunks, manifests).retrieve(
+        "policy", [0.1], ["group"],
+    )
+
+    assert len(results) == 1
 
 
 @pytest.mark.parametrize("mode", list(RetrievalMode))
@@ -255,6 +244,60 @@ def test_every_ranked_query_filters_acl_before_ranking(mode: RetrievalMode) -> N
     )
 
 
+def test_shared_link_feedback_never_authorizes_retrieval() -> None:
+    class AclFilteringChunks:
+        def __init__(self) -> None:
+            self.row = candidate() | {
+                "allowedGroupIds": ["allowed-group"],
+                "aclFeedback": ["SharedLink"],
+            }
+            self.queries: list[str] = []
+
+        def query_items(
+            self,
+            *,
+            query: str,
+            parameters: list[dict[str, object]],
+            enable_cross_partition_query: bool,
+        ) -> list[dict[str, object]]:
+            assert enable_cross_partition_query is True
+            self.queries.append(query)
+            parameter_values = {
+                parameter["name"]: parameter["value"]
+                for parameter in parameters
+            }
+            principal_ids = set(parameter_values["@principalIds"])
+            return (
+                [self.row]
+                if principal_ids.intersection(self.row["allowedGroupIds"])
+                else []
+            )
+
+    chunks = AclFilteringChunks()
+    manifests = Mock()
+    manifests.read_item.return_value = active_manifest(
+        allowedGroupIds=["allowed-group"],
+        aclStatus="Verified",
+        aclFeedback=["SharedLink"],
+    )
+    retriever = SecureCosmosRetriever(chunks, manifests)
+
+    allowed = retriever.retrieve("policy", [0.1], ["allowed-group"])
+    denied = retriever.retrieve("policy", [0.1], ["outside-group"])
+
+    assert [result.content for result in allowed] == ["authorized content"]
+    assert denied == []
+    assert all("aclFeedback" not in query for query in chunks.queries)
+    assert all(
+        "ARRAY_CONTAINS(@principalIds, gid)" in query
+        for query in chunks.queries
+    )
+    manifests.read_item.assert_called_once_with(
+        item="document",
+        partition_key="sharepoint-drive:run1",
+    )
+
+
 def test_non_ready_document_is_not_returned() -> None:
     chunks = Mock()
     chunks.query_items.return_value = [candidate()]
@@ -268,7 +311,9 @@ def test_non_ready_document_is_not_returned() -> None:
 
 @pytest.mark.parametrize("mode", list(RetrievalMode))
 @pytest.mark.parametrize("raw", [False, True])
-def test_documents_only_filter_precedes_ranking(mode: RetrievalMode, raw: bool) -> None:
+def test_supported_document_and_transcript_filters_precede_ranking(
+    mode: RetrievalMode, raw: bool,
+) -> None:
     chunks = Mock()
     chunks.query_items.return_value = [candidate()]
     manifests = Mock()
@@ -280,7 +325,113 @@ def test_documents_only_filter_precedes_ranking(mode: RetrievalMode, raw: bool) 
     query = chunks.query_items.call_args.kwargs["query"]
     assert "c.schemaVersion = 1" in query.split("ORDER BY")[0]
     assert "c.locatorKind IN ('page', 'section', 'slide', 'worksheet')" in query
-    assert "c.locatorKind = 'time'" not in query
+    assert "c.locatorKind = 'time'" in query.split("ORDER BY")[0]
+
+
+@pytest.mark.parametrize("mode", list(RetrievalMode))
+def test_source_eligibility_filters_candidates_before_ranking(mode: RetrievalMode) -> None:
+    chunks = Mock()
+    chunks.query_items.return_value = [candidate() | {"sourceId": "source-a"}]
+    manifests = Mock()
+    manifests.read_item.return_value = active_manifest(sourceId="source-a")
+
+    results = SecureCosmosRetriever(chunks, manifests).retrieve(
+        "policy", [0.1], ["group"], mode=mode,
+        eligible_source_ids=["source-a"],
+    )
+
+    assert len(results) == 1
+    query = chunks.query_items.call_args.kwargs["query"]
+    assert "ARRAY_CONTAINS(@eligibleSourceIds, c.sourceId)" in query
+    assert query.index("c.sourceId") < query.index("ORDER BY")
+    parameters = {
+        parameter["name"]: parameter["value"]
+        for parameter in chunks.query_items.call_args.kwargs["parameters"]
+    }
+    assert parameters["@eligibleSourceIds"] == ["source-a"]
+
+
+def test_production_retriever_requires_source_eligibility_before_query() -> None:
+    chunks = Mock()
+    retriever = SecureCosmosRetriever(
+        chunks, Mock(), require_source_eligibility=True,
+    )
+
+    with pytest.raises(ValueError, match="source_eligibility_required"):
+        retriever.retrieve("policy", [0.1], ["group"])
+
+    chunks.query_items.assert_not_called()
+
+
+def test_candidate_source_id_must_match_ready_manifest() -> None:
+    chunks = Mock()
+    chunks.query_items.return_value = [candidate() | {"sourceId": "source-a"}]
+    manifests = Mock()
+    manifests.read_item.return_value = active_manifest(sourceId="source-b")
+
+    results = SecureCosmosRetriever(chunks, manifests).retrieve(
+        "policy", [0.1], ["group"], eligible_source_ids=["source-a"],
+    )
+
+    assert results == []
+
+
+def test_candidate_from_source_outside_request_snapshot_is_rejected() -> None:
+    chunks = Mock()
+    chunks.query_items.return_value = [candidate() | {"sourceId": "source-b"}]
+    manifests = Mock()
+    manifests.read_item.return_value = active_manifest(sourceId="source-b")
+
+    results = SecureCosmosRetriever(chunks, manifests).retrieve(
+        "policy", [0.1], ["group"], eligible_source_ids=["source-a"],
+    )
+
+    assert results == []
+    manifests.read_item.assert_not_called()
+
+
+@pytest.mark.parametrize("mode", list(RetrievalMode))
+@pytest.mark.parametrize("eligible_source", ["source-a", "source-b"])
+def test_mixed_source_candidates_return_only_eligible_source_with_acl_filter(
+    mode: RetrievalMode, eligible_source: str,
+) -> None:
+    sources = ("source-a", "source-b")
+    chunks = Mock()
+    chunks.query_items.return_value = [
+        candidate() | {
+            "id": f"chunk-{source}", "documentId": f"document-{source}",
+            "sourceId": source, "sourceRunId": f"{source}:run",
+            "sourceName": f"{source}.pdf",
+            "sourceUrl": f"https://tenant.sharepoint.com/sites/{source}/document.pdf",
+        }
+        for source in sources
+    ]
+    manifests = Mock()
+    manifests.read_item.return_value = active_manifest(sourceId=eligible_source)
+    retriever = SecureCosmosRetriever(chunks, manifests, require_source_eligibility=True)
+
+    results = retriever.retrieve(
+        "policy", [0.1], [f"group-{eligible_source}"], mode=mode,
+        eligible_source_ids=[eligible_source],
+    )
+
+    assert len(results) == 1
+    assert results[0].source_id == eligible_source
+    assert results[0].source_name == f"{eligible_source}.pdf"
+    assert results[0].source_url == f"https://tenant.sharepoint.com/sites/{eligible_source}/document.pdf"
+    manifests.read_item.assert_called_once_with(
+        item=f"document-{eligible_source}", partition_key=f"{eligible_source}:run",
+    )
+    query = chunks.query_items.call_args.kwargs["query"]
+    where = query.split("ORDER BY")[0]
+    assert "ARRAY_CONTAINS(@eligibleSourceIds, c.sourceId)" in where
+    assert "ARRAY_CONTAINS(@principalIds, gid)" in where
+    parameters = {
+        parameter["name"]: parameter["value"]
+        for parameter in chunks.query_items.call_args.kwargs["parameters"]
+    }
+    assert parameters["@eligibleSourceIds"] == [eligible_source]
+    assert parameters["@principalIds"] == [f"group-{eligible_source}"]
 
 
 @pytest.mark.parametrize("raw", [False, True])
@@ -432,6 +583,31 @@ def test_acl_disabled_omits_filter_and_accepts_empty_principals() -> None:
     assert "@principalIds" not in query
 
 
+def test_request_acl_policy_overrides_retriever_default() -> None:
+    chunks = Mock()
+    chunks.query_items.return_value = []
+    retriever = SecureCosmosRetriever(chunks, Mock())
+
+    retriever.retrieve(
+        "policy",
+        [0.1],
+        [],
+        eligible_source_ids=["source-a"],
+        acl_enabled=False,
+    )
+
+    query = chunks.query_items.call_args.kwargs["query"]
+    parameters = {
+        parameter["name"]: parameter["value"]
+        for parameter in chunks.query_items.call_args.kwargs["parameters"]
+    }
+    assert "c.isRetrievable = true" in query
+    assert "ARRAY_CONTAINS(@eligibleSourceIds, c.sourceId)" in query
+    assert "allowedGroupIds" not in query
+    assert parameters["@eligibleSourceIds"] == ["source-a"]
+    assert "@principalIds" not in parameters
+
+
 def test_projection_includes_source_modified_at_and_returns_field() -> None:
     row = candidate()
     row["sourceModifiedAt"] = "2024-05-01T00:00:00Z"
@@ -458,7 +634,7 @@ def test_raw_projection_excludes_ingestion_only_token_count() -> None:
     manifests.read_item.return_value = active_manifest()
     retriever = SecureCosmosRetriever(chunks, manifests, acl_enabled=False)
 
-    raw = retriever.retrieve("policy", [0.1], [], raw=True)
+    retriever.retrieve("policy", [0.1], [], raw=True)
 
     assert "c.tokenCount" not in chunks.query_items.call_args.kwargs["query"]
 
@@ -619,7 +795,7 @@ def test_expander_variants_are_tokenized_into_keywords() -> None:
     assert term_values == ["vacation", "policy", "annual", "leave"]
 
 
-# --- Phase 2b: multi-term FullTextScore SQL generation ----------------------------
+# --- Multi-term FullTextScore SQL generation --------------------------------------
 
 
 def test_hybrid_multi_term_uses_one_full_text_score_with_all_bound_terms() -> None:

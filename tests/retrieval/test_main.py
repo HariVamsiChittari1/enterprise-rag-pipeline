@@ -6,6 +6,7 @@ import asyncio
 import base64
 import json
 import time
+import uuid
 from dataclasses import replace
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -23,7 +24,7 @@ from fastapi import HTTPException, Request
 
 from retrieval.main import app
 import retrieval.main as retrieval_main
-from retrieval.auth import GatewayContext, Principal
+from retrieval.auth import Principal
 from retrieval.catalog import RequestPolicy, RuntimeCatalogSnapshot
 from retrieval.cosmos import RetrievalLocatorKind, RetrievalMode, RetrievedChunk
 from retrieval.pipeline import RetrievalDependencyError
@@ -32,19 +33,22 @@ from retrieval.service import (
     RagService, SearchResult, UnknownScoringProfileError,
     suppress_content_filter_retry, suppress_content_filter_retry_async,
 )
+from retrieval.source_policy import (
+    SourceEligibility,
+    SourcePolicyReader,
+    SourcePolicySnapshot,
+)
 from retrieval.synonyms import SynonymExpander, SynonymMap
 
 
 TENANT_ID = "11111111-1111-4111-8111-111111111111"
 USER_ID = "22222222-2222-4222-8222-abcdefabcdef"
-GATEWAY_CLIENT_ID = "33333333-3333-4333-8333-333333333333"
-GATEWAY_PRINCIPAL_ID = "44444444-4444-4444-8444-444444444444"
 
 
 class _PolicyService:
     def capture_policy(self, requested=None, expand_synonyms=None):
         snapshot = RuntimeCatalogSnapshot(
-            deployment_instance_id="test", catalog_id="runtime-catalog", etag="etag-a",
+            catalog_id="runtime-catalog", etag="etag-a",
             digest="sha256:" + "a" * 64, operation_id="operation-a",
             changed_at="2026-09-08T00:00:00Z", accepted_at=datetime(2026, 9, 8, tzinfo=timezone.utc),
             over_fetch_factor=1, hybrid_weights=(1, 1), full_text_score_scope="Global",
@@ -52,39 +56,41 @@ class _PolicyService:
         )
         return RequestPolicy.capture(snapshot, requested, expand_synonyms)
 
+    def capture_source_policy(self, _source_id=None):
+        return None
 
-def _encoded_service_principal(*, idtyp: str = "app") -> str:
+
+def _encoded_user_principal(**overrides: str) -> str:
     claims = {
-        "oid": GATEWAY_PRINCIPAL_ID,
+        "oid": USER_ID,
         "tid": TENANT_ID,
         "aud": "api://retrieval-api",
-        "idtyp": idtyp,
-        "azp": GATEWAY_CLIENT_ID,
-        "roles": "Retrieval.Gateway",
+        "idtyp": "user",
+        "scp": "user_impersonation",
     }
+    claims.update(overrides)
     return base64.b64encode(json.dumps({
         "claims": [{"typ": key, "val": value} for key, value in claims.items()]
     }).encode()).decode()
 
 
-def _gateway_request(*, idtyp: str = "app", duplicate_context: bool = False) -> Request:
-    context = GatewayContext(USER_ID, TENANT_ID).encode().encode()
+def _direct_user_request(
+    *,
+    duplicate_principal: bool = False,
+    **overrides: str,
+) -> Request:
+    encoded = _encoded_user_principal(**overrides).encode()
     headers = [
-        (b"x-ms-client-principal", _encoded_service_principal(idtyp=idtyp).encode()),
-        (b"x-rag-gateway-context", context),
+        (b"x-ms-client-principal", encoded),
     ]
-    if duplicate_context:
-        headers.append((b"x-rag-gateway-context", context))
+    if duplicate_principal:
+        headers.append((b"x-ms-client-principal", encoded))
     return Request({"type": "http", "headers": headers})
 
 
 @pytest.fixture
 def client():
-    return TestClient(
-        app,
-        raise_server_exceptions=False,
-        headers={"X-RAG-REQUEST-ID": "11111111-1111-4111-8111-111111111111"},
-    )
+    return TestClient(app, raise_server_exceptions=False)
 
 
 def test_health_live(client):
@@ -128,9 +134,14 @@ def test_citation_response_uses_typed_location(
 
 
 def test_query_missing_auth_returns_401(client):
-    response = client.post("/api/query", json={"question": "What is RAG?"})
+    response = client.post(
+        "/api/query",
+        json={"sourceId": "source-a", "question": "What is RAG?"},
+    )
     assert response.status_code == 401
-    assert response.json()["error"]["code"] == "invalid_gateway_headers"
+    assert response.json()["error"]["code"] == (
+        "invalid_authenticated_principal_header"
+    )
 
 
 def test_audio_citation_preserves_times_without_inventing_a_playback_url() -> None:
@@ -156,7 +167,7 @@ def test_document_citation_wire_shape_stays_unchanged() -> None:
     assert route.response_model_exclude_none is True
 
 
-def test_resolve_principal_accepts_only_function_app_boundary(
+def test_resolve_principal_accepts_direct_delegated_user(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     resolver = Mock()
@@ -164,55 +175,234 @@ def test_resolve_principal_accepts_only_function_app_boundary(
     monkeypatch.setattr(retrieval_main._state, "config", SimpleNamespace(
         tenant_id=TENANT_ID,
         retrieval_audience="api://retrieval-api",
-        gateway_client_id=GATEWAY_CLIENT_ID,
-        gateway_principal_id=GATEWAY_PRINCIPAL_ID,
-        acl_enabled=True,
     ), raising=False)
     monkeypatch.setattr(retrieval_main._state, "group_resolver", resolver, raising=False)
 
-    principal = retrieval_main._resolve_principal(_gateway_request())
+    principal = retrieval_main._resolve_principal(_direct_user_request())
 
-    assert principal == Principal(USER_ID, TENANT_ID, frozenset({"group-1"}))
+    assert principal == Principal(USER_ID, TENANT_ID, frozenset())
+    resolver.resolve_transitive_security_groups.assert_not_called()
 
 
-def test_resolve_principal_rejects_duplicate_context_header(
+def test_resolve_principal_rejects_duplicate_principal_header(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(retrieval_main._state, "config", SimpleNamespace(), raising=False)
 
-    with pytest.raises(HTTPException, match="invalid_gateway_headers"):
-        retrieval_main._resolve_principal(_gateway_request(duplicate_context=True))
+    with pytest.raises(
+        HTTPException,
+        match="invalid_authenticated_principal_header",
+    ):
+        retrieval_main._resolve_principal(
+            _direct_user_request(duplicate_principal=True),
+        )
 
 
-def test_resolve_principal_rejects_delegated_direct_caller(
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"idtyp": "app"}, "user_token_required"),
+        (
+            {"tid": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"},
+            "unexpected_tenant",
+        ),
+        ({"aud": "api://other"}, "unexpected_audience"),
+        ({"scp": "other.scope"}, "required_scope_missing"),
+    ],
+)
+def test_resolve_principal_rejects_invalid_delegated_user(
     monkeypatch: pytest.MonkeyPatch,
+    overrides: dict[str, str],
+    message: str,
 ) -> None:
     monkeypatch.setattr(retrieval_main._state, "config", SimpleNamespace(
         tenant_id=TENANT_ID,
         retrieval_audience="api://retrieval-api",
-        gateway_client_id=GATEWAY_CLIENT_ID,
-        gateway_principal_id=GATEWAY_PRINCIPAL_ID,
-        acl_enabled=False,
     ), raising=False)
     monkeypatch.setattr(retrieval_main._state, "group_resolver", None, raising=False)
 
-    with pytest.raises(HTTPException, match="service_token_required"):
-        retrieval_main._resolve_principal(_gateway_request(idtyp="user"))
+    with pytest.raises(HTTPException, match=message):
+        retrieval_main._resolve_principal(
+            _direct_user_request(**overrides),
+        )
+
+
+def test_query_accepts_direct_user_and_owns_request_id(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    encoded_principal = _encoded_user_principal()
+
+    class DirectUserService(_PolicyService):
+        def plan_queries(self, *_args):
+            return ["policy"], []
+
+        def answer_with_queries(self, *_args, **_kwargs):
+            return {
+                "answer": "I could not find authorized evidence for this question.",
+                "citations": [],
+                "usage": [],
+            }
+
+    monkeypatch.setattr(
+        retrieval_main._state,
+        "config",
+        SimpleNamespace(
+            tenant_id=TENANT_ID,
+            retrieval_audience="api://retrieval-api",
+            include_citations=True,
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        retrieval_main._state,
+        "rag_service",
+        DirectUserService(),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        retrieval_main._state,
+        "agent_chat_client",
+        None,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        retrieval_main._state,
+        "audit_container",
+        SimpleNamespace(create_item=lambda _item: None),
+        raising=False,
+    )
+
+    response = client.post(
+        "/api/query",
+        json={"sourceId": "source-a", "question": "policy"},
+        headers={
+            "X-MS-CLIENT-PRINCIPAL": encoded_principal,
+            "X-RAG-REQUEST-ID": "11111111-1111-4111-8111-111111111111",
+        },
+    )
+
+    assert response.status_code == 200
+    request_id = response.json()["request_id"]
+    assert str(uuid.UUID(request_id)) == request_id
+    assert request_id != "11111111-1111-4111-8111-111111111111"
+    logs = capsys.readouterr()
+    assert encoded_principal not in logs.out + logs.err
+    assert USER_ID not in logs.out + logs.err
+
+
+@pytest.mark.parametrize(
+    ("content_scope", "acl_enabled", "expected_groups"),
+    [
+        ("business", True, frozenset({"group-1"})),
+        ("business", False, frozenset()),
+        ("common", False, frozenset()),
+    ],
+)
+def test_selected_source_policy_controls_group_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+    content_scope: str,
+    acl_enabled: bool,
+    expected_groups: frozenset[str],
+) -> None:
+    resolver = Mock()
+    resolver.resolve_transitive_security_groups.return_value = {"group-1"}
+    monkeypatch.setattr(
+        retrieval_main._state,
+        "group_resolver",
+        resolver,
+        raising=False,
+    )
+    snapshot = SourcePolicySnapshot((
+        SourceEligibility(
+            "source-a",
+            "etag-a",
+            "active",
+            content_scope,
+            "search-chunks",
+            "source-documents",
+            acl_enabled,
+            "Business A",
+        ),
+    ))
+
+    principal = retrieval_main._principal_for_source_policy(
+        Principal(USER_ID, TENANT_ID, frozenset()),
+        snapshot,
+    )
+
+    assert principal.security_group_ids == expected_groups
+    assert resolver.resolve_transitive_security_groups.call_count == int(
+        acl_enabled,
+    )
+
+
+def test_common_source_with_acl_enabled_fails_closed() -> None:
+    snapshot = SourcePolicySnapshot((
+        SourceEligibility(
+            "source-a",
+            "etag-a",
+            "active",
+            "common",
+            "search-chunks",
+            "source-documents",
+            True,
+            "Business A",
+        ),
+    ))
+
+    with pytest.raises(
+        RetrievalDependencyError,
+        match="source_policy_invalid",
+    ):
+        retrieval_main._principal_for_source_policy(
+            Principal(USER_ID, TENANT_ID, frozenset()),
+            snapshot,
+        )
 
 
 def test_query_empty_question_returns_422(client):
     response = client.post(
         "/api/query",
-        json={"question": ""},
+        json={"sourceId": "source-a", "question": ""},
         headers={"X-MS-CLIENT-PRINCIPAL": "dummy"},
     )
     assert response.status_code == 422
 
 
+def test_query_missing_source_id_returns_422(client):
+    response = client.post(
+        "/api/query",
+        json={"question": "test"},
+        headers={"X-MS-CLIENT-PRINCIPAL": "dummy"},
+    )
+
+    assert response.status_code == 422
+
+
+@pytest.mark.parametrize(
+    "source_id",
+    [" ", "source/a", "source\\a", "source\na", "\u00e9" * 512],
+)
+def test_query_invalid_source_id_returns_422(
+    client: TestClient,
+    source_id: str,
+) -> None:
+    response = client.post(
+        "/api/query",
+        json={"sourceId": source_id, "question": "test"},
+        headers={"X-MS-CLIENT-PRINCIPAL": "dummy"},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "invalid_request"
+
+
 def test_query_question_too_long_returns_422(client):
     response = client.post(
         "/api/query",
-        json={"question": "x" * 4001},
+        json={"sourceId": "source-a", "question": "x" * 4001},
         headers={"X-MS-CLIENT-PRINCIPAL": "dummy"},
     )
     assert response.status_code == 422
@@ -221,7 +411,7 @@ def test_query_question_too_long_returns_422(client):
 def test_query_invalid_mode_returns_422(client):
     response = client.post(
         "/api/query",
-        json={"question": "test", "mode": "invalid"},
+        json={"sourceId": "source-a", "question": "test", "mode": "invalid"},
         headers={"X-MS-CLIENT-PRINCIPAL": "dummy"},
     )
     assert response.status_code == 422
@@ -246,7 +436,11 @@ def test_query_unknown_scoring_profile_returns_stable_400(
 
     response = client.post(
         "/api/query",
-        json={"question": "test", "scoring_profile": "missing"},
+        json={
+            "sourceId": "source-a",
+            "question": "test",
+            "scoring_profile": "missing",
+        },
         headers={"X-MS-CLIENT-PRINCIPAL": "ignored"},
     )
 
@@ -279,7 +473,7 @@ def test_query_retrieval_outage_returns_stable_503(
 
     response = client.post(
         "/api/query",
-        json={"question": "test"},
+        json={"sourceId": "source-a", "question": "test"},
         headers={"X-MS-CLIENT-PRINCIPAL": "ignored"},
     )
 
@@ -310,11 +504,14 @@ def test_query_wall_clock_deadline_returns_safe_504(
         raising=False,
     )
 
-    response = client.post("/api/query", json={"question": "slow"})
+    response = client.post(
+        "/api/query",
+        json={"sourceId": "source-a", "question": "slow"},
+    )
 
     assert response.status_code == 504
     assert response.json()["error"]["code"] == "operation_timeout"
-    assert response.json()["request_id"] == "11111111-1111-4111-8111-111111111111"
+    assert str(uuid.UUID(response.json()["request_id"])) == response.json()["request_id"]
 
 
 @pytest.mark.parametrize("requested_mode", ["hybrid", "vector", "full_text"])
@@ -354,7 +551,12 @@ def test_agentic_path_receives_request_mode_and_top_k(
 
     response = client.post(
         "/api/query",
-        json={"question": "compare two policies", "mode": requested_mode, "top_k": 1},
+        json={
+            "sourceId": "source-a",
+            "question": "compare two policies",
+            "mode": requested_mode,
+            "top_k": 1,
+        },
         headers={"X-MS-CLIENT-PRINCIPAL": "ignored"},
     )
 
@@ -402,7 +604,11 @@ def test_agentic_fallback_preserves_request_mode(
 
     response = client.post(
         "/api/query",
-        json={"question": "compare two policies", "mode": requested_mode},
+        json={
+            "sourceId": "source-a",
+            "question": "compare two policies",
+            "mode": requested_mode,
+        },
         headers={"X-MS-CLIENT-PRINCIPAL": "ignored"},
     )
 
@@ -413,6 +619,116 @@ def test_agentic_fallback_preserves_request_mode(
         "agentic_mode": expected_mode,
         "fallback_mode": expected_mode,
     }
+
+
+def test_query_point_reads_only_requested_source_policy(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = {
+        "id": "source-a",
+        "sourceId": "source-a",
+        "schemaVersion": 1,
+        "sourceKind": "sharepoint-drive",
+        "desiredState": "active",
+        "config": {
+            "siteId": "site-a",
+            "siteUrl": "https://tenant.sharepoint.com/sites/a",
+            "driveId": "drive-a",
+            "businessName": "Business A",
+            "contentScope": "business",
+            "chunksContainer": "business-a-search-chunks",
+            "manifestsContainer": "business-a-source-documents",
+            "retrievalAclEnabled": True,
+        },
+        "_etag": "catalog-etag-a",
+    }
+
+    class Sources:
+        query_calls = 0
+        reads: list[tuple[str, str]] = []
+
+        def query_items(self, **_kwargs):
+            self.query_calls += 1
+            pytest.fail("a source-specific request must not enumerate the registry")
+
+        def read_item(self, *, item: str, partition_key: str):
+            self.reads.append((item, partition_key))
+            return source
+
+    sources = Sources()
+
+    class PointReadService(_PolicyService):
+        _source_policy_reader = SourcePolicyReader(sources)
+        capture_source_policy = RagService.capture_source_policy
+
+        def plan_queries(self, *_args):
+            return ["policy"], []
+
+        def answer_with_queries(
+            self,
+            *_args,
+            source_id,
+            source_policy_snapshot,
+            **_kwargs,
+        ):
+            snapshot = source_policy_snapshot
+            assert snapshot is not None
+            assert snapshot.eligible_source_ids == ["source-a"]
+            return {
+                "answer": "I could not find authorized evidence for this question.",
+                "citations": [],
+                "usage": [{"operation": "embedding"}],
+            }
+
+    monkeypatch.setattr(
+        retrieval_main,
+        "_resolve_principal",
+        lambda _: Principal("point-read-user", "tenant", frozenset({"group"})),
+    )
+    monkeypatch.setattr(
+        retrieval_main._state,
+        "rag_service",
+        PointReadService(),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        retrieval_main._state,
+        "agent_chat_client",
+        None,
+        raising=False,
+    )
+    audit_records: list[dict] = []
+    monkeypatch.setattr(
+        retrieval_main._state,
+        "audit_container",
+        SimpleNamespace(create_item=audit_records.append),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        retrieval_main._state,
+        "config",
+        SimpleNamespace(include_citations=True),
+        raising=False,
+    )
+
+    response = client.post(
+        "/api/query",
+        json={"sourceId": "source-a", "question": "policy"},
+    )
+
+    assert response.status_code == 200
+    assert sources.query_calls == 0
+    assert sources.reads == [("source-a", "source-a")]
+    assert [record["operation"] for record in audit_records] == [
+        "embedding",
+        "query_request",
+    ]
+    assert all(
+        record["businessName"] == "Business A"
+        for record in audit_records
+    )
+    assert all(record["sourceId"] == "source-a" for record in audit_records)
 
 
 @pytest.mark.parametrize("search_calls", [0, 1])
@@ -462,7 +778,10 @@ def test_given_agent_without_evidence_when_query_completes_then_refuses(
     monkeypatch.setattr(retrieval_main, "_AGENT_AVAILABLE", True)
     monkeypatch.setattr(retrieval_main, "create_rag_agent", agent_factory)
 
-    response = client.post("/api/query", json={"question": "policy"})
+    response = client.post(
+        "/api/query",
+        json={"sourceId": "source-a", "question": "policy"},
+    )
 
     assert response.status_code == 200
     assert response.json()["answer"] == "I could not find authorized evidence for this question."
@@ -494,6 +813,7 @@ async def test_given_agent_outcome_when_accepting_then_preserves_existing_behavi
     policy = _PolicyService().capture_policy()
     principal = Principal("agent-outcome", "t", frozenset({"g"}))
     planning_usage = [{"operation": "query_planning"}]
+    final_checks = []
 
     class EvidenceService:
         def search(self, _question, _queries, caller, **kwargs):
@@ -502,6 +822,9 @@ async def test_given_agent_outcome_when_accepting_then_preserves_existing_behavi
             if outcome == "dependency":
                 raise RetrievalDependencyError("retrieval_dependency_unavailable")
             return SearchResult((chunk,), ())
+
+        def validate_sources_current(self, chunks, expected_sources=None):
+            final_checks.append(chunks)
 
     def agent_factory(_client, search_tool, **_kwargs):
         async def run(_question):
@@ -525,7 +848,7 @@ async def test_given_agent_outcome_when_accepting_then_preserves_existing_behavi
 
     operation = retrieval_main._run_agentic_path(
         "policy", principal, RetrievalMode.HYBRID, planning_usage,
-        structlog.get_logger(), policy=policy,
+        structlog.get_logger(), "source-a", policy=policy,
     )
     if outcome in {"dependency", "cancelled"}:
         expected_error = RetrievalDependencyError if outcome == "dependency" else asyncio.CancelledError
@@ -539,6 +862,7 @@ async def test_given_agent_outcome_when_accepting_then_preserves_existing_behavi
             assert [citation["chunk_id"] for citation in result["citations"]] == ["chunk"]
             assert result["policy"] == policy.metadata()
             assert result["usage"][0] == planning_usage[0]
+            assert final_checks == [[chunk]]
         else:
             assert result is None
 
@@ -597,6 +921,12 @@ def test_given_generated_citations_when_querying_then_validates_before_presentat
         def search(self, *_args, **_kwargs):
             return SearchResult(evidence, ())
 
+        def validate_sources_current(self, chunks, expected_sources=None):
+            assert chunks == list(evidence)
+
+        def _validate_source_policy(self, snapshot, chunks):
+            assert snapshot is None
+
     def agent_factory(_client, search_tool, **_kwargs):
         async def run(_question):
             generation_calls.append("agent")
@@ -620,7 +950,10 @@ def test_given_generated_citations_when_querying_then_validates_before_presentat
     monkeypatch.setattr(retrieval_main, "_AGENT_AVAILABLE", True)
     monkeypatch.setattr(retrieval_main, "create_rag_agent", agent_factory)
 
-    response = client.post("/api/query", json={"question": question})
+    response = client.post(
+        "/api/query",
+        json={"sourceId": "source-a", "question": question},
+    )
 
     captured_logs = capsys.readouterr()
     assert question not in captured_logs.out + captured_logs.err
@@ -630,7 +963,7 @@ def test_given_generated_citations_when_querying_then_validates_before_presentat
         "standard": ["standard"], "agent": ["agent"], "fallback": ["agent", "standard"],
     }[path]
     payload = response.json()
-    assert payload["request_id"] == client.headers["X-RAG-REQUEST-ID"]
+    assert str(uuid.UUID(payload["request_id"])) == payload["request_id"]
     if answer.startswith(("Unknown", "Missing", "Malformed")):
         assert response.status_code == 502
         assert payload["error"] == {
@@ -723,6 +1056,12 @@ def test_given_safety_block_when_querying_then_returns_safe_error_without_contin
             searches.append("search")
             return SearchResult((chunk,), ())
 
+        def validate_sources_current(self, _chunks, _expected_sources=None):
+            return None
+
+        def _validate_source_policy(self, _snapshot, _chunks):
+            return None
+
     async_sdk = AsyncOpenAI(
         api_key="synthetic", base_url="https://sdk-test.invalid/v1", max_retries=2,
         http_client=httpx.AsyncClient(transport=httpx.MockTransport(respond),
@@ -753,15 +1092,20 @@ def test_given_safety_block_when_querying_then_returns_safe_error_without_contin
                 raise TimeoutError()
             monkeypatch.setattr(retrieval_main, "create_rag_agent", lambda *_args, **_kwargs: SimpleNamespace(run=timeout))
         try:
-            response = client.post("/api/query", json={"question": "Synthetic question"})
+            response = client.post(
+                "/api/query",
+                json={"sourceId": "source-a", "question": "Synthetic question"},
+            )
         finally:
             asyncio.run(async_sdk.close())
 
     assert response.status_code == 422
-    assert response.json() == {
-        "error": {"code": "content_filtered", "message": "The request could not be completed under the content safety policy."},
-        "request_id": client.headers["X-RAG-REQUEST-ID"],
+    payload = response.json()
+    assert payload["error"] == {
+        "code": "content_filtered",
+        "message": "The request could not be completed under the content safety policy.",
     }
+    assert str(uuid.UUID(payload["request_id"])) == payload["request_id"]
     assert calls == {
         "planning": ["planning"], "standard": ["planning", "standard"],
         "agent": ["planning", "agent"], "fallback": ["planning", "agent-timeout", "standard"],
@@ -778,11 +1122,14 @@ async def test_given_safety_clients_when_lifespan_exits_then_preserves_settings_
 
     config = SimpleNamespace(
         managed_identity_client_id="synthetic", cosmos_endpoint="https://cosmos.invalid",
-        cosmos_database="synthetic", cosmos_chunks_container="chunks", cosmos_manifests_container="manifests",
-        cosmos_audit_container="audit", acl_enabled=True, openai_endpoint="https://sdk-test.invalid",
-        audio_retrieval_enabled=False, audio_max_acl_age_seconds=None, audio_max_source_age_seconds=None,
+        cosmos_database="synthetic",
+        cosmos_audit_container="audit", cosmos_ingestion_sources_container="ingestion-sources",
+        cosmos_ingestion_runs_container="ingestion-runs",
+        tenant_id="synthetic-tenant",
+        openai_endpoint="https://sdk-test.invalid",
         openai_api_version="2024-10-21", agent_api_version="synthetic-api-version", chat_deployment="synthetic",
-        catalog_container="catalog", deployment_instance_id="synthetic", catalog_poll_seconds=60,
+        agent_max_iterations=7,
+        catalog_container="catalog", catalog_poll_seconds=60,
         embedding_deployment="synthetic-embedding", retrieval_timeout_seconds=2, generation_timeout_seconds=2,
         max_evidence_chunks=5, max_planned_queries=3, graph_group_timeout_seconds=2,
     )
@@ -819,11 +1166,10 @@ async def test_given_safety_clients_when_lifespan_exits_then_preserves_settings_
 
     monkeypatch.setattr(retrieval_main, "_state", retrieval_main._AppState())
     monkeypatch.setattr(retrieval_main, "load_retrieval_config", lambda: config)
-    monkeypatch.setattr(retrieval_main, "ManagedIdentityCredential", lambda **_kwargs: credential)
+    monkeypatch.setattr(retrieval_main, "create_azure_credential", lambda *_args: credential)
     monkeypatch.setattr(retrieval_main, "_configure_tracing", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(retrieval_main, "load_cosmos_instance_configs", lambda **_kwargs: [])
     monkeypatch.setattr(retrieval_main, "build_cosmos_registry", lambda *_args, **_kwargs: registry)
-    monkeypatch.setattr(retrieval_main, "CosmosClient", lambda **_kwargs: cosmos)
+    monkeypatch.setattr(retrieval_main, "create_cosmos_client", lambda *_a, **_k: cosmos)
     monkeypatch.setattr(retrieval_main, "RuntimeCatalogLoader", Mock())
     monkeypatch.setattr(retrieval_main, "RuntimeCatalogProvider", lambda *_args, **_kwargs: provider)
     monkeypatch.setattr(retrieval_main, "catalog_event_emitter", Mock())
@@ -839,6 +1185,12 @@ async def test_given_safety_clients_when_lifespan_exits_then_preserves_settings_
             assert not clients["sync_http"].is_closed
             if failure != "agent-init":
                 assert not clients["async_http"].is_closed
+                assert (
+                    retrieval_main._state.agent_chat_client.function_invocation_configuration[
+                        "max_iterations"
+                    ]
+                    == config.agent_max_iterations
+                )
 
     if failure in {"startup", "shutdown"}:
         with pytest.raises(RuntimeError, match=f"synthetic {failure}"):
@@ -939,6 +1291,9 @@ def test_given_reload_during_planning_when_request_completes_then_policy_and_aud
             self.captures += 1
             return RequestPolicy.capture(self.snapshot, requested, expand_synonyms)
 
+        def capture_source_policy(self, _source_id):
+            return None
+
         def plan_queries(self, *_args):
             self.snapshot = replace(
                 original, etag="etag-b", operation_id="operation-b",
@@ -980,7 +1335,10 @@ def test_given_reload_during_planning_when_request_completes_then_policy_and_aud
     monkeypatch.setattr(retrieval_main, "_AGENT_AVAILABLE", True)
     monkeypatch.setattr(retrieval_main, "create_rag_agent", agent_factory)
 
-    response = client.post("/api/query", json={"question": "policy"})
+    response = client.post(
+        "/api/query",
+        json={"sourceId": "source-a", "question": "policy"},
+    )
 
     assert response.status_code == 200
     assert set(response.json()) == {"answer", "citations", "request_id"}

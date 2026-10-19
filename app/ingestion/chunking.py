@@ -23,7 +23,6 @@ from ingestion.models import (
 DEFAULT_MAX_TOKENS = 800
 DEFAULT_OVERLAP_TOKENS = 100
 DEFAULT_TOKENIZER = "cl100k_base"
-MAX_CHUNKS_PER_DOCUMENT = 2_000
 MIN_MERGE_TOKENS = 50
 
 _DI_MARKER_RE = re.compile(
@@ -34,11 +33,15 @@ _DI_MARKER_RE = re.compile(
 
 def chunk_pages(
     pages: list[Page],
+    *,
+    max_chunks_per_source: int,
     max_tokens: int = DEFAULT_MAX_TOKENS,
     overlap_tokens: int = DEFAULT_OVERLAP_TOKENS,
     tokenizer_name: str = DEFAULT_TOKENIZER,
 ) -> list[Chunk]:
     """Split extracted pages into token-bounded chunks with overlap."""
+    if type(max_chunks_per_source) is not int or max_chunks_per_source <= 0:
+        raise ValueError("max_chunks_per_source must be a positive integer")
     encoding = tiktoken.get_encoding(tokenizer_name)
     chunks: list[Chunk] = []
     step = max_tokens - overlap_tokens
@@ -71,7 +74,7 @@ def chunk_pages(
                             visual_coverage=page.visual_coverage,
                         )
                     )
-                    if len(chunks) > MAX_CHUNKS_PER_DOCUMENT:
+                    if len(chunks) > max_chunks_per_source:
                         raise TerminalDocumentError("chunking_limit_exceeded")
                 if offset + max_tokens >= len(tokens):
                     break
@@ -85,6 +88,7 @@ def chunk_audio_segments(
     segments: tuple[AudioTranscriptSegment, ...],
     audio: AudioMetadata,
     *,
+    max_chunks_per_source: int,
     max_tokens: int = DEFAULT_MAX_TOKENS,
     overlap_tokens: int = DEFAULT_OVERLAP_TOKENS,
     tokenizer_name: str = DEFAULT_TOKENIZER,
@@ -95,6 +99,8 @@ def chunk_audio_segments(
     other text is preserved. Overlap may shrink to preserve UTF-8 and progress.
     Locator ordinals and page_number identify phrases, not physical pages.
     """
+    if type(max_chunks_per_source) is not int or max_chunks_per_source <= 0:
+        raise ValueError("max_chunks_per_source must be a positive integer")
     if type(max_tokens) is not int or not 1 <= max_tokens <= DEFAULT_MAX_TOKENS:
         raise ValueError("audio chunk token limit is invalid")
     if type(overlap_tokens) is not int or not 0 <= overlap_tokens <= DEFAULT_OVERLAP_TOKENS or overlap_tokens >= max_tokens:
@@ -153,7 +159,7 @@ def chunk_audio_segments(
             contributors = segments[first:last]
             start_ms = min(segment.start_ms for segment in contributors)
             end_ms = max(segment.end_ms for segment in contributors)
-            if len(chunks) >= MAX_CHUNKS_PER_DOCUMENT:
+            if len(chunks) >= max_chunks_per_source:
                 raise TerminalDocumentError("chunking_limit_exceeded")
             chunks.append(Chunk(
                 ordinal=len(chunks), page_number=first + 1, content=text,

@@ -8,7 +8,6 @@ param embeddingDeploymentName = readEnvironmentVariable('OPENAI_EMBEDDING_DEPLOY
 param chatDeploymentName = readEnvironmentVariable('OPENAI_CHAT_DEPLOYMENT_NAME')
 param documentIntelligenceEnabled = readEnvironmentVariable('DOCUMENT_INTELLIGENCE_ENABLED', 'true') == 'true'
 param contentUnderstandingEnabled = readEnvironmentVariable('CONTENT_UNDERSTANDING_ENABLED', 'false') == 'true'
-param aclEnabled = readEnvironmentVariable('ACL_ENABLED', 'true') == 'true'
 param includeCitations = readEnvironmentVariable('INCLUDE_CITATIONS', 'true') == 'true'
 param contentUnderstandingAnalyzerId = readEnvironmentVariable(
   'CONTENT_UNDERSTANDING_ANALYZER_ID',
@@ -16,10 +15,10 @@ param contentUnderstandingAnalyzerId = readEnvironmentVariable(
 )
 param contentUnderstandingAllowedIpAddress = readEnvironmentVariable('CONTENT_UNDERSTANDING_ALLOWED_IP_ADDRESS', '')
 param audioWriterEnabled = readEnvironmentVariable('AUDIO_WRITER_ENABLED', 'false') == 'true'
-param audioRetrievalEnabled = readEnvironmentVariable('AUDIO_RETRIEVAL_ENABLED', 'false') == 'true'
 param audioLocale = readEnvironmentVariable('AUDIO_LOCALE', 'en-US')
 param speechAllowedIpAddress = readEnvironmentVariable('SPEECH_ALLOWED_IP_ADDRESS', '')
 param sharePointTenantId = readEnvironmentVariable('SHAREPOINT_TENANT_ID')
+param entraApiTenantId = readEnvironmentVariable('ENTRA_API_TENANT_ID')
 param sharePointAppClientId = readEnvironmentVariable('SHAREPOINT_APP_CLIENT_ID')
 param sharePointDriveId = readEnvironmentVariable('SHAREPOINT_ASSIGNED_DRIVE_ID')
 param sharePointSiteUrl = readEnvironmentVariable('SHAREPOINT_SITE_URL')
@@ -33,8 +32,10 @@ param sharePointKeyVaultResourceGroupName = readEnvironmentVariable('SHAREPOINT_
 param adminApiClientId = readEnvironmentVariable('ADMIN_API_CLIENT_ID')
 param functionApiAudience = readEnvironmentVariable('FUNCTION_API_AUDIENCE')
 param retrievalApiClientId = readEnvironmentVariable('RETRIEVAL_API_CLIENT_ID')
-param retrievalApiAudience = readEnvironmentVariable('RETRIEVAL_API_AUDIENCE')
 param retrievalApiServicePrincipalId = readEnvironmentVariable('RETRIEVAL_API_SERVICE_PRINCIPAL_ID')
+param retrievalAllowedApplicationClientIds = [
+  readEnvironmentVariable('RETRIEVAL_ALLOWED_CALLER_CLIENT_ID')
+]
 param allowedApplicationClientIds = [
   readEnvironmentVariable('FUNCTION_ALLOWED_CALLER_CLIENT_ID')
 ]

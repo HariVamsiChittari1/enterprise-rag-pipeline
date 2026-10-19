@@ -5,17 +5,32 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass
-from typing import Any
-from urllib.parse import quote, unquote, unquote_to_bytes, urlparse, urlsplit
+from typing import Any, TypeGuard
+from urllib.parse import (
+    quote,
+    unquote,
+    unquote_to_bytes,
+    urlparse,
+    urlsplit,
+    urlunsplit,
+)
 
 import httpx
 
 from ingestion.errors import TerminalDocumentError
-from ingestion.models import ACL_POLICY_VERSION, ScaleLimits, verified_acl_hash
-
+from ingestion.models import (
+    ACL_POLICY_VERSION,
+    AclFeedback,
+    AclStatus,
+    SourceAdmissionConfig,
+    canonical_acl_feedback,
+    canonical_group_ids,
+    verified_acl_hash,
+)
 
 GRAPH_ROOT = "https://graph.microsoft.com/v1.0"
 GRAPH_ORIGIN = httpx.URL(GRAPH_ROOT)
+MAX_CHILDREN_PAGE_SIZE = 50
 DELTA_PREFER = "deltashowremovedasdeleted, deltatraversepermissiongaps, deltashowsharingchanges"
 DOWNLOAD_HOST_SUFFIXES = (
     "files.1drv.com",
@@ -59,6 +74,8 @@ ZIP_SIGNATURES = (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")
 MARKDOWN_IMAGE_MIME_TYPE = "image/png"
 GRAPH_PDF_MAX_ATTEMPTS = 3
 GRAPH_PDF_MAX_RETRY_DELAY_SECONDS = 30.0
+SHAREPOINT_REST_MAX_ATTEMPTS = 3
+SHAREPOINT_REST_MAX_RETRY_DELAY_SECONDS = 30.0
 
 
 @dataclass(frozen=True)
@@ -101,6 +118,7 @@ class DiscoveryState:
     folders_discovered: int = 0
     pdfs_discovered: int = 0
     graph_pages: int = 0
+    rejected_files: int = 0
 
     def __post_init__(self) -> None:
         counters = (
@@ -108,6 +126,7 @@ class DiscoveryState:
             self.folders_discovered,
             self.pdfs_discovered,
             self.graph_pages,
+            self.rejected_files,
         )
         if any(value < 0 for value in counters):
             raise ValueError("discovery counters cannot be negative")
@@ -127,6 +146,7 @@ class DiscoveryState:
             "foldersDiscovered": self.folders_discovered,
             "pdfsDiscovered": self.pdfs_discovered,
             "graphPages": self.graph_pages,
+            "rejectedFiles": self.rejected_files,
         }
 
     @classmethod
@@ -139,15 +159,21 @@ class DiscoveryState:
             "graphPages",
         )
         counters = [value.get(name) for name in counter_names]
+        rejected_files = value.get("rejectedFiles", 0)
         if not isinstance(pending, list) or not all(
             isinstance(cursor, dict) for cursor in pending
         ):
             raise ValueError("discovery pending folders are invalid")
-        if any(isinstance(counter, bool) or not isinstance(counter, int) for counter in counters):
+        if (
+            any(isinstance(counter, bool) or not isinstance(counter, int) for counter in counters)
+            or isinstance(rejected_files, bool)
+            or not isinstance(rejected_files, int)
+        ):
             raise ValueError("discovery counters are invalid")
         return cls(
             tuple(FolderCursor.from_dict(cursor) for cursor in pending),
             *counters,
+            rejected_files,
         )
 
 
@@ -189,11 +215,13 @@ class ChildrenPage:
 class DiscoveryStep:
     state: DiscoveryState
     pdfs: tuple[DiscoveredPdf, ...]
+    rejected_count: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "state": self.state.to_dict(),
             "pdfs": [pdf.to_dict() for pdf in self.pdfs],
+            "rejectedCount": self.rejected_count,
         }
 
 
@@ -201,6 +229,17 @@ class DiscoveryStep:
 class VerifiedAcl:
     allowed_group_ids: tuple[str, ...]
     acl_hash: str
+    acl_feedback: tuple[AclFeedback, ...] = ()
+
+    @property
+    def acl_status(self) -> AclStatus:
+        return AclStatus.VERIFIED
+
+    def __post_init__(self) -> None:
+        if canonical_group_ids(self.allowed_group_ids) != self.allowed_group_ids:
+            raise ValueError("allowed_group_ids must be sorted and unique")
+        if canonical_acl_feedback(self.acl_feedback) != self.acl_feedback:
+            raise ValueError("acl_feedback must be sorted and unique")
 
 
 @dataclass(frozen=True)
@@ -230,7 +269,9 @@ class DeltaResetRequired(RuntimeError):
 
 
 class GraphPageLimitExceeded(RuntimeError):
-    pass
+    def __init__(self, next_link: str | None = None) -> None:
+        super().__init__("Graph page guard reached before traversal completed")
+        self.next_link = next_link
 
 
 class GraphCredentialAuth(httpx.Auth):
@@ -282,7 +323,11 @@ def read_children_page(
     params = (
         None
         if cursor.next_link is not None
-        else {"$select": CHILDREN_SELECT, "$orderby": "name asc"}
+        else {
+            "$select": CHILDREN_SELECT,
+            "$orderby": "name asc",
+            "$top": str(MAX_CHILDREN_PAGE_SIZE),
+        }
     )
     response = client.get(url, params=params)
     response.raise_for_status()
@@ -295,6 +340,8 @@ def read_children_page(
     values = payload.get("value")
     if not isinstance(values, list) or not all(isinstance(item, dict) for item in values):
         raise ValueError("Graph children page has an invalid value collection")
+    if len(values) > MAX_CHILDREN_PAGE_SIZE:
+        raise GraphDiscoveryLimitExceeded("graph_children_page_exceeded")
     if "@odata.deltaLink" in payload:
         raise ValueError("Graph children page returned an unexpected deltaLink")
     next_link = payload.get("@odata.nextLink")
@@ -413,7 +460,7 @@ def validate_source_signature(source_format: str, content: bytes) -> None:
 def advance_discovery(
     state: DiscoveryState,
     page: ChildrenPage,
-    limits: ScaleLimits,
+    limits: SourceAdmissionConfig,
     allowed_extensions: tuple[str, ...] = (".pdf",),
 ) -> DiscoveryStep:
     if state.complete:
@@ -427,6 +474,8 @@ def advance_discovery(
     items_scanned = state.items_scanned
     folders_discovered = state.folders_discovered
     pdfs_discovered = state.pdfs_discovered
+    rejected_files = state.rejected_files
+    rejected_this_page = 0
 
     for item in page.items:
         items_scanned += 1
@@ -458,16 +507,22 @@ def advance_discovery(
             raise ValueError("Graph file facet is invalid")
         name = item.get("name")
         if not isinstance(name, str):
+            rejected_files += 1
+            rejected_this_page += 1
             continue
         name_lower = name.lower()
         if not any(name_lower.endswith(ext) for ext in allowed_extensions):
+            rejected_files += 1
+            rejected_this_page += 1
             continue
-        if pdfs_discovered >= limits.max_eligible_pdfs:
-            raise GraphDiscoveryLimitExceeded("max_eligible_pdfs_exceeded")
+        if pdfs_discovered >= limits.max_eligible_sources:
+            raise GraphDiscoveryLimitExceeded("max_eligible_sources_exceeded")
         try:
             discovered = discovered_pdf_from_item(item, pdfs_discovered)
         except TerminalDocumentError:
             # Skip a single mislabeled/mismatched file rather than abort the whole traversal.
+            rejected_files += 1
+            rejected_this_page += 1
             continue
         if discovered.size_bytes > limits.max_source_bytes:
             raise GraphDiscoveryLimitExceeded("max_source_bytes_exceeded")
@@ -475,11 +530,12 @@ def advance_discovery(
         pdfs_discovered += 1
 
     if page.next_link is not None:
-        pending = [FolderCursor(current.item_id, current.depth, page.next_link)]
+        # Child-first traversal keeps the Durable cursor stack bounded by page size and depth.
+        pending = child_folders
+        pending.append(FolderCursor(current.item_id, current.depth, page.next_link))
         pending.extend(remaining)
     else:
-        pending = remaining
-    pending.extend(child_folders)
+        pending = child_folders + remaining
     return DiscoveryStep(
         DiscoveryState(
             pending_folders=tuple(pending),
@@ -487,8 +543,10 @@ def advance_discovery(
             folders_discovered=folders_discovered,
             pdfs_discovered=pdfs_discovered,
             graph_pages=state.graph_pages + 1,
+            rejected_files=rejected_files,
         ),
         tuple(pdfs),
+        rejected_this_page,
     )
 
 
@@ -496,7 +554,7 @@ def discover_next_page(
     client: httpx.Client,
     drive_id: str,
     state: DiscoveryState,
-    limits: ScaleLimits,
+    limits: SourceAdmissionConfig,
     allowed_extensions: tuple[str, ...] = (".pdf",),
 ) -> DiscoveryStep:
     if state.complete:
@@ -513,6 +571,9 @@ def read_json_pages(
     max_pages: int,
     *,
     headers: dict[str, str] | None = None,
+    page_capture: Any | None = None,
+    collect_values: bool = True,
+    resume_position: tuple[int, str | None] | None = None,
 ) -> tuple[list[dict[str, Any]], str | None]:
     if max_pages < 1:
         raise ValueError("max_pages must be positive")
@@ -521,25 +582,57 @@ def read_json_pages(
     url: str | None = initial_url
     delta_link: str | None = None
     page_count = 0
+    page_ordinal = 0
+    predecessor_receipt_id: str | None = None
+    if resume_position is not None:
+        page_ordinal, predecessor_receipt_id = resume_position
+    elif page_capture is not None:
+        position_reader = getattr(page_capture, "paging_position", None)
+        if callable(position_reader):
+            page_ordinal, predecessor_receipt_id = position_reader(initial_url)
     while url:
         if page_count >= max_pages:
-            raise GraphPageLimitExceeded(
-                "Graph page guard reached before traversal completed"
+            raise GraphPageLimitExceeded(validate_graph_paging_url(url))
+        request_url = validate_graph_paging_url(url)
+        capture_state = (
+            page_capture.begin_page(
+                request_url, page_ordinal, predecessor_receipt_id,
             )
-        response = client.get(validate_graph_paging_url(url), headers=headers or {})
-        if response.status_code == 410:
-            location = response.headers.get("location")
-            if not location:
-                raise ValueError("Graph delta reset omitted its location")
-            raise DeltaResetRequired(validate_graph_paging_url(location))
-        response.raise_for_status()
-        payload = response.json()
+            if page_capture is not None else None
+        )
+        if capture_state is not None and capture_state["state"] == "reset":
+            raise DeltaResetRequired(capture_state["location"])
+        if capture_state is not None and capture_state["state"] == "sealed":
+            payload = {
+                "value": capture_state["items"],
+                "@odata.nextLink": capture_state.get("nextLink"),
+                "@odata.deltaLink": capture_state.get("deltaLink"),
+            }
+            receipt_id = capture_state["receiptId"]
+        else:
+            response = client.get(request_url, headers=headers or {})
+            if response.status_code == 410:
+                location = response.headers.get("location")
+                if not location:
+                    raise ValueError("Graph delta reset omitted its location")
+                reset_location = validate_graph_paging_url(location)
+                if reset_location == request_url:
+                    parsed = urlsplit(reset_location)
+                    reset_location = urlunsplit(
+                        (parsed.scheme, parsed.netloc, parsed.path, "", "")
+                    )
+                if page_capture is not None:
+                  page_capture.record_reset(request_url, page_ordinal, reset_location)
+                raise DeltaResetRequired(reset_location)
+            response.raise_for_status()
+            payload = response.json()
         page_values = payload.get("value")
         if not isinstance(page_values, list) or not all(
             isinstance(item, dict) for item in page_values
         ):
             raise ValueError("Graph page has an invalid value collection")
-        values.extend(page_values)
+        if collect_values:
+            values.extend(page_values)
         page_count += 1
 
         next_link = payload.get("@odata.nextLink")
@@ -554,6 +647,18 @@ def read_json_pages(
             next_link = validate_graph_paging_url(next_link)
         if current_delta:
             delta_link = validate_graph_paging_url(current_delta)
+        if page_capture is not None and (capture_state is None or capture_state["state"] != "sealed"):
+            receipt_id = page_capture.seal_page(
+                request_url,
+                page_ordinal,
+                predecessor_receipt_id,
+                page_values,
+                next_link,
+                current_delta,
+            )
+        if page_capture is not None:
+            predecessor_receipt_id = receipt_id
+        page_ordinal += 1
         url = next_link
 
     return values, delta_link
@@ -565,19 +670,37 @@ def _read_delta_pages(
     max_pages: int,
     *,
     allow_reset: bool,
+    page_capture: Any | None = None,
 ) -> tuple[list[dict[str, Any]], str, bool]:
     delta_headers = {"Prefer": DELTA_PREFER}
+    collect_values = page_capture is None or not callable(
+        getattr(page_capture, "list_reduced_items_page", None)
+    )
     try:
-        values, final_delta_link = read_json_pages(client, initial_url, max_pages, headers=delta_headers)
+        values, final_delta_link = read_json_pages(
+            client, initial_url, max_pages, headers=delta_headers,
+            page_capture=page_capture,
+            collect_values=collect_values,
+        )
         is_reset = False
     except DeltaResetRequired as reset:
         if not allow_reset:
             raise
         try:
-            values, final_delta_link = read_json_pages(client, reset.location, max_pages, headers=delta_headers)
+            values, final_delta_link = read_json_pages(
+                client, reset.location, max_pages, headers=delta_headers,
+                page_capture=page_capture,
+                collect_values=collect_values,
+                resume_position=(0, None),
+            )
         except DeltaResetRequired as second_reset:
             # Graph occasionally double-410s during server-side state transitions
-            values, final_delta_link = read_json_pages(client, second_reset.location, max_pages, headers=delta_headers)
+            values, final_delta_link = read_json_pages(
+                client, second_reset.location, max_pages, headers=delta_headers,
+                page_capture=page_capture,
+                collect_values=collect_values,
+                resume_position=(0, None),
+            )
         is_reset = True
     if not final_delta_link:
         raise ValueError("Graph delta traversal completed without a deltaLink")
@@ -607,6 +730,8 @@ def read_drive_delta(
     drive_id: str,
     max_pages: int,
     delta_link: str | None = None,
+    *,
+    page_capture: Any | None = None,
 ) -> DriveDelta:
     initial_url = delta_link or f"{GRAPH_ROOT}/drives/{drive_id}/root/delta"
     values, final_delta_link, is_reset = _read_delta_pages(
@@ -614,6 +739,7 @@ def read_drive_delta(
         initial_url,
         max_pages,
         allow_reset=delta_link is not None,
+        page_capture=page_capture,
     )
 
     latest_by_id: dict[str, dict[str, Any]] = {}
@@ -671,7 +797,9 @@ def validate_sharepoint_drive_site(
     drive_id: str,
     site_url: str,
     max_pages: int,
-) -> None:
+    expected_site_id: str | None = None,
+) -> str:
+    """Verify the site owns the drive and return the Graph site ID."""
     try:
         parsed = urlparse(site_url)
         port = parsed.port
@@ -707,6 +835,8 @@ def validate_sharepoint_drive_site(
     site_id = site.get("id") if isinstance(site, dict) else None
     if not isinstance(site_id, str) or not site_id:
         raise ValueError("Graph SharePoint site response is invalid")
+    if expected_site_id is not None and site_id != expected_site_id:
+        raise ValueError("Configured SharePoint URL does not match the registered site ID")
 
     drives, _ = read_json_pages(
         client,
@@ -718,6 +848,7 @@ def validate_sharepoint_drive_site(
         for drive in drives
     ):
         raise ValueError("Configured SharePoint site does not own the configured drive")
+    return site_id
 
 
 def read_permissions(
@@ -736,103 +867,172 @@ def read_permissions(
         raise TerminalDocumentError(
             "unsafe_acl:incomplete_permissions_traversal"
         ) from error
+    except httpx.HTTPStatusError as error:
+        if error.response.status_code in (403, 404):
+            raise TerminalDocumentError(
+                "unsafe_acl:permissions_unverifiable"
+            ) from error
+        raise
     except ValueError as error:
         raise TerminalDocumentError("unsafe_acl:invalid_permissions_response") from error
     return values
 
 
+@dataclass(frozen=True)
+class GroupVerification:
+    group_ids: set[str]
+    acl_feedback: tuple[AclFeedback, ...]
+
+
 def read_security_enabled_group_ids(
     client: httpx.Client,
     group_ids: set[str],
-) -> set[str]:
+) -> GroupVerification:
     security_group_ids: set[str] = set()
+    feedback: set[AclFeedback] = set()
     for group_id in sorted(group_ids):
         response = client.get(
             f"{GRAPH_ROOT}/groups/{quote(group_id, safe='')}",
             params={"$select": "id,securityEnabled,groupTypes,mailEnabled"},
         )
         if response.status_code == 404:
-            # Group deleted from Entra — skip it
+            feedback.add(AclFeedback.INVALID_GROUP)
             continue
         if response.status_code == 429:
             raise TimeoutError(
                 f"graph_throttled_group_{group_id[:8]}"
             )
+        if response.status_code == 403:
+            raise TerminalDocumentError(
+                "unsafe_acl:group_unverifiable"
+            )
         response.raise_for_status()
         try:
             payload = response.json()
-        except ValueError as error:
-            raise TerminalDocumentError("unsafe_acl:invalid_group_response") from error
+        except ValueError:
+            feedback.add(AclFeedback.INVALID_GROUP)
+            continue
         if not isinstance(payload, dict) or payload.get("id") != group_id:
-            raise TerminalDocumentError("unsafe_acl:invalid_group_response")
+            feedback.add(AclFeedback.INVALID_GROUP)
+            continue
         security_enabled = payload.get("securityEnabled")
         if not isinstance(security_enabled, bool):
-            raise TerminalDocumentError("unsafe_acl:invalid_group_security_enabled")
-        if security_enabled:
+            feedback.add(AclFeedback.INVALID_GROUP)
+            continue
+        group_types = payload.get("groupTypes")
+        if (
+            not isinstance(group_types, list)
+            or not all(isinstance(group_type, str) for group_type in group_types)
+        ):
+            feedback.add(AclFeedback.INVALID_GROUP)
+            continue
+        if not security_enabled:
+            feedback.add(AclFeedback.INVALID_GROUP)
+        elif "Unified" in group_types:
+            feedback.add(AclFeedback.UNIFIED_GROUP)
+        else:
             security_group_ids.add(group_id)
-    return security_group_ids
+    return GroupVerification(
+        group_ids=security_group_ids,
+        acl_feedback=canonical_acl_feedback(tuple(feedback)),
+    )
 
 
 @dataclass(frozen=True)
 class PermissionIdentities:
     entra_group_ids: set[str]
     site_group_ids: set[str]
+    acl_feedback: tuple[AclFeedback, ...]
 
 
-def _permission_group_ids_strict(permissions: list[dict[str, Any]]) -> PermissionIdentities:
+def _collect_permission_identities(
+    permissions: list[dict[str, Any]],
+) -> PermissionIdentities:
     if not permissions:
         raise TerminalDocumentError("unsafe_acl:empty_permissions")
     group_ids: set[str] = set()
     site_group_ids: set[str] = set()
+    feedback: set[AclFeedback] = set()
     for permission in permissions:
+        has_link = permission.get("link") is not None
+        if has_link:
+            feedback.add(AclFeedback.SHARED_LINK)
+
         roles = permission.get("roles")
         if (
             not isinstance(roles, list)
             or not roles
             or not all(isinstance(role, str) for role in roles)
         ):
-            raise TerminalDocumentError("unsafe_acl:missing_roles")
+            feedback.add(AclFeedback.UNSUPPORTED_ROLE)
+            continue
         if any(role not in SUPPORTED_ACL_ROLES for role in roles):
-            raise TerminalDocumentError("unsafe_acl:unsupported_role")
-        if permission.get("link") is not None:
-            raise TerminalDocumentError("unsafe_acl:sharing_link")
+            feedback.add(AclFeedback.UNSUPPORTED_ROLE)
+        if not any(role in SUPPORTED_ACL_ROLES for role in roles):
+            continue
 
         identities: list[dict[str, Any]] = []
         single = permission.get("grantedToV2")
         multiple = permission.get("grantedToIdentitiesV2")
         if single is not None:
-            if not isinstance(single, dict):
-                raise TerminalDocumentError("unsafe_acl:incomplete_identity_set")
-            identities.append(single)
+            if isinstance(single, dict):
+                identities.append(single)
+            else:
+                feedback.add(AclFeedback.INVALID_IDENTITY)
         if multiple is not None:
-            if not isinstance(multiple, list) or not all(
-                isinstance(identity, dict) for identity in multiple
-            ):
-                raise TerminalDocumentError("unsafe_acl:incomplete_identity_set")
-            identities.extend(multiple)
+            if isinstance(multiple, list):
+                for identity in multiple:
+                    if isinstance(identity, dict):
+                        identities.append(identity)
+                    else:
+                        feedback.add(AclFeedback.INVALID_IDENTITY)
+            else:
+                feedback.add(AclFeedback.INVALID_IDENTITY)
         if not identities:
-            raise TerminalDocumentError("unsafe_acl:missing_identity_set")
+            if not has_link:
+                feedback.add(AclFeedback.INVALID_IDENTITY)
+            continue
 
         for identity in identities:
             group = identity.get("group")
             site_group = identity.get("siteGroup")
+            sharepoint_group = identity.get("sharePointGroup")
+            if identity.get("user") is not None or identity.get("siteUser") is not None:
+                feedback.add(AclFeedback.DIRECT_USER)
             if group is not None:
-                if not isinstance(group, dict):
-                    raise TerminalDocumentError(
-                        "unsafe_acl:ambiguous_or_missing_entra_principal"
-                    )
-                group_id = group.get("id")
-                if not isinstance(group_id, str) or not group_id:
-                    raise TerminalDocumentError("unsafe_acl:missing_principal_id")
-                group_ids.add(group_id)
+                group_id = group.get("id") if isinstance(group, dict) else None
+                if _valid_permission_group_id(group_id):
+                    group_ids.add(group_id)
+                else:
+                    feedback.add(AclFeedback.INVALID_IDENTITY)
             elif site_group is not None:
-                if isinstance(site_group, dict):
-                    sg_id = site_group.get("id")
-                    if isinstance(sg_id, (str, int)) and sg_id:
-                        site_group_ids.add(str(sg_id))
-    if not group_ids and not site_group_ids:
-        raise TerminalDocumentError("unsafe_acl:no_entra_groups_found")
-    return PermissionIdentities(entra_group_ids=group_ids, site_group_ids=site_group_ids)
+                feedback.add(AclFeedback.SITE_GROUP)
+                sg_id = site_group.get("id") if isinstance(site_group, dict) else None
+                if isinstance(sg_id, (str, int)) and not isinstance(sg_id, bool) and str(sg_id):
+                    site_group_ids.add(str(sg_id))
+                else:
+                    feedback.add(AclFeedback.INVALID_IDENTITY)
+            elif sharepoint_group is not None:
+                feedback.add(AclFeedback.SITE_GROUP)
+            elif group is None and site_group is None and not (
+                identity.get("user") is not None
+                or identity.get("siteUser") is not None
+            ):
+                feedback.add(AclFeedback.INVALID_IDENTITY)
+    return PermissionIdentities(
+        entra_group_ids=group_ids,
+        site_group_ids=site_group_ids,
+        acl_feedback=canonical_acl_feedback(tuple(feedback)),
+    )
+
+
+def _valid_permission_group_id(value: object) -> TypeGuard[str]:
+    return (
+        isinstance(value, str)
+        and value == value.strip()
+        and 0 < len(value) <= 100
+        and "\x1f" not in value
+    )
 
 
 def resolve_site_group_security_groups(
@@ -845,7 +1045,14 @@ def resolve_site_group_security_groups(
     base = site_url.rstrip("/")
     for sg_id in sorted(site_group_ids):
         url = f"{base}/_api/web/sitegroups({sg_id})/users"
-        response = sp_client.get(url, headers={"Accept": "application/json;odata=nometadata"})
+        for attempt in range(SHAREPOINT_REST_MAX_ATTEMPTS):
+            response = sp_client.get(
+                url, headers={"Accept": "application/json;odata=nometadata"}
+            )
+            retry_delay = _sharepoint_rest_retry_delay(response, attempt)
+            if retry_delay is None:
+                break
+            time.sleep(retry_delay)
         if response.status_code == 404:
             continue
         response.raise_for_status()
@@ -866,6 +1073,28 @@ def resolve_site_group_security_groups(
     return entra_ids
 
 
+def _sharepoint_rest_retry_delay(response: httpx.Response, attempt: int) -> float | None:
+    """Return the wait before retrying a throttled SharePoint REST call, or None to stop.
+
+    SharePoint Online signals throttling with 429 or 503 and a Retry-After header.
+    """
+    if response.status_code not in (429, 503):
+        return None
+    if attempt >= SHAREPOINT_REST_MAX_ATTEMPTS - 1:
+        return None
+    retry_after = response.headers.get("Retry-After")
+    if retry_after is not None:
+        try:
+            delay_seconds = int(retry_after)
+        except ValueError:
+            delay_seconds = -1
+        if delay_seconds >= 0:
+            if delay_seconds > SHAREPOINT_REST_MAX_RETRY_DELAY_SECONDS:
+                return None
+            return float(delay_seconds)
+    return min(float(2**attempt), SHAREPOINT_REST_MAX_RETRY_DELAY_SECONDS)
+
+
 def read_verified_acl(
     client: httpx.Client,
     drive_id: str,
@@ -876,22 +1105,25 @@ def read_verified_acl(
     site_url: str = "",
 ) -> VerifiedAcl:
     permissions = read_permissions(client, drive_id, item_id, max_pages)
-    perm_ids = _permission_group_ids_strict(permissions)
+    perm_ids = _collect_permission_identities(permissions)
     all_group_ids = set(perm_ids.entra_group_ids)
     if perm_ids.site_group_ids and sp_client and site_url:
         sp_groups = resolve_site_group_security_groups(sp_client, site_url, perm_ids.site_group_ids)
         all_group_ids.update(sp_groups)
     if not all_group_ids:
-        raise TerminalDocumentError("unsafe_acl:no_entra_groups_found")
-    verified_group_ids = read_security_enabled_group_ids(client, all_group_ids)
-    if not verified_group_ids:
         raise TerminalDocumentError("unsafe_acl:no_verified_security_groups")
-    canonical = tuple(sorted(verified_group_ids))
+    verification = read_security_enabled_group_ids(client, all_group_ids)
+    if not verification.group_ids:
+        raise TerminalDocumentError("unsafe_acl:no_verified_security_groups")
+    canonical = tuple(sorted(verification.group_ids))
+    feedback = canonical_acl_feedback(
+        perm_ids.acl_feedback + verification.acl_feedback
+    )
     try:
         digest = verified_acl_hash(canonical, ACL_POLICY_VERSION)
     except ValueError:
         raise TerminalDocumentError("unsafe_acl:invalid_verified_group_ids") from None
-    return VerifiedAcl(canonical, digest)
+    return VerifiedAcl(canonical, digest, feedback)
 
 
 async def read_bounded_content(response: httpx.Response, max_bytes: int) -> bytes:

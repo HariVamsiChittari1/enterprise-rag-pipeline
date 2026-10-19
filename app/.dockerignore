@@ -11,6 +11,9 @@
 !retrieval/catalog.example.json
 !retrieval/requirements.txt
 !retrieval/Dockerfile
+!azure_credentials.py
+!source_registry.py
+!cosmos_connection.py
 
 # Explicit re-excludes for files that must never enter the ACR build context.
 retrieval/.dockerignore
