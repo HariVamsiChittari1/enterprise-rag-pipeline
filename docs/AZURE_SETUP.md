@@ -89,12 +89,14 @@ Function EasyAuth requires authentication for all paths except `/api/webhook/*`,
 ### Retrieval API Application
 
 - Configure a single-tenant application.
-- Expose application role `Retrieval.Gateway`.
-- Assign that role to the Function UAMI service principal after the Foundation phase creates it.
+- Expose delegated scope `user_impersonation`.
+- Authorize the approved native/public client application for that scope.
+- Record that client ID as `RETRIEVAL_ALLOWED_CALLER_CLIENT_ID`; ACA accepts
+  delegated retrieval tokens only from that client application.
 - Record the client ID/audience and service-principal object ID as the `RETRIEVAL_API_*` values.
 - Grant the retrieval UAMI the Microsoft Graph application permissions required for transitive group resolution.
 
-ACA Authentication and retrieval application code both restrict access to the Function UAMI application and principal. The Function sends a managed-identity service token plus `X-RAG-GATEWAY-CONTEXT` and `X-RAG-REQUEST-ID`; it does not forward the user's EasyAuth principal header.
+ACA Authentication requires a delegated user token for the retrieval API; application code validates tenant, audience, scope, user identity, and optional `idtyp=user`.
 
 ### Existing Key Vault
 
@@ -146,6 +148,7 @@ azd env set FUNCTION_ALLOWED_CALLER_CLIENT_ID <approved-client-id>
 azd env set RETRIEVAL_API_CLIENT_ID <retrieval-api-client-id>
 azd env set RETRIEVAL_API_AUDIENCE api://<retrieval-api-client-id>
 azd env set RETRIEVAL_API_SERVICE_PRINCIPAL_ID <retrieval-api-sp-object-id>
+azd env set RETRIEVAL_ALLOWED_CALLER_CLIENT_ID <approved-native-client-id>
 
 azd env set COST_CENTER <cost-center>
 azd env set CLEANUP_DATE <yyyy-mm-dd>
@@ -177,12 +180,11 @@ azd env set RETRIEVAL_ZONE_REDUNDANT false
 ## Local Validation
 
 ```powershell
-python -m venv .venv-py312
-.\.venv-py312\Scripts\Activate.ps1
+.\scripts\initialize-dev-environment.ps1 -CreateVenv
 python -m pip install -r requirements-dev.txt
 python -m pytest
-az bicep build --file infra/main.bicep
-az bicep build-params --file infra/main.parameters.bicepparam
+az bicep build --file infra/main.bicep --outfile "$env:BICEP_OUTPUT_DIR\main.json"
+az bicep build-params --file infra/main.parameters.bicepparam --outfile "$env:BICEP_OUTPUT_DIR\main.parameters.json"
 ```
 
 If the environment cannot compile the retained inactive AKS module, report that separately; do not treat AKS as part of the active serving deployment.
@@ -247,8 +249,7 @@ stops initialization without replacement; do not delete it to bypass the check.
 
 ```powershell
 $catalog = python tools/publish_retrieval_catalog.py validate `
-  --file app/retrieval/catalog.example.json `
-  --deployment-instance-id $target.DeploymentInstanceId | ConvertFrom-Json
+  --file app/retrieval/catalog.example.json | ConvertFrom-Json
 azd env set RETRIEVAL_CATALOG_DIGEST $catalog.catalogDigest
 ```
 
@@ -366,9 +367,10 @@ deployment target. Perform those reviews separately.
 
 ### Reviewed Function Package Deployment
 
-Without package arguments, `Function` deploys from the configured application
-project. To preview an external source ZIP, use the same reviewed target and
-plan/source authority with the package path and digest:
+`Function` requires both the reviewed package path and SHA-256; it does not
+support deploying the mutable application project directly. To preview the
+package, use the same reviewed target and plan/source authority with its path
+and digest:
 
 ```powershell
 .\scripts\deploy.ps1 -Phase Function @target `
@@ -386,8 +388,10 @@ On Windows, the handle denies writes/deletion through ordinary file-sharing APIs
 this is not a cross-platform filesystem immutability guarantee. Deployment errors
 propagate and the handle is released even on failure.
 
-The bindings select the reviewed main site, not a slot. They are not live
-attestation of its hosting plan, Python runtime, identity, network, or health.
+The controller resolves the exact main-site ARM ID and requires the reviewed
+`DeploymentInstance`/`azd-service-name` tags plus the single expected Function
+UAMI before preview and again before execution. This target check is not an
+attestation of hosting-plan capacity, Python runtime, network, or health.
 Verify those separately, prevent concurrent edits to the local azd environment,
 and review the complete package, quiet window, active work, and compatible recovery path
 before authorizing an existing-app deployment. A Flex update is app-wide and can
@@ -442,16 +446,38 @@ After saving, obtain the current ETag and digest through `inspect` from a
 private-connected, read-authorized process. Keep outputs in protected evidence:
 
 ```powershell
-$connection = @('--deployment-instance-id', '<deployment-instance-id>',
-  '--endpoint', '<private-cosmos-endpoint>', '--database', 'rag-db')
+$env:AZURE_AUTH_MODE = 'service_principal'
+$env:AZURE_TENANT_ID = '<approved-tenant-guid>'
+$env:AZURE_CLIENT_ID = '<developer-local-azure-access-client-id>'
+$secret = Read-Host 'Local service-principal secret' -AsSecureString
+$env:AZURE_CLIENT_SECRET = [Net.NetworkCredential]::new('', $secret).Password
+Remove-Variable secret
+
+$connection = @('--endpoint', '<private-cosmos-endpoint>', '--database', 'rag-db')
 $current = python tools/publish_retrieval_catalog.py inspect @connection | ConvertFrom-Json
 python tools/publish_retrieval_catalog.py observe `
-  --deployment-instance-id '<deployment-instance-id>' `
   --subscription '<subscription-id>' --resource-group '<resource-group>' `
   --application '<container-app-name>' --workspace '<workspace-customer-id>' `
   --target-etag $current.etag --target-digest $current.catalogDigest `
   --observation-timeout 7500
 ```
+
+The Cosmos-backed publisher actions use this explicit application credential,
+not the Azure CLI login. The principal needs only the reviewed
+`retrieval-config` custom data-plane role. The `observe` action invokes Azure
+CLI separately for app inventory and workspace queries. Never print or persist
+the secret. After the final Cosmos-backed action, clear the application
+credential from the current process:
+
+```powershell
+'AZURE_AUTH_MODE', 'AZURE_TENANT_ID', 'AZURE_CLIENT_ID',
+  'AZURE_CLIENT_SECRET' | ForEach-Object {
+    Remove-Item "Env:$_" -ErrorAction SilentlyContinue
+  }
+```
+
+Close the terminal. Rotation and emergency revocation follow
+[the local credential procedure](LOCAL_DEVELOPMENT.md#rotate-or-revoke-the-local-credential).
 
 `observe` is read-only and requires app inventory and workspace query access,
 not Cosmos writes. Exit 0 means the supplied generation was observed across a
@@ -464,7 +490,6 @@ it and the source file, and never regenerate it to retry an uncertain write:
 
 ```powershell
 python tools/publish_retrieval_catalog.py prepare `
-  --deployment-instance-id '<deployment-instance-id>' `
   --file '<protected-config-source.json>' --manifest '<protected-manifest.json>' `
   --expected-etag $current.etag --reason '<reviewed-reason>'
 python tools/publish_retrieval_catalog.py update @connection `

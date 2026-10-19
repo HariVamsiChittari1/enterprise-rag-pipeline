@@ -8,18 +8,24 @@ from unittest.mock import Mock
 import httpx
 import pytest
 from openai import APIStatusError, AzureOpenAI, BadRequestError
-
 from retrieval.auth import Principal
 from retrieval.catalog import RuntimeCatalogSnapshot, load_catalog_item
 from retrieval.cosmos import (
     RetrievalLocatorKind,
     RetrievalMode,
-    RetrievedChunk as _RetrievedChunk,
     SecureCosmosRetriever,
+)
+from retrieval.cosmos import (
+    RetrievedChunk as _RetrievedChunk,
 )
 from retrieval.cosmos_registry import CosmosRegistry
 from retrieval.pipeline import RetrievalDependencyError
-from retrieval.service import ContentFilteredError, RagService, suppress_content_filter_retry
+from retrieval.service import (
+    ContentFilteredError,
+    RagService,
+    suppress_content_filter_retry,
+)
+from retrieval.source_policy import SourceEligibility, SourcePolicySnapshot
 
 
 def RetrievedChunk(
@@ -51,7 +57,7 @@ def _registry(retriever) -> CosmosRegistry:
 
 def _provider(**values) -> SimpleNamespace:
     snapshot = RuntimeCatalogSnapshot(
-        deployment_instance_id="test", catalog_id="runtime-catalog", etag="etag-a",
+        catalog_id="runtime-catalog", etag="etag-a",
         digest="sha256:" + "a" * 64, operation_id="operation-a",
         changed_at="2026-09-08T00:00:00Z", accepted_at=datetime(2026, 9, 8, tzinfo=timezone.utc),
         over_fetch_factor=1, hybrid_weights=(1, 1), full_text_score_scope="Global",
@@ -64,6 +70,293 @@ def completion(content: str) -> SimpleNamespace:
     return SimpleNamespace(
         choices=[SimpleNamespace(message=SimpleNamespace(content=content))]
     )
+
+
+class _SourcePolicy:
+    def __init__(self, validation_results: list[bool] | None = None) -> None:
+        self.snapshot = SourcePolicySnapshot((
+            SourceEligibility(
+                "source-a",
+                "catalog-etag",
+                "active",
+                "business",
+                "search-chunks",
+                "source-documents",
+                True,
+                "Business A",
+            ),
+        ))
+        self.validation_results = validation_results or [True]
+        self.validated: list[set[str]] = []
+
+    def capture(self, source_id: str) -> SourcePolicySnapshot:
+        assert source_id == "source-a"
+        return self.snapshot
+
+    def validate_sources(self, snapshot: SourcePolicySnapshot, source_ids: set[str]) -> bool:
+        self.validated.append(source_ids)
+        configured_result = self.validation_results.pop(0) if self.validation_results else True
+        return configured_result and all(
+            snapshot.get(source_id) == self.snapshot.get(source_id)
+            for source_id in source_ids
+        )
+
+
+class _SourceRetriever:
+    def __init__(self) -> None:
+        self.source_ids: list[str] | None = None
+        self.acl_calls: list[tuple[list[str], bool | None]] = []
+
+    def retrieve(
+        self,
+        *_args,
+        eligible_source_ids=None,
+        acl_enabled=None,
+        **_kwargs,
+    ):
+        principal_ids = _args[2] if len(_args) >= 3 else []
+        self.source_ids = eligible_source_ids
+        self.acl_calls.append((principal_ids, acl_enabled))
+        return [replace(
+            RetrievedChunk(
+                "chunk", "document", "Authorized source evidence", "policy.pdf",
+                "https://example.com/policy.pdf", 1,
+            ),
+            source_id="source-a",
+        )]
+
+    def to_chunks(self, rows):
+        return rows
+
+
+def _source_policy_service(retriever, policy, client=None) -> RagService:
+    return RagService(
+        client or Mock(), _registry(retriever), "embedding", "chat",
+        catalog_provider=_provider(), source_policy_reader=policy,
+    )
+
+
+def test_search_passes_eligible_sources_and_rechecks_before_return() -> None:
+    retriever = _SourceRetriever()
+    policy = _SourcePolicy()
+    service = _source_policy_service(retriever, policy)
+
+    result = service.search(
+        "policy", ["policy"], Principal("user", "tenant", frozenset({"group"})),
+        mode=RetrievalMode.FULL_TEXT,
+        source_id="source-a",
+    )
+
+    assert [chunk.source_id for chunk in result.chunks] == ["source-a"]
+    assert retriever.source_ids == ["source-a"]
+    assert policy.validated == [{"source-a"}]
+
+
+def test_search_resolves_only_selected_source_pair() -> None:
+    retriever = _SourceRetriever()
+    resolved: list[SourceEligibility] = []
+    registry = CosmosRegistry(
+        None,
+        retriever_factory=lambda source: (
+            resolved.append(source) or retriever
+        ),
+    )
+    policy = _SourcePolicy()
+    service = RagService(
+        Mock(),
+        registry,
+        "embedding",
+        "chat",
+        catalog_provider=_provider(),
+        source_policy_reader=policy,
+    )
+
+    result = service.search(
+        "policy",
+        ["policy"],
+        Principal("user", "tenant", frozenset({"group"})),
+        mode=RetrievalMode.FULL_TEXT,
+        source_id="source-a",
+    )
+
+    assert [chunk.source_id for chunk in result.chunks] == ["source-a"]
+    assert resolved == [policy.snapshot.sources[0]]
+    assert len(registry) == 1
+
+
+def test_acl_policy_changes_apply_without_recreating_retriever() -> None:
+    retriever = _SourceRetriever()
+    policy = _SourcePolicy()
+    service = _source_policy_service(retriever, policy)
+    principal = Principal("user", "tenant", frozenset({"group"}))
+
+    for index, acl_enabled in enumerate((True, False, True), start=1):
+        policy.snapshot = SourcePolicySnapshot((
+            replace(
+                policy.snapshot.sources[0],
+                catalog_etag=f"catalog-etag-{index}",
+                retrieval_acl_enabled=acl_enabled,
+            ),
+        ))
+        service.search(
+            "policy",
+            ["policy"],
+            principal,
+            mode=RetrievalMode.FULL_TEXT,
+            source_id="source-a",
+        )
+
+    assert retriever.acl_calls == [
+        (["group"], True),
+        ([], False),
+        (["group"], True),
+    ]
+
+
+def test_pair_resolution_failure_is_explicit_dependency_error() -> None:
+    registry = CosmosRegistry(
+        None,
+        retriever_factory=lambda _source: (_ for _ in ()).throw(
+            PermissionError("RBAC denied"),
+        ),
+    )
+    service = RagService(
+        Mock(),
+        registry,
+        "embedding",
+        "chat",
+        catalog_provider=_provider(),
+        source_policy_reader=_SourcePolicy(),
+    )
+
+    with pytest.raises(
+        RetrievalDependencyError,
+        match="retrieval_dependency_unavailable",
+    ):
+        service.search(
+            "policy",
+            ["policy"],
+            Principal("user", "tenant", frozenset({"group"})),
+            mode=RetrievalMode.FULL_TEXT,
+            source_id="source-a",
+        )
+
+
+def test_source_attributed_legacy_reader_fails_closed_without_source_policy() -> None:
+    service = RagService(
+        Mock(), _registry(_SourceRetriever()), "embedding", "chat",
+        catalog_provider=_provider(),
+    )
+
+    with pytest.raises(RetrievalDependencyError, match="source_policy_unavailable"):
+        service.search(
+            "policy", ["policy"], Principal("user", "tenant", frozenset({"group"})),
+            mode=RetrievalMode.FULL_TEXT,
+            source_id="source-a",
+        )
+
+
+def test_search_withholds_chunks_when_source_policy_changes() -> None:
+    service = _source_policy_service(_SourceRetriever(), _SourcePolicy([False]))
+
+    with pytest.raises(RetrievalDependencyError, match="source_policy_changed"):
+        service.search(
+            "policy", ["policy"], Principal("user", "tenant", frozenset({"group"})),
+            mode=RetrievalMode.FULL_TEXT,
+            source_id="source-a",
+        )
+
+
+def test_search_withholds_chunk_from_unrequested_source() -> None:
+    class CrossSourceRetriever(_SourceRetriever):
+        def retrieve(self, *args, **kwargs):
+            chunk = super().retrieve(*args, **kwargs)[0]
+            return [replace(chunk, source_id="source-b")]
+
+    policy = _SourcePolicy()
+    service = _source_policy_service(CrossSourceRetriever(), policy)
+
+    with pytest.raises(RetrievalDependencyError, match="source_policy_changed"):
+        service.search(
+            "policy",
+            ["policy"],
+            Principal("user", "tenant", frozenset({"group"})),
+            mode=RetrievalMode.FULL_TEXT,
+            source_id="source-a",
+        )
+
+    assert policy.validated == []
+
+
+def test_empty_eligible_source_set_does_not_query_content() -> None:
+    retriever = _SourceRetriever()
+    policy = _SourcePolicy()
+    policy.snapshot = SourcePolicySnapshot(())
+    service = _source_policy_service(retriever, policy)
+
+    result = service.search(
+        "policy", ["policy"], Principal("user", "tenant", frozenset({"group"})),
+        mode=RetrievalMode.FULL_TEXT,
+        source_id="source-a",
+    )
+
+    assert result.chunks == ()
+    assert retriever.source_ids is None
+
+
+def test_empty_acl_membership_does_not_query_content() -> None:
+    retriever = _SourceRetriever()
+    service = _source_policy_service(retriever, _SourcePolicy())
+
+    result = service.search(
+        "policy", ["policy"], Principal("user", "tenant", frozenset()),
+        mode=RetrievalMode.FULL_TEXT,
+        source_id="source-a",
+    )
+
+    assert result.chunks == ()
+    assert retriever.acl_calls == []
+
+
+def test_answer_is_not_released_if_source_is_withheld_during_generation() -> None:
+    retriever = _SourceRetriever()
+    policy = _SourcePolicy([False])
+    client = Mock()
+    client.chat.completions.create.return_value = completion("Answer [S1].")
+    service = _source_policy_service(retriever, policy, client)
+
+    with pytest.raises(RetrievalDependencyError, match="source_policy_changed"):
+        service.answer_with_queries(
+            "policy", ["policy"], Principal("user", "tenant", frozenset({"group"})),
+            mode=RetrievalMode.FULL_TEXT,
+            source_id="source-a",
+        )
+
+    client.chat.completions.create.assert_called_once()
+    assert policy.validated == [{"source-a"}]
+
+
+def test_final_check_compares_agent_evidence_to_the_policy_that_admitted_it() -> None:
+    retriever = _SourceRetriever()
+    policy = _SourcePolicy()
+    service = _source_policy_service(retriever, policy)
+    original = policy.snapshot.get("source-a")
+    chunks = retriever.retrieve(eligible_source_ids=["source-a"])
+    policy.snapshot = SourcePolicySnapshot((
+        SourceEligibility(
+            "source-a",
+            "new-catalog-etag",
+            "active",
+            "business",
+            "search-chunks",
+            "source-documents",
+            False,
+            "Business A",
+        ),
+    ))
+
+    with pytest.raises(RetrievalDependencyError, match="source_policy_changed"):
+        service.validate_sources_current(chunks, {"source-a": original})
 
 
 @pytest.mark.parametrize(("status", "payload", "expected"), [
@@ -228,7 +521,7 @@ def test_given_valid_citations_or_refusal_when_generating_then_accepts(answer: s
 def test_given_raw_integral_float_catalog_when_searching_then_integer_budget_is_used() -> None:
     item = {
         "id": "runtime-catalog", "type": "retrieval-runtime-catalog",
-        "deploymentInstanceId": "test", "_etag": "etag-a",
+        "_etag": "etag-a",
         "change": {
             "operationId": "b14c1a67-9fc4-4e78-a818-e5951473d15b",
             "changedAt": "2026-09-08T00:00:00Z", "reason": "Numeric regression",
@@ -551,7 +844,6 @@ def test_plan_queries_uses_history_as_context() -> None:
     assert "history" in call_content
 
 
-from retrieval.cosmos import MAX_CANDIDATE_POOL_TOTAL
 from retrieval.scoring import (
     FreshnessParameters,
     ScoringFunction,
@@ -600,8 +892,6 @@ def test_service_omitting_scoring_profile_preserves_current_top_k_order() -> Non
 
 
 def test_service_with_scoring_profile_uses_over_fetch_and_reranks_by_freshness() -> None:
-    from datetime import datetime, timezone
-
     client = Mock()
     client.chat.completions.create.side_effect = [
         completion('{"queries":["q"]}'),
@@ -794,7 +1084,7 @@ def _make_retriever_for_profile_path() -> Mock:
     return retriever
 
 
-# --- Phase 2 (2026): private evaluation seams ------------------------------------
+# --- Private evaluation seams ----------------------------------------------------
 
 
 def test_retrieve_rankings_returns_reranked_chunks_without_answer_generation() -> None:
@@ -933,8 +1223,6 @@ def test_retrieve_evaluation_pool_requires_explicit_profile_name() -> None:
 
 def test_retrieve_evaluation_pool_fails_closed_when_all_retrievals_fail() -> None:
     """Evaluation must preserve production RetrievalDependencyError semantics."""
-    from datetime import datetime, timezone
-
     client = Mock()
     client.embeddings.create.return_value = SimpleNamespace(
         data=[SimpleNamespace(embedding=[0.0] * 3072)]

@@ -15,6 +15,34 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 PUBLISHER = PROJECT_ROOT / "tools" / "publish_retrieval_catalog.py"
 
 
+def test_container_uses_explicit_credential_factory(monkeypatch) -> None:
+    credential = Mock()
+    credential.__enter__ = Mock(return_value=credential)
+    credential.__exit__ = Mock(return_value=False)
+    container = object()
+    database = Mock()
+    database.get_container_client.return_value = container
+    cosmos = Mock()
+    cosmos.__enter__ = Mock(return_value=cosmos)
+    cosmos.__exit__ = Mock(return_value=False)
+    cosmos.get_database_client.return_value = database
+    credential_factory = Mock(return_value=credential)
+    cosmos_factory = Mock(return_value=cosmos)
+    monkeypatch.setattr(publisher, "create_azure_credential", credential_factory)
+    monkeypatch.setattr(publisher, "CosmosClient", cosmos_factory)
+    args = SimpleNamespace(
+        endpoint="https://account.documents.azure.com",
+        database="rag-db",
+        container="retrieval-config",
+    )
+
+    with publisher._container(args) as observed:
+        assert observed is container
+
+    credential_factory.assert_called_once_with()
+    cosmos_factory.assert_called_once_with(args.endpoint, credential=credential)
+
+
 def _source() -> dict:
     return {
         "config": {
@@ -40,7 +68,7 @@ def test_validate_prints_deterministic_catalog_identity(tmp_path: Path) -> None:
     path.write_text(json.dumps(_source()), encoding="utf-8")
 
     result = subprocess.run(
-        [sys.executable, str(PUBLISHER), "validate", "--file", str(path), "--deployment-instance-id", "instance-a"],
+        [sys.executable, str(PUBLISHER), "validate", "--file", str(path)],
         cwd=PROJECT_ROOT,
         capture_output=True,
         text=True,
@@ -57,7 +85,7 @@ def test_validate_rejects_malformed_catalog(tmp_path: Path) -> None:
     path.write_text("{}", encoding="utf-8")
 
     result = subprocess.run(
-        [sys.executable, str(PUBLISHER), "validate", "--file", str(path), "--deployment-instance-id", "instance-a"],
+        [sys.executable, str(PUBLISHER), "validate", "--file", str(path)],
         cwd=PROJECT_ROOT,
         capture_output=True,
         text=True,
@@ -73,7 +101,7 @@ def test_prepare_is_offline_create_only_and_contains_no_catalog_body(tmp_path: P
     path.write_text(json.dumps(_source()), encoding="utf-8")
     command = [
         sys.executable, str(PUBLISHER), "prepare", "--file", str(path),
-        "--manifest", str(manifest), "--deployment-instance-id", "instance-a",
+        "--manifest", str(manifest),
         "--expected-etag", "etag-a", "--reason", "test operation",
     ]
     first = subprocess.run(command, cwd=PROJECT_ROOT, capture_output=True, text=True)
@@ -81,7 +109,7 @@ def test_prepare_is_offline_create_only_and_contains_no_catalog_body(tmp_path: P
     original = manifest.read_bytes()
     value = json.loads(original)
     assert value["expectedEtag"] == "etag-a"
-    assert value["deploymentInstanceId"] == "instance-a"
+    assert "deploymentInstanceId" not in value
     assert "config" not in value
     assert "profiles" not in value
     second = subprocess.run(command, cwd=PROJECT_ROOT, capture_output=True, text=True)
@@ -93,25 +121,23 @@ def test_given_changed_candidate_file_when_resuming_then_reject_before_access(tm
     source = tmp_path / "catalog.json"
     manifest_path = tmp_path / "operation.json"
     source.write_text(json.dumps(_source()), encoding="utf-8")
-    manifest = _prepare_operation(source, "instance-a", "etag-a", "Reviewed test")
+    manifest = _prepare_operation(source, "etag-a", "Reviewed test")
     _persist_manifest(manifest_path, manifest)
     source.write_text(json.dumps(_source(), indent=2), encoding="utf-8")
     with pytest.raises(CatalogConflictError, match="file changed"):
-        _load_candidate(manifest_path, source, "instance-a")
+        _load_candidate(manifest_path, source)
 
 
 def test_given_stable_manifest_when_resuming_then_identity_is_unchanged(tmp_path: Path) -> None:
     source = tmp_path / "catalog.json"
     manifest_path = tmp_path / "operation.json"
     source.write_text(json.dumps(_source()), encoding="utf-8")
-    manifest = _prepare_operation(source, "instance-a", "etag-a", "Reviewed test")
+    manifest = _prepare_operation(source, "etag-a", "Reviewed test")
     _persist_manifest(manifest_path, manifest)
-    loaded, candidate = _load_candidate(manifest_path, source, "instance-a")
+    loaded, candidate = _load_candidate(manifest_path, source)
     assert loaded == manifest
     assert candidate["change"]["operationId"] == manifest["operationId"]
     assert candidate["change"]["changedAt"] == manifest["createdAt"]
-    with pytest.raises(CatalogConflictError, match="target"):
-        _load_candidate(manifest_path, source, "another-instance")
 
 
 @pytest.mark.parametrize("failure", ["none", "semantic", "diagnostic", "actor", "activity", "adoption", "current", "inaccessible"])
@@ -119,7 +145,7 @@ def test_writer_completion_requires_entire_result_bound_chain(monkeypatch, failu
     args = SimpleNamespace(
         subscription="sub", resource_group="group", application="app", workspace="workspace",
         actor_principal_id="actor", cosmos_account_resource_id="/synthetic/account", database="rag-db",
-        container="retrieval-config", deployment_instance_id="synthetic", observation_timeout=60,
+        container="retrieval-config", observation_timeout=60,
     )
     outcome = {
         "status": "applied-but-unassured", "auditStatus": "semantic-outcome-verified",

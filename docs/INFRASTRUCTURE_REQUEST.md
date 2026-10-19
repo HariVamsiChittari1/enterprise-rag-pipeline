@@ -34,9 +34,9 @@ The current connector also requests permission-change metadata whose documented 
 ### Retrieval API Application
 
 - Single-tenant API application.
-- Client ID/audience supplied as `RETRIEVAL_API_CLIENT_ID` and `RETRIEVAL_API_AUDIENCE`.
-- Application role `Retrieval.Gateway`.
-- Function UAMI service principal assigned to that role.
+- Client ID supplied as `RETRIEVAL_API_CLIENT_ID`.
+- Delegated scope `user_impersonation`.
+- Approved native/public client authorized for that scope.
 - Retrieval API service-principal object ID supplied as `RETRIEVAL_API_SERVICE_PRINCIPAL_ID` for external validation and deployment evidence.
 
 Active Bicep does not create or consent these directory objects.
@@ -51,13 +51,14 @@ The deployment creates a private endpoint/private DNS integration for the existi
 
 - Application Insights and Log Analytics.
 - Storage account and Functions deployment container.
-- Cosmos DB NoSQL account, database, and five containers.
+- Cosmos DB NoSQL account, database, six base/control containers, and six
+  source-content containers.
 - Durable Task Scheduler and source-derived task hub.
 - Document Intelligence and Azure AI Language accounts.
 - VNet, three subnets, seven private endpoints, and six unique private DNS zones.
 - Azure Container Registry.
 - Function, retrieval, and operations UAMIs.
-- Internal ACA managed environment.
+- External-access, VNet-integrated ACA managed environment.
 - Function App and retrieval Container App during the `Final` phase.
 - Temporary catalog-publisher job during `Operations`; removed by `OperationsCleanup`.
 
@@ -70,8 +71,21 @@ Default storage redundancy is ZRS. Cosmos defaults to serverless but supports pr
 | `ingestion-runs` | `/sourceId` |
 | `source-documents` | `/sourceRunId` |
 | `search-chunks` | `/documentKey` |
-| `retrieval-config` | `/deploymentInstanceId` |
+| `retrieval-config` | `/id` |
+| `ingestion-sources` | `/sourceId` |
 | `service-audit` | `/id` |
+| `dev-business-a-search-chunks` | `/documentKey` |
+| `dev-business-a-source-documents` | `/sourceRunId` |
+| `dev-business-b-search-chunks` | `/documentKey` |
+| `dev-business-b-source-documents` | `/sourceRunId` |
+| `dev-common-search-chunks` | `/documentKey` |
+| `dev-common-source-documents` | `/sourceRunId` |
+
+Assign the Function App managed identity the repository-defined guarded-writer
+Cosmos data-plane role scoped only to `retrieval-config`. The role requires
+metadata/read, conditional replace, query/change-feed, and create for bootstrap,
+history, and outcome records; it must not include delete, upsert, wildcard
+actions, or account-wide Cosmos contributor access.
 
 ## Deployment Inputs
 

@@ -239,7 +239,7 @@ def test_scoring_function_rejects_magnitude() -> None:
         )
 
 
-# --- Phase 1 (2026): direct-constructor invariants and vocabulary reset --------
+# --- Direct-constructor invariants and vocabulary reset ------------------------
 
 
 def test_scoring_profile_rejects_legacy_max_aggregation() -> None:

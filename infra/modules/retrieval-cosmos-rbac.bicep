@@ -16,12 +16,20 @@ param searchChunksContainerName string
 @description('Source documents container name')
 param sourceDocumentsContainerName string
 
+@description('Ingestion source registry container name')
+param ingestionSourcesContainerName string
+
+@description('Ingestion run and source-serving control container name')
+param ingestionRunsContainerName string
+
 @description('Retrieval catalog container name')
 param retrievalConfigContainerName string
 
 var readableContainerNames = [
   searchChunksContainerName
   sourceDocumentsContainerName
+  ingestionSourcesContainerName
+  ingestionRunsContainerName
   retrievalConfigContainerName
 ]
 

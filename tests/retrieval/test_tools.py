@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from typing import Any
 from datetime import datetime, timezone
 
@@ -18,6 +19,7 @@ from retrieval.cosmos import (
 from retrieval.pipeline import RetrievalDependencyError
 from retrieval.service import SearchResult
 from retrieval.scoring import ScoringProfile
+from retrieval.source_policy import SourceEligibility, SourcePolicySnapshot
 from retrieval.tools import make_search_tool
 
 
@@ -55,7 +57,7 @@ class FakeRagService:
         self._error = error
         self.calls: list[dict[str, Any]] = []
         self.snapshot = RuntimeCatalogSnapshot(
-            deployment_instance_id="test", catalog_id="runtime-catalog", etag="etag-a",
+            catalog_id="runtime-catalog", etag="etag-a",
             digest="sha256:" + "a" * 64, operation_id="operation-a",
             changed_at="2026-09-08T00:00:00Z", accepted_at=datetime(2026, 9, 8, tzinfo=timezone.utc),
             over_fetch_factor=1, hybrid_weights=(1, 1), full_text_score_scope="Global",
@@ -63,6 +65,18 @@ class FakeRagService:
             synonym_maps={}, synonym_expanders={},
         )
         self.policy = None
+        self.source_policy_snapshot = SourcePolicySnapshot((
+            SourceEligibility(
+                "source-a",
+                "catalog-etag",
+                "active",
+                "business",
+                "search-chunks",
+                "source-documents",
+                True,
+                "Business A",
+            ),
+        ))
 
     def capture_policy(self, requested=None, expand_synonyms=None) -> RequestPolicy:
         self.policy = RequestPolicy.capture(self.snapshot, requested, expand_synonyms)
@@ -87,6 +101,7 @@ class FakeRagService:
         return SearchResult(
             tuple(chunks),
             ({"operation": "retrieval_batch", "degraded": False},),
+            self.source_policy_snapshot,
         )
 
 
@@ -119,6 +134,7 @@ async def test_search_tool_delegates_policy_and_formats_chunks(
     fixed_now = datetime(2026, 1, 1, tzinfo=timezone.utc)
     tool = make_search_tool(
         service, principal, captured,
+        source_id="source-a",
         scoring_profile="fresh",
         max_evidence=4,
         expand_synonyms=True,
@@ -140,6 +156,9 @@ async def test_search_tool_delegates_policy_and_formats_chunks(
         "expand_synonyms": True,
         "now": fixed_now,
         "policy": service.policy,
+        "source_policy_snapshot": None,
+        "source_id": "source-a",
+        "validate_source_policy": False,
     }]
 
 
@@ -222,6 +241,43 @@ async def test_search_tool_keeps_request_wide_citations_stable_and_bounded(
     assert [(chunk.document_id, chunk.chunk_id) for chunk in captured] == [
         ("d1", "c1"), ("d2", "c2"), ("d3", "c3"),
     ]
+
+
+@pytest.mark.asyncio
+async def test_search_tool_reuses_request_source_policy_for_final_validation(
+    principal: Principal,
+) -> None:
+    chunk = replace(
+        RetrievedChunk("c1", "d1", "Active", "a.pdf", "https://sp.com/a", 1),
+        source_id="source-a",
+    )
+    service = FakeRagService([[chunk], [chunk]])
+    expected_sources: dict[str, SourceEligibility] = {}
+    tool = make_search_tool(
+        service,
+        principal,
+        [],
+        source_policy_versions=expected_sources,
+    )
+
+    await tool(query="first")
+    await tool(query="second")
+
+    assert expected_sources == {
+        "source-a": SourceEligibility(
+            "source-a",
+            "catalog-etag",
+            "active",
+            "business",
+            "search-chunks",
+            "source-documents",
+            True,
+            "Business A",
+        )
+    }
+    assert all(call["validate_source_policy"] is False for call in service.calls)
+    assert service.calls[0]["source_policy_snapshot"] is None
+    assert service.calls[1]["source_policy_snapshot"] is service.source_policy_snapshot
 
 
 @pytest.mark.asyncio

@@ -9,9 +9,10 @@ param location string = resourceGroup().location
 @description('ACR login server (e.g. myacr.azurecr.io)')
 param acrLoginServer string
 
-@description('Immutable container image name/tag or fully qualified registry reference')
-@minLength(1)
-param imageName string
+@description('Immutable SHA-256 digest for the approved rag-retrieval repository')
+@minLength(64)
+@maxLength(64)
+param imageDigest string
 
 @description('User-assigned managed identity resource ID for the container app')
 param managedIdentityId string
@@ -29,15 +30,13 @@ param retrievalApiClientId string
 @minLength(1)
 param retrievalApiAudience string
 
+@description('Approved native/public client application IDs allowed to call the retrieval API')
+@minLength(1)
+param allowedApplicationClientIds array
+
 @description('Single-tenant Entra issuer URL')
 @minLength(1)
 param entraIssuer string
-
-@description('Function UAMI application/client ID allowed by ACA auth')
-param gatewayClientId string
-
-@description('Function UAMI service-principal object ID allowed by ACA auth')
-param gatewayPrincipalId string
 
 @description('Container CPU cores')
 param containerCpu string = '0.5'
@@ -74,6 +73,7 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
     configuration: {
       ingress: {
         external: true
+        allowInsecure: false
         targetPort: 8080
         transport: 'auto'
       }
@@ -89,7 +89,7 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
       containers: [
         {
           name: 'retrieval-agent'
-          image: contains(imageName, '.azurecr.io/') ? imageName : '${acrLoginServer}/${imageName}'
+          image: '${acrLoginServer}/rag-retrieval@sha256:${imageDigest}'
           resources: {
             cpu: json(containerCpu)
             memory: containerMemory
@@ -151,10 +151,7 @@ resource authConfig 'Microsoft.App/containerApps/authConfigs@2024-03-01' = {
         validation: {
           allowedAudiences: [retrievalApiAudience]
           defaultAuthorizationPolicy: {
-            allowedApplications: [gatewayClientId]
-            allowedPrincipals: {
-              identities: [gatewayPrincipalId]
-            }
+            allowedApplications: allowedApplicationClientIds
           }
         }
       }
@@ -165,11 +162,14 @@ resource authConfig 'Microsoft.App/containerApps/authConfigs@2024-03-01' = {
   }
 }
 
-@description('Container App FQDN (internal)')
+@description('Container App public FQDN')
 output fqdn string = containerApp.properties.configuration.ingress.fqdn
 
 @description('Container App resource name')
 output containerAppName string = containerApp.name
 
-@description('Container App internal URL')
-output internalUrl string = 'https://${containerApp.properties.configuration.ingress.fqdn}'
+@description('Container App public base URL')
+output publicUrl string = 'https://${containerApp.properties.configuration.ingress.fqdn}'
+
+@description('Container App public query URL')
+output queryUrl string = 'https://${containerApp.properties.configuration.ingress.fqdn}/api/query'

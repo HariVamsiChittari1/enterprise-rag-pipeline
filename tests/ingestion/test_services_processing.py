@@ -2,12 +2,15 @@ from __future__ import annotations
 
 from dataclasses import replace
 from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
 
-from config import IngestionConfig
+from config import ExecutionBatchConfig, IngestionConfig
 from ingestion.graph import ResolvedMarkdownImage, VerifiedAcl
 from ingestion.models import (
+    AclFeedback,
+    AclStatus,
     ActivityStatus,
     CanonicalExtractionResult,
     CanonicalSegment,
@@ -17,7 +20,7 @@ from ingestion.models import (
     ExtractionProvenance,
     LocatorKind,
     Page,
-    ScaleLimits,
+    SourceAdmissionConfig,
     SourceLocator,
     SourceDocumentRecord,
     VisualDisposition,
@@ -33,6 +36,7 @@ from ingestion.models import (
 )
 from ingestion.repository import VersionedRecord
 from ingestion.services import process_document
+from ingestion.source_registry import SourcePlan, config_for_source
 from ingestion.office_visuals import (
     OfficeContentUnit,
     OfficeVisualInventory,
@@ -40,6 +44,7 @@ from ingestion.office_visuals import (
     RenderedVisualDescription,
 )
 import ingestion.services as services
+from source_registry import SharePointSource, source_binding_digest
 
 UTC = "2026-09-02T07:00:00Z"
 GROUP_A = "22222222-2222-4222-8222-222222222222"
@@ -141,31 +146,28 @@ def _config(**overrides: Any) -> IngestionConfig:
         content_understanding_analyzer_id="prebuilt-documentSearch",
         language_endpoint="",
         openai_endpoint="https://openai.example",
+        embedding_deployment="test-embedding",
         vision_deployment="gpt-5.4",
         managed_identity_client_id="mi",
+        admission=SourceAdmissionConfig(),
+        execution=ExecutionBatchConfig(),
         chunk_max_tokens=800,
         chunk_overlap_tokens=100,
-        acl_max_pages=10,
-        download_timeout_seconds=120.0,
-        delta_max_pages=200,
-        embedding_batch_size=100,
-        max_pdf_pages=500,
         vision_max_output_tokens=400,
-        vision_max_image_bytes=2 * 1024 * 1024,
-        vision_max_figures=60,
-        query_proxy_timeout_seconds=30.0,
         sharepoint_site_url="",
     )
     values.update(overrides)
     return IngestionConfig(**values)
 
 
-def _document(name: str) -> SourceDocumentRecord:
-    document_id = create_document_id("source", "drive", "item-1")
+def _document(
+    name: str, source_id: str = "source", drive_id: str = "drive",
+) -> SourceDocumentRecord:
+    document_id = create_document_id(source_id, drive_id, "item-1")
     return SourceDocumentRecord(
-        source_id="source",
+        source_id=source_id,
         run_id="run-1",
-        drive_id="drive",
+        drive_id=drive_id,
         item_id="item-1",
         parent_item_id="parent-1",
         source_name=name,
@@ -185,8 +187,8 @@ def _document(name: str) -> SourceDocumentRecord:
         updated_at=UTC,
         id=document_id,
         document_id=document_id,
-        source_run_id=create_source_run_id("source", "run-1"),
-        document_key=create_document_key("source", "run-1", document_id),
+        source_run_id=create_source_run_id(source_id, "run-1"),
+        document_key=create_document_key(source_id, "run-1", document_id),
     )
 
 
@@ -321,13 +323,21 @@ def _run(
     config: IngestionConfig | None = None,
     di_client: Any | None = None,
     cu_client: Any | None = None,
+    audit_container: Any | None = None,
+    expected_embedding_deployment: str | None = None,
 ) -> tuple[_Repository, _LifecycleRepository, Any]:
     repository = _Repository()
     lifecycle = _LifecycleRepository()
+
+    def _embed(_client: Any, texts: list[str], **kwargs: Any) -> list[tuple[float, ...]]:
+        if expected_embedding_deployment is not None:
+            assert kwargs["deployment"] == expected_embedding_deployment
+        return [(0.0,) * 3072 for _ in texts]
+
     monkeypatch.setattr(
         services,
         "embed_texts",
-        lambda _client, texts, **_kwargs: [(0.0,) * 3072 for _ in texts],
+        _embed,
     )
     outcome = process_document(
         config or _config(),
@@ -339,9 +349,38 @@ def _run(
         object() if di_client is None else di_client,
         None,
         object(),
+        audit_container=audit_container,
         cu_client=object() if cu_client is None else cu_client,
     )
     return repository, lifecycle, outcome
+
+
+def test_document_processing_uses_configured_embedding_deployment(
+    monkeypatch: Any,
+) -> None:
+    deployment = "custom-document-embedding"
+    connector = _Connector(
+        "guide.md",
+        "text/markdown",
+        b"# Guide\n\nConfigured embedding deployment.",
+    )
+    monkeypatch.setattr(
+        services,
+        "extract_markdown",
+        lambda _content, **_kwargs: _canonical(
+            Page(1, "Extracted Markdown with enough text for one production chunk.")
+        ),
+    )
+
+    _, _, outcome = _run(
+        monkeypatch,
+        _document("guide.md"),
+        connector,
+        config=_config(embedding_deployment=deployment),
+        expected_embedding_deployment=deployment,
+    )
+
+    assert outcome.status is ActivityStatus.SUCCEEDED
 
 
 def _stub_markdown_image_extraction(monkeypatch: Any) -> None:
@@ -354,6 +393,82 @@ def _stub_markdown_image_extraction(monkeypatch: Any) -> None:
     monkeypatch.setattr(services, "extract_markdown", fake_extract_markdown)
 
 
+@pytest.mark.parametrize(
+    ("content_scope", "retrieval_acl_enabled", "container_prefix"),
+    [
+        ("business", True, "business-a"),
+        ("business", False, "business-a"),
+        ("common", False, "common"),
+    ],
+)
+def test_processing_preserves_acl_metadata_independent_of_retrieval_policy(
+    monkeypatch: Any,
+    content_scope: str,
+    retrieval_acl_enabled: bool,
+    container_prefix: str,
+) -> None:
+    source = SharePointSource(
+        source_id="source-a",
+        site_id="site-a",
+        site_url="https://tenant.sharepoint.com/sites/a",
+        drive_id="drive-a",
+        desired_state="active",
+        content_scope=content_scope,
+        chunks_container=f"{container_prefix}-search-chunks",
+        manifests_container=f"{container_prefix}-source-documents",
+        retrieval_acl_enabled=retrieval_acl_enabled,
+        business_name="Business A",
+    )
+    plan = SourcePlan(
+        source,
+        "catalog-etag",
+        source_binding_digest(source, "tenant"),
+    )
+    config = config_for_source(_config(), plan)
+    connector = _Connector(
+        "guide.md",
+        "text/markdown",
+        b"# Guide\n\nSource-aware ACL metadata.",
+    )
+    acl = VerifiedAcl(("group-a", "group-b"), content_sha256("acl"))
+    connector.document_acls = [acl, acl]
+    monkeypatch.setattr(
+        services,
+        "extract_markdown",
+        lambda _content, **_kwargs: _canonical(
+            Page(1, "Extracted Markdown with enough text for one production chunk.")
+        ),
+    )
+
+    audit = MagicMock()
+    repository, lifecycle, outcome = _run(
+        monkeypatch,
+        replace(
+            _document("guide.md", source.source_id, source.drive_id),
+            business_name=source.business_name,
+        ),
+        connector,
+        config=config,
+        audit_container=audit,
+    )
+
+    assert outcome.status is ActivityStatus.SUCCEEDED
+    assert repository.chunks
+    assert all(
+        chunk.allowed_group_ids == acl.allowed_group_ids
+        for chunk in repository.chunks
+    )
+    assert repository.admitted_document is not None
+    assert repository.admitted_document.allowed_group_ids == acl.allowed_group_ids
+    assert lifecycle.calls[0]["allowed_group_ids"] == acl.allowed_group_ids
+    assert audit.create_item.call_count > 0
+    assert all(
+        call.args[0]["businessName"] == "Business A"
+        for call in audit.create_item.call_args_list
+    )
+
+
+@pytest.mark.parametrize("source_id", ["source-a", "source-b"])
 @pytest.mark.parametrize(
     ("name", "mime_type", "locator_kind", "locator_label"),
     [
@@ -383,12 +498,20 @@ def test_given_office_visual_when_processing_then_merges_rendered_description(
     mime_type: str,
     locator_kind: LocatorKind,
     locator_label: str,
+    source_id: str,
 ) -> None:
     connector = _Connector(
         name,
         mime_type,
         b"PK\x03\x04original-office-content",
     )
+    drive_id = f"drive-{source_id}"
+    acl = VerifiedAcl(
+        (f"group-{source_id}",),
+        content_sha256(source_id),
+        (AclFeedback.SHARED_LINK,),
+    )
+    connector.document_acls = [acl, acl]
     locator = SourceLocator(locator_kind, locator_label, 1, 1)
     inventory = OfficeVisualInventory(
         content_units=(OfficeContentUnit("office/unit1.xml", locator, False),),
@@ -435,15 +558,16 @@ def test_given_office_visual_when_processing_then_merges_rendered_description(
 
     repository, lifecycle, outcome = _run(
         monkeypatch,
-        _document(name),
+        _document(name, source_id, drive_id),
         connector,
+        config=_config(source_id=source_id, drive_id=drive_id),
     )
 
     assert outcome.status is ActivityStatus.SUCCEEDED
     assert connector.original_downloads == 1
     assert connector.conversions == 1
-    assert connector.source_download_limits == [100 * 1024 * 1024]
-    assert connector.rendered_download_limits == [200 * 1024 * 1024]
+    assert connector.source_download_limits == [500 * 1024 * 1024]
+    assert connector.rendered_download_limits == [500 * 1024 * 1024]
     assert extracted == [
         (
             b"PK\x03\x04original-office-content",
@@ -462,15 +586,29 @@ def test_given_office_visual_when_processing_then_merges_rendered_description(
     )
     assert len(repository.manifest_pages) == 1
     assert repository.admitted_document is not None
+    assert repository.admitted_document.acl_status is AclStatus.VERIFIED
+    assert repository.admitted_document.acl_feedback == (AclFeedback.SHARED_LINK,)
     assert repository.admitted_document.visual_manifest_page_count == 1
     assert repository.admitted_document.visual_manifest_hash == visual_manifest_hash(
         tuple(repository.manifest_pages)
     )
     assert len(lifecycle.calls) == 1
+    assert outcome.chunks_written == len(repository.chunks) >= 1
+    assert all(chunk.source_id == source_id for chunk in repository.chunks)
+    assert all(chunk.allowed_group_ids == acl.allowed_group_ids for chunk in repository.chunks)
+    assert repository.admitted_document.source_run_id == create_source_run_id(source_id, "run-1")
+    assert lifecycle.calls[0]["document_key"] == repository.admitted_document.document_key
 
 
-def test_given_markdown_when_processing_then_uses_direct_extraction_and_relative_loader(monkeypatch: Any) -> None:
+@pytest.mark.parametrize("source_id", ["source-a", "source-b"])
+def test_given_markdown_when_processing_then_uses_direct_extraction_and_relative_loader(
+    monkeypatch: Any, source_id: str,
+) -> None:
     connector = _Connector("guide.md", "text/markdown", b"# Guide\n\nDirect Markdown content")
+    drive_id = f"drive-{source_id}"
+    acl = VerifiedAcl((f"group-{source_id}",), content_sha256(source_id))
+    connector.document_acls = [acl, acl]
+    connector.image_acls = [acl, acl]
 
     def fake_extract_markdown(content: bytes, **kwargs: Any) -> CanonicalExtractionResult:
         kwargs["image_loader"]("images/chart.png")
@@ -480,8 +618,9 @@ def test_given_markdown_when_processing_then_uses_direct_extraction_and_relative
 
     repository, _, outcome = _run(
         monkeypatch,
-        _document("guide.md"),
+        _document("guide.md", source_id, drive_id),
         connector,
+        config=_config(source_id=source_id, drive_id=drive_id),
     )
 
     assert outcome.status is ActivityStatus.SUCCEEDED
@@ -490,37 +629,62 @@ def test_given_markdown_when_processing_then_uses_direct_extraction_and_relative
     assert connector.relative_paths == ["images/chart.png"]
     assert connector.image_downloads == 1
     assert repository.chunks[0].is_retrievable is False
+    assert outcome.chunks_written == len(repository.chunks) >= 1
+    assert all(chunk.source_id == source_id for chunk in repository.chunks)
+    assert all(chunk.allowed_group_ids == acl.allowed_group_ids for chunk in repository.chunks)
+    assert repository.admitted_document is not None
+    assert repository.admitted_document.document_id == create_document_id(source_id, drive_id, "item-1")
 
 
-def test_given_pdf_when_processing_then_uses_original_without_conversion(monkeypatch: Any) -> None:
+@pytest.mark.parametrize("source_id", ["source-a", "source-b"])
+def test_given_pdf_when_processing_then_uses_original_without_conversion(
+    monkeypatch: Any, source_id: str,
+) -> None:
     connector = _Connector("report.pdf", "application/pdf", b"%PDF-original")
-    extracted: list[bytes] = []
+    drive_id = f"drive-{source_id}"
+    acl = VerifiedAcl((f"group-{source_id}",), content_sha256(source_id))
+    connector.document_acls = [acl, acl]
+    extracted: list[tuple[bytes, int]] = []
     monkeypatch.setattr(
         services,
         "extract_pdf",
-        lambda _client, content, **_kwargs: extracted.append(content)
+        lambda _client, content, **kwargs: extracted.append(
+            (content, kwargs["max_pdf_pages"])
+        )
         or _canonical(Page(1, "Extracted PDF content with enough text for one production chunk.")),
     )
 
-    _, _, outcome = _run(
+    repository, lifecycle, outcome = _run(
         monkeypatch,
-        _document("report.pdf"),
+        _document("report.pdf", source_id, drive_id),
         connector,
+        config=_config(
+            source_id=source_id,
+            drive_id=drive_id,
+            admission=SourceAdmissionConfig(max_pages_per_source=1_733),
+        ),
     )
 
     assert outcome.status is ActivityStatus.SUCCEEDED
     assert connector.conversions == 0
-    assert extracted == [b"%PDF-original"]
+    assert extracted == [(b"%PDF-original", 1_733)]
+    assert outcome.chunks_written == len(repository.chunks) >= 1
+    assert all(chunk.source_id == source_id for chunk in repository.chunks)
+    assert all(chunk.allowed_group_ids == acl.allowed_group_ids for chunk in repository.chunks)
+    assert repository.admitted_document is not None
+    assert repository.admitted_document.document_id == create_document_id(source_id, drive_id, "item-1")
+    assert lifecycle.calls[0]["document_key"] == repository.admitted_document.document_key
 
 
-def test_approved_document_capacity_limits_are_fixed() -> None:
-    limits = ScaleLimits()
+def test_default_source_admission_capacity_is_explicit() -> None:
+    limits = SourceAdmissionConfig()
 
-    assert limits.max_source_bytes == 100 * 1024 * 1024
-    assert limits.max_rendered_pdf_bytes == 200 * 1024 * 1024
-    assert limits.max_document_units == 300
+    assert limits.max_source_bytes == 500 * 1024 * 1024
+    assert limits.max_rendered_derivative_bytes == 500 * 1024 * 1024
+    assert limits.max_pages_per_source == 2_000
+    assert limits.max_content_units_per_source == 2_000
     assert limits.max_office_characters == 8_000_000
-    assert limits.max_visual_descriptions == 60
+    assert limits.max_visual_assets_per_source == 60
 
 
 def test_given_office_over_aggregate_character_limit_then_fails_before_chunking(
@@ -549,14 +713,18 @@ def test_given_office_over_aggregate_character_limit_then_fails_before_chunking(
             segments=(
                 CanonicalSegment(
                     ordinal=0,
-                    text="x" * (ScaleLimits().max_office_characters // 2 + 1),
+                    text="x" * (
+                        SourceAdmissionConfig().max_office_characters // 2 + 1
+                    ),
                     locator=locator,
                     modalities=(ContentModality.TEXT,),
                     provenance=(ExtractionProvenance.DIRECT,),
                 ),
                 CanonicalSegment(
                     ordinal=1,
-                    text="y" * (ScaleLimits().max_office_characters // 2 + 1),
+                    text="y" * (
+                        SourceAdmissionConfig().max_office_characters // 2 + 1
+                    ),
                     locator=locator,
                     modalities=(ContentModality.TEXT,),
                     provenance=(ExtractionProvenance.DIRECT,),
@@ -576,7 +744,7 @@ def test_given_office_over_aggregate_character_limit_then_fails_before_chunking(
 
     repository, _, outcome = _run(monkeypatch, _document("briefing.pptx"), connector)
 
-    assert outcome.status is ActivityStatus.FAILED
+    assert outcome.status is ActivityStatus.QUARANTINED
     assert outcome.error is not None
     assert outcome.error.code == "office_character_limit_exceeded"
     assert repository.chunks == []
@@ -635,7 +803,7 @@ def test_given_provider_over_visual_limit_then_fails_before_chunking(
         ),
     )
 
-    assert outcome.status is ActivityStatus.FAILED
+    assert outcome.status is ActivityStatus.QUARANTINED
     assert outcome.error is not None
     assert outcome.error.code == "visual_description_limit_exceeded"
     assert repository.chunks == []
@@ -733,7 +901,7 @@ def test_given_text_only_office_when_cu_selected_then_uses_rendered_pdf(
     assert outcome.status is ActivityStatus.SUCCEEDED
     assert analyzed == [(b"%PDF-converted", "application/pdf")]
     assert connector.conversions == 1
-    assert connector.rendered_download_limits == [200 * 1024 * 1024]
+    assert connector.rendered_download_limits == [500 * 1024 * 1024]
 
 
 def test_given_visual_office_when_cu_selected_then_uses_rendered_pdf_only(
@@ -879,7 +1047,7 @@ def test_given_etag_drift_after_chunk_write_when_processing_then_does_not_admit(
         connector,
     )
 
-    assert outcome.status is ActivityStatus.FAILED
+    assert outcome.status is ActivityStatus.QUARANTINED
     assert outcome.error is not None
     assert outcome.error.code == "source_etag_changed_during_processing"
     assert "begin_document_admission" not in repository.calls
@@ -887,15 +1055,26 @@ def test_given_etag_drift_after_chunk_write_when_processing_then_does_not_admit(
     assert repository.chunks and all(not chunk.is_retrievable for chunk in repository.chunks)
 
 
-def test_given_acl_drift_after_chunk_write_when_processing_then_does_not_admit(monkeypatch: Any) -> None:
-    connector = _Connector("report.pdf", "application/pdf", b"%PDF-original")
-    connector.document_acls = [
-        ACL_A,
+@pytest.mark.parametrize(
+    "final_acl",
+    [
         VerifiedAcl(
             ("33333333-3333-4333-8333-333333333333",),
             content_sha256("changed-group"),
         ),
-    ]
+        VerifiedAcl(
+            ACL_A.allowed_group_ids,
+            ACL_A.acl_hash,
+            (AclFeedback.SHARED_LINK,),
+        ),
+    ],
+)
+def test_given_acl_drift_after_chunk_write_when_processing_then_does_not_admit(
+    monkeypatch: Any,
+    final_acl: VerifiedAcl,
+) -> None:
+    connector = _Connector("report.pdf", "application/pdf", b"%PDF-original")
+    connector.document_acls = [ACL_A, final_acl]
     monkeypatch.setattr(
         services,
         "extract_pdf",
@@ -908,7 +1087,7 @@ def test_given_acl_drift_after_chunk_write_when_processing_then_does_not_admit(m
         connector,
     )
 
-    assert outcome.status is ActivityStatus.FAILED
+    assert outcome.status is ActivityStatus.QUARANTINED
     assert outcome.error is not None
     assert outcome.error.code == "source_acl_changed_during_processing"
     assert "begin_document_admission" not in repository.calls
@@ -926,7 +1105,7 @@ def test_given_markdown_mime_drift_after_chunk_write_when_processing_then_does_n
         connector,
     )
 
-    assert outcome.status is ActivityStatus.FAILED
+    assert outcome.status is ActivityStatus.QUARANTINED
     assert outcome.error is not None
     assert outcome.error.code == "source_mime_changed_during_processing"
     assert "begin_document_admission" not in repository.calls
@@ -950,7 +1129,7 @@ def test_given_referenced_image_acl_excludes_document_group_when_processing_then
         connector,
     )
 
-    assert outcome.status is ActivityStatus.FAILED
+    assert outcome.status is ActivityStatus.QUARANTINED
     assert outcome.error is not None
     assert outcome.error.code == "markdown_image_acl_not_authorized"
     assert connector.image_downloads == 0
@@ -969,7 +1148,7 @@ def test_given_referenced_image_etag_drift_after_chunk_write_when_processing_the
         connector,
     )
 
-    assert outcome.status is ActivityStatus.FAILED
+    assert outcome.status is ActivityStatus.QUARANTINED
     assert outcome.error is not None
     assert outcome.error.code == "markdown_image_etag_changed_during_processing"
     assert "begin_document_admission" not in repository.calls
@@ -994,7 +1173,7 @@ def test_given_referenced_image_acl_drift_after_chunk_write_when_processing_then
         connector,
     )
 
-    assert outcome.status is ActivityStatus.FAILED
+    assert outcome.status is ActivityStatus.QUARANTINED
     assert outcome.error is not None
     assert outcome.error.code == "markdown_image_acl_changed_during_processing"
     assert "begin_document_admission" not in repository.calls
@@ -1011,7 +1190,7 @@ def test_given_unsupported_live_format_when_processing_then_fails_before_downloa
         connector,
     )
 
-    assert outcome.status is ActivityStatus.FAILED
+    assert outcome.status is ActivityStatus.QUARANTINED
     assert outcome.error is not None
     assert outcome.error.code.startswith("source_extension_not_allowed")
     assert connector.original_downloads == 0

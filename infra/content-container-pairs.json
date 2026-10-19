@@ -1,0 +1,14 @@
+[
+  {
+    "chunksContainer": "dev-business-a-search-chunks",
+    "manifestsContainer": "dev-business-a-source-documents"
+  },
+  {
+    "chunksContainer": "dev-business-b-search-chunks",
+    "manifestsContainer": "dev-business-b-source-documents"
+  },
+  {
+    "chunksContainer": "dev-common-search-chunks",
+    "manifestsContainer": "dev-common-source-documents"
+  }
+]

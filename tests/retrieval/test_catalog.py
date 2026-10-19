@@ -62,9 +62,9 @@ def _source() -> dict[str, Any]:
 
 
 def test_given_config_source_when_built_for_direct_editing_then_no_writer_metadata_required() -> None:
-    item = build_catalog_item(_source(), "dev")
+    item = build_catalog_item(_source())
 
-    assert set(item) == {"id", "deploymentInstanceId", "type", "config"}
+    assert set(item) == {"id", "type", "config"}
     snapshot = load_catalog_item(item)
     assert snapshot.operation_id is None
     assert snapshot.changed_at is None
@@ -78,7 +78,7 @@ class FakeContainer:
         self.etag = "etag-1"
 
     def create_item(self, *, body: dict[str, Any]) -> dict[str, Any]:
-        key = (body["deploymentInstanceId"], body["id"])
+        key = (body["id"], body["id"])
         if key in self.items:
             raise CosmosResourceExistsError(status_code=409, message="exists")
         stored = dict(body)
@@ -97,7 +97,7 @@ class FakeContainer:
         self, *, item: str, body: dict[str, Any], etag: str, match_condition: Any,
         response_hook=None, retry_write=False,
     ) -> dict[str, Any]:
-        key = (body["deploymentInstanceId"], item)
+        key = (body["id"], item)
         if key not in self.items:
             raise CosmosResourceNotFoundError(status_code=404, message="missing")
         if etag != self.items[key]["_etag"]:
@@ -112,17 +112,18 @@ class FakeContainer:
             response_hook({"x-ms-activity-id": "test-activity"}, stored)
         return stored
 
-    def query_items(self, *, query, parameters, partition_key):
+    def query_items(self, *, query, parameters, enable_cross_partition_query):
+        assert enable_cross_partition_query is True
         operation_id = parameters[1]["value"]
         return [
-            dict(item) for (partition, _identity), item in self.items.items()
-            if partition == partition_key and item.get("operation", {}).get("operationId") == operation_id
+            dict(item) for item in self.items.values()
+            if item.get("operation", {}).get("operationId") == operation_id
         ]
 
 
 def _item(source: dict[str, Any] | None = None) -> dict[str, Any]:
     return build_catalog_item(
-        source if source is not None else _source(), "dev",
+        source if source is not None else _source(),
         operation_id="b14c1a67-9fc4-4e78-a818-e5951473d15b",
         changed_at=datetime(2026, 8, 26, tzinfo=timezone.utc), reason="Test configuration",
     )
@@ -130,12 +131,12 @@ def _item(source: dict[str, Any] | None = None) -> dict[str, Any]:
 
 def _operation():
     candidate = build_catalog_item(
-        _source(), "dev", operation_id="a14c1a67-9fc4-4e78-a818-e5951473d15b",
+        _source(), operation_id="a14c1a67-9fc4-4e78-a818-e5951473d15b",
         changed_at=datetime(2026, 9, 8, tzinfo=timezone.utc), reason="Updated policy",
     )
     manifest = {
         "operationId": candidate["change"]["operationId"], "createdAt": candidate["change"]["changedAt"],
-        "deploymentInstanceId": "dev", "expectedEtag": "etag-1",
+        "expectedEtag": "etag-1",
         "candidateDigest": load_catalog_item(candidate).digest,
         "candidateFileDigest": "sha256:" + "c" * 64, "reason": "Updated policy",
     }
@@ -151,8 +152,8 @@ def test_given_guarded_update_when_retried_then_history_and_replacement_are_not_
     assert first["status"] == "applied-but-unassured"
     assert first["activityId"] == "test-activity"
     assert first["etag"] == "etag-2"
-    history = container.items[("dev", first["historyId"])]
-    assert load_catalog_history(history, "dev") == original
+    history = container.items[(first["historyId"], first["historyId"])]
+    assert load_catalog_history(history) == original
     second = apply_catalog_operation(container, candidate, manifest)
     assert second["status"] == "applied-but-unassured"
     assert second["historyId"] == first["historyId"]
@@ -177,11 +178,11 @@ def test_given_malformed_history_candidate_digest_when_loaded_then_rejected(dige
     publish_catalog(container, _item())
     candidate, manifest = _operation()
     result = apply_catalog_operation(container, candidate, manifest)
-    history = deepcopy(container.items[("dev", result["historyId"])])
+    history = deepcopy(container.items[(result["historyId"], result["historyId"])])
     history["operation"]["candidateDigest"] = digest
 
     with pytest.raises(CatalogError):
-        load_catalog_history(history, "dev")
+        load_catalog_history(history)
 
 
 def test_given_missing_history_candidate_digest_when_loaded_then_rejected() -> None:
@@ -189,11 +190,11 @@ def test_given_missing_history_candidate_digest_when_loaded_then_rejected() -> N
     publish_catalog(container, _item())
     candidate, manifest = _operation()
     result = apply_catalog_operation(container, candidate, manifest)
-    history = deepcopy(container.items[("dev", result["historyId"])])
+    history = deepcopy(container.items[(result["historyId"], result["historyId"])])
     del history["operation"]["candidateDigest"]
 
     with pytest.raises(CatalogError):
-        load_catalog_history(history, "dev")
+        load_catalog_history(history)
 
 
 def test_given_unapplied_operation_when_reconciling_then_no_mutation():
@@ -238,7 +239,8 @@ def test_writer_replay_does_not_assure_missing_or_changed_outcome(failure):
     publish_catalog(container, _item())
     candidate, manifest = _operation()
     first = apply_catalog_operation(container, candidate, manifest)
-    key = ("dev", "runtime-catalog-outcome:" + manifest["operationId"])
+    outcome_id = "runtime-catalog-outcome:" + manifest["operationId"]
+    key = (outcome_id, outcome_id)
     if failure == "missing":
         del container.items[key]
     else:
@@ -256,7 +258,7 @@ def test_unchanged_body_with_new_etag_cannot_reuse_writer_outcome():
     publish_catalog(container, _item())
     candidate, manifest = _operation()
     apply_catalog_operation(container, candidate, manifest)
-    container.items[("dev", "runtime-catalog")]["_etag"] = "direct-edit-etag"
+    container.items[("runtime-catalog", "runtime-catalog")]["_etag"] = "direct-edit-etag"
     replay = apply_catalog_operation(container, candidate, manifest, reconcile_only=True)
     assert replay["auditStatus"] != "semantic-outcome-verified"
     assert replay["activityId"] is None
@@ -269,7 +271,7 @@ def test_given_history_collision_when_content_differs_then_abort_before_replace(
             if body["type"] == "retrieval-runtime-catalog-history":
                 conflicting = deepcopy(body)
                 conflicting[field] = "corrupted"
-                self.items[(body["deploymentInstanceId"], body["id"])] = conflicting
+                self.items[(body["id"], body["id"])] = conflicting
                 raise CosmosResourceExistsError(status_code=409, message="exists")
             return super().create_item(body=body)
 
@@ -278,7 +280,7 @@ def test_given_history_collision_when_content_differs_then_abort_before_replace(
     candidate, manifest = _operation()
     with pytest.raises(CatalogError):
         apply_catalog_operation(container, candidate, manifest)
-    assert container.items[("dev", "runtime-catalog")]["_etag"] == "etag-1"
+    assert container.items[("runtime-catalog", "runtime-catalog")]["_etag"] == "etag-1"
 
 
 def test_given_replace_412_when_updating_then_conflict_is_terminal():
@@ -334,7 +336,6 @@ def test_given_current_singleton_when_loaded_then_validates_strict_contract() ->
     del config["defaultProfile"]
     item = {
         "id": "runtime-catalog",
-        "deploymentInstanceId": "dev",
         "type": "retrieval-runtime-catalog",
         "change": {
             "operationId": "b14c1a67-9fc4-4e78-a818-e5951473d15b",
@@ -449,10 +450,10 @@ def test_publish_is_idempotent_and_loader_reads_fixed_item() -> None:
     item = _item()
     publish_catalog(container, item)
     publish_catalog(container, item)
-    loaded = RuntimeCatalogLoader(container, "dev").load()
+    loaded = RuntimeCatalogLoader(container).load()
     assert loaded.digest == load_catalog_item(item).digest
     assert loaded.etag == "etag-1"
-    assert set(container.items) == {("dev", "runtime-catalog")}
+    assert set(container.items) == {("runtime-catalog", "runtime-catalog")}
 
 
 @pytest.mark.parametrize("field", ["config", "operationId", "changedAt", "reason"])
@@ -470,13 +471,13 @@ def test_given_conflicting_bootstrap_when_published_then_existing_item_is_untouc
         }[field]
     with pytest.raises(CatalogConflictError, match="explicit disposition"):
         publish_catalog(container, second)
-    assert container.read_item(item="runtime-catalog", partition_key="dev")["config"] == first_item["config"]
-    assert container.read_item(item="runtime-catalog", partition_key="dev")["change"] == first_item["change"]
+    assert container.read_item(item="runtime-catalog", partition_key="runtime-catalog")["config"] == first_item["config"]
+    assert container.read_item(item="runtime-catalog", partition_key="runtime-catalog")["change"] == first_item["change"]
 
 
 def test_loader_reports_missing_and_baseline_factory_supplies_defaults() -> None:
     container = FakeContainer()
-    loader = RuntimeCatalogLoader(container, "dev")
+    loader = RuntimeCatalogLoader(container)
     with pytest.raises(CatalogMissingError, match="missing"):
         loader.load()
 
@@ -488,14 +489,13 @@ def test_loader_reports_missing_and_baseline_factory_supplies_defaults() -> None
     assert dict(baseline.profiles) == {}
     assert dict(baseline.synonym_maps) == {}
     assert baseline.default_profile is None
-    assert baseline.deployment_instance_id == "dev"
     policy = RequestPolicy.capture(baseline)
     assert policy.profile is None
     assert policy.expander is None
 
     item = _item()
     publish_catalog(container, item)
-    del container.items[("dev", item["id"])]
+    del container.items[(item["id"], item["id"])]
     with pytest.raises(CatalogMissingError, match="missing"):
         loader.load()
 
@@ -506,7 +506,7 @@ def test_loader_fails_closed_on_read_error() -> None:
             raise RuntimeError("transient")
 
     with pytest.raises(CatalogError, match="read failed"):
-        RuntimeCatalogLoader(BrokenContainer(), "dev").load()
+        RuntimeCatalogLoader(BrokenContainer()).load()
 
 
 @pytest.mark.parametrize(

@@ -12,16 +12,16 @@ from ingestion.telemetry import usage_record, write_audit_record
 logger = logging.getLogger(__name__)
 
 EMBEDDING_DIMENSIONS = 3_072
-EMBEDDING_MODEL = "text-embedding-3-large"
 
 
 def embed_texts(
     client: Any,
     texts: list[str],
-    deployment: str = EMBEDDING_MODEL,
+    deployment: str,
     audit_container: Any | None = None,
     source_id: str = "",
     run_id: str = "",
+    business_name: str | None = None,
     batch_size: int = 100,
 ) -> list[tuple[float, ...]]:
     """Generate embeddings for a list of texts in batches."""
@@ -48,6 +48,7 @@ def embed_texts(
             write_audit_record(
                 audit_container, source_id, run_id,
                 usage_record("ingestion_embedding", deployment, response, start),
+                business_name=business_name,
             )
         ordered = sorted(response.data, key=lambda item: item.index)
         if len(ordered) != len(batch):

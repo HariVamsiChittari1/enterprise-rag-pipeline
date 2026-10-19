@@ -11,7 +11,7 @@ connector (e.g. Azure Storage) can be added without changing services.py's orche
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Any, Protocol
 
 import httpx
 
@@ -20,7 +20,7 @@ from ingestion.graph import (
     DiscoveryStep,
     DriveDelta,
     ResolvedMarkdownImage,
-    ScaleLimits,
+    SourceAdmissionConfig,
     VerifiedAcl,
     bootstrap_delta_cursor,
     discover_next_page,
@@ -40,7 +40,7 @@ class SourceConnector(Protocol):
     def discover_next_page(
         self,
         state: DiscoveryState,
-        limits: ScaleLimits,
+        limits: SourceAdmissionConfig,
         allowed_extensions: tuple[str, ...] = (".pdf",),
     ) -> DiscoveryStep: ...
 
@@ -69,7 +69,9 @@ class SourceConnector(Protocol):
         max_bytes: int,
     ) -> ResolvedMarkdownImage: ...
 
-    def read_drive_delta(self, max_pages: int, delta_link: str | None = None) -> DriveDelta: ...
+    def read_drive_delta(
+        self, max_pages: int, delta_link: str | None = None, *, page_capture: Any | None = None,
+    ) -> DriveDelta: ...
 
     def bootstrap_delta_cursor(self) -> str: ...
 
@@ -86,7 +88,7 @@ class SharePointConnector:
     def discover_next_page(
         self,
         state: DiscoveryState,
-        limits: ScaleLimits,
+        limits: SourceAdmissionConfig,
         allowed_extensions: tuple[str, ...] = (".pdf",),
     ) -> DiscoveryStep:
         return discover_next_page(self.client, self.drive_id, state, limits, allowed_extensions)
@@ -137,8 +139,17 @@ class SharePointConnector:
             max_bytes,
         )
 
-    def read_drive_delta(self, max_pages: int, delta_link: str | None = None) -> DriveDelta:
-        return read_drive_delta(self.client, self.drive_id, max_pages, delta_link=delta_link)
+    def read_drive_delta(
+        self,
+        max_pages: int,
+        delta_link: str | None = None,
+        *,
+        page_capture: Any | None = None,
+    ) -> DriveDelta:
+        return read_drive_delta(
+            self.client, self.drive_id, max_pages,
+            delta_link=delta_link, page_capture=page_capture,
+        )
 
     def bootstrap_delta_cursor(self) -> str:
         return bootstrap_delta_cursor(self.client, self.drive_id)

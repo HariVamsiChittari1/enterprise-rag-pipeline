@@ -33,7 +33,6 @@ def _required(name: str) -> str:
 
 
 def publish_bootstrap_catalog() -> dict[str, str]:
-    deployment_instance_id = _required("DEPLOYMENT_INSTANCE_ID")
     expected_digest = _required("EXPECTED_CATALOG_DIGEST")
     source_path = Path(
         os.getenv("CATALOG_PATH", "/app/retrieval/catalog.example.json")
@@ -45,7 +44,7 @@ def publish_bootstrap_catalog() -> dict[str, str]:
     if not isinstance(source, dict):
         raise OperationsError("catalog source must be an object")
 
-    item = build_catalog_item(source, deployment_instance_id)
+    item = build_catalog_item(source)
     catalog = load_catalog_item(item)
     if catalog.digest != expected_digest:
         raise OperationsError("catalog digest does not match the reviewed artifact")
@@ -61,7 +60,6 @@ def _run_catalog_operation(item: dict[str, Any] | None = None) -> dict[str, str]
     endpoint = _required("COSMOS_ENDPOINT")
     database_name = _required("COSMOS_DATABASE")
     container_name = _required("RETRIEVAL_CONFIG_CONTAINER")
-    deployment_instance_id = _required("DEPLOYMENT_INSTANCE_ID")
     managed_identity_client_id = _required("MANAGED_IDENTITY_CLIENT_ID")
     try:
         with ExitStack() as resources:
@@ -74,7 +72,7 @@ def _run_catalog_operation(item: dict[str, Any] | None = None) -> dict[str, str]
             )
             if item is not None:
                 publish_catalog(container, item)
-            observed = RuntimeCatalogLoader(container, deployment_instance_id).load()
+            observed = RuntimeCatalogLoader(container).load()
             if observed.etag is None:
                 raise OperationsError("runtime catalog has no ETag")
         return {

@@ -9,14 +9,17 @@ from typing import Any
 
 import pytest
 
-from config import IngestionConfig
+from config import ExecutionBatchConfig, IngestionConfig
 from ingestion.graph import VerifiedAcl
 from ingestion.models import (
+    AclFeedback,
+    AclStatus,
     ActivityStatus,
     AudioMetadata,
     DocumentStage,
     DocumentStatus,
     LocatorKind,
+    SourceAdmissionConfig,
     SourceDocumentRecord,
     content_sha256,
     content_sha256_bytes,
@@ -72,11 +75,12 @@ def _config(**overrides: Any) -> IngestionConfig:
         content_understanding_endpoint="https://cu.example",
         content_understanding_analyzer_id="prebuilt-documentSearch",
         language_endpoint="", openai_endpoint="https://openai.example",
+        embedding_deployment="test-embedding",
         vision_deployment="gpt-5.4", managed_identity_client_id="mi",
-        chunk_max_tokens=800, chunk_overlap_tokens=100, acl_max_pages=10,
-        download_timeout_seconds=120.0, delta_max_pages=200, embedding_batch_size=100,
-        max_pdf_pages=500, vision_max_output_tokens=400, vision_max_image_bytes=2 * 1024 * 1024,
-        vision_max_figures=60, query_proxy_timeout_seconds=30.0, sharepoint_site_url="",
+        admission=SourceAdmissionConfig(),
+        execution=ExecutionBatchConfig(),
+        chunk_max_tokens=800, chunk_overlap_tokens=100,
+        vision_max_output_tokens=400, sharepoint_site_url="",
         audio_writer_enabled=True,
         speech_endpoint="https://speech-fixture.cognitiveservices.azure.com",
         speech_region="eastus2", audio_deployment_region="eastus2", audio_locale="en-US",
@@ -85,19 +89,27 @@ def _config(**overrides: Any) -> IngestionConfig:
     return IngestionConfig(**values)
 
 
-def _document(mime: str = "audio/wav", name: str = "clip.wav") -> SourceDocumentRecord:
-    document_id = create_document_id("source", "drive", "item-1")
+def _document(
+    mime: str = "audio/wav", name: str = "clip.wav",
+    source_id: str = "source", drive_id: str = "drive",
+) -> SourceDocumentRecord:
+    document_id = create_document_id(source_id, drive_id, "item-1")
     return SourceDocumentRecord(
-        source_id="source", run_id="run-1", drive_id="drive", item_id="item-1",
+        source_id=source_id, run_id="run-1", drive_id=drive_id, item_id="item-1",
         parent_item_id="parent-1", source_name=name, source_path=f"/audio/{name}",
         source_url=f"https://example.invalid/{name}", e_tag="source-etag",
         mime_type=mime, size_bytes=len(WAV), discovery_ordinal=1,
         allowed_group_ids=("pending",), acl_hash=content_sha256("pending"), acl_evaluated_at=UTC,
         status=DocumentStatus.DISCOVERED, stage=DocumentStage.DISCOVERED, attempt_count=0,
         discovered_at=UTC, updated_at=UTC, id=document_id, document_id=document_id,
-        source_run_id=create_source_run_id("source", "run-1"),
-        document_key=create_document_key("source", "run-1", document_id),
+        source_run_id=create_source_run_id(source_id, "run-1"),
+        document_key=create_document_key(source_id, "run-1", document_id),
     )
+
+
+def test_audio_work_identity_fields_are_paired() -> None:
+    with pytest.raises(ValueError, match="work and attempt IDs must be set together"):
+        replace(_document(), transcription_work_id="work-only")
 
 
 class _Repository:
@@ -181,27 +193,64 @@ class _Connector:
 def _run(monkeypatch: Any, *, config: IngestionConfig | None = None,
          token_provider: Any = lambda: "synthetic-token",
          transcribe: Any = None, mime: str = "audio/wav",
-         name: str = "clip.wav") -> tuple[_Repository, _LifecycleRepository, Any]:
+         name: str = "clip.wav", acl: VerifiedAcl = ACL_A,
+         expected_embedding_deployment: str | None = None,
+         ) -> tuple[_Repository, _LifecycleRepository, Any]:
     repository = _Repository()
     lifecycle = _LifecycleRepository()
-    monkeypatch.setattr(services, "embed_texts", lambda _c, texts, **_k: [(0.0,) * 3072 for _ in texts])
+    selected_config = config or _config()
+
+    def _embed(_client: Any, texts: list[str], **kwargs: Any) -> list[tuple[float, ...]]:
+        if expected_embedding_deployment is not None:
+            assert kwargs["deployment"] == expected_embedding_deployment
+        return [(0.0,) * 3072 for _ in texts]
+
+    monkeypatch.setattr(services, "embed_texts", _embed)
     monkeypatch.setattr(
         services, "transcribe_audio",
         transcribe or (lambda **_kwargs: transcript_body()),
     )
+    connector = _Connector(mime=mime, name=name)
+    connector.acls = [acl, acl]
     outcome = process_document(
-        config or _config(), _document(mime, name), "etag-0",
-        repository, lifecycle, _Connector(mime=mime, name=name), None, None, object(),
+        selected_config, _document(mime, name, selected_config.source_id, selected_config.drive_id), "etag-0",
+        repository, lifecycle, connector, None, None, object(),
         speech_token_provider=token_provider,
     )
     return repository, lifecycle, outcome
 
 
+def test_audio_processing_uses_configured_embedding_deployment(
+    monkeypatch: Any,
+) -> None:
+    deployment = "custom-audio-embedding"
+
+    _, _, outcome = _run(
+        monkeypatch,
+        config=_config(embedding_deployment=deployment),
+        expected_embedding_deployment=deployment,
+    )
+
+    assert outcome.status is ActivityStatus.SUCCEEDED
+
+
+@pytest.mark.parametrize("source_id", ["source-a", "source-b"])
 @pytest.mark.parametrize("mime,name", [
     ("audio/wav", "clip.wav"), ("audio/mpeg", "clip.mp3"), ("audio/flac", "clip.flac"),
 ])
-def test_audio_document_is_transcribed_chunked_and_admitted(monkeypatch: Any, mime: str, name: str) -> None:
-    repository, lifecycle, outcome = _run(monkeypatch, mime=mime, name=name)
+def test_audio_document_is_transcribed_chunked_and_admitted(
+    monkeypatch: Any, mime: str, name: str, source_id: str,
+) -> None:
+    drive_id = f"drive-{source_id}"
+    acl = VerifiedAcl(
+        (f"group-{source_id}",),
+        content_sha256(source_id),
+        (AclFeedback.SHARED_LINK,),
+    )
+    repository, lifecycle, outcome = _run(
+        monkeypatch, mime=mime, name=name, acl=acl,
+        config=_config(source_id=source_id, drive_id=drive_id),
+    )
 
     assert outcome.status is ActivityStatus.SUCCEEDED
     assert outcome.chunks_written == len(repository.chunks) >= 1
@@ -220,10 +269,17 @@ def test_audio_document_is_transcribed_chunked_and_admitted(monkeypatch: Any, mi
     admitted = repository.ready_document
     assert admitted is not None
     assert admitted.status is DocumentStatus.READY
+    assert admitted.acl_status is AclStatus.VERIFIED
+    assert admitted.acl_feedback == (AclFeedback.SHARED_LINK,)
     assert admitted.page_count is None
     assert admitted.content_hash == WAV_HASH
     assert admitted.audio is not None and admitted.source_verified_at is not None
     assert lifecycle.calls and lifecycle.calls[0]["is_retrievable"] is True
+    assert admitted.document_id == create_document_id(source_id, drive_id, "item-1")
+    assert admitted.source_run_id == create_source_run_id(source_id, "run-1")
+    assert all(chunk.source_id == source_id for chunk in repository.chunks)
+    assert all(chunk.allowed_group_ids == acl.allowed_group_ids for chunk in repository.chunks)
+    assert lifecycle.calls[0]["document_key"] == admitted.document_key
 
 
 def test_audio_requires_writer_enabled(monkeypatch: Any) -> None:
@@ -231,13 +287,13 @@ def test_audio_requires_writer_enabled(monkeypatch: Any) -> None:
         audio_writer_enabled=False, speech_endpoint="", speech_region="",
         audio_deployment_region="", audio_locale="",
     ))
-    assert outcome.status is ActivityStatus.FAILED
+    assert outcome.status is ActivityStatus.QUARANTINED
     assert outcome.error is not None and outcome.error.code == "audio_writer_disabled"
 
 
 def test_audio_requires_token_provider(monkeypatch: Any) -> None:
     _, _, outcome = _run(monkeypatch, token_provider=None)
-    assert outcome.status is ActivityStatus.FAILED
+    assert outcome.status is ActivityStatus.QUARANTINED
     assert outcome.error is not None and outcome.error.code == "audio_transcription_token_provider_missing"
 
 
@@ -248,7 +304,7 @@ def test_audio_provider_terminal_failure_fails_closed(monkeypatch: Any) -> None:
         raise TerminalDocumentError("audio_transcription_rejected:400")
 
     repository, _, outcome = _run(monkeypatch, transcribe=_reject)
-    assert outcome.status is ActivityStatus.FAILED
+    assert outcome.status is ActivityStatus.QUARANTINED
     assert repository.ready_document is None
     assert "write_chunks" not in repository.calls
 
@@ -293,6 +349,7 @@ def _transcribing_doc() -> SourceDocumentRecord:
     return replace(
         _document(), status=DocumentStatus.PROCESSING, stage=DocumentStage.TRANSCRIBING,
         content_hash=WAV_HASH, transcription_job_url=_JOB_URL, staging_blob_name="key.wav",
+        transcription_work_id="work-audio", transcription_attempt_id="attempt-audio",
     )
 
 
@@ -314,8 +371,10 @@ def test_audio_batch_submit_stages_source_and_records_job(monkeypatch: Any) -> N
     outcome = process_document(
         _batch_config(), _document(), "etag-0", repository, lifecycle, _Connector(),
         None, None, object(), speech_token_provider=lambda: "tok", blob_service_client=blob,
+        document_work_id="document-work:audio-test",
+        document_work_attempt_id="attempt-audio-test",
     )
-    assert outcome.status is ActivityStatus.SUCCEEDED
+    assert outcome.status is ActivityStatus.PENDING
     assert outcome.chunks_written == 0
     assert "write_chunks" not in repository.calls
     assert "begin_document_admission" not in repository.calls
@@ -323,6 +382,8 @@ def test_audio_batch_submit_stages_source_and_records_job(monkeypatch: Any) -> N
     assert submitted is not None and submitted.stage is DocumentStage.TRANSCRIBING
     assert submitted.transcription_job_url == _JOB_URL
     assert submitted.staging_blob_name and submitted.content_hash == WAV_HASH
+    assert submitted.transcription_work_id == "document-work:audio-test"
+    assert submitted.transcription_attempt_id == "attempt-audio-test"
     assert blob.blob.uploaded is not None and blob.blob.uploaded[1] is True
 
 
@@ -332,7 +393,7 @@ def test_audio_batch_submit_requires_blob_client(monkeypatch: Any) -> None:
         _batch_config(), _document(), "etag-0", repository, lifecycle, _Connector(),
         None, None, object(), speech_token_provider=lambda: "tok", blob_service_client=None,
     )
-    assert outcome.status is ActivityStatus.FAILED
+    assert outcome.status is ActivityStatus.QUARANTINED
     assert outcome.error is not None and outcome.error.code == "audio_staging_client_missing"
 
 
@@ -365,6 +426,8 @@ def test_finalize_audio_transcription_succeeds(monkeypatch: Any) -> None:
     assert repository.ready_document is not None and repository.ready_document.status is DocumentStatus.READY
     assert repository.ready_document.audio is not None
     assert repository.ready_document.transcription_job_url is None
+    assert repository.ready_document.transcription_work_id == "work-audio"
+    assert repository.ready_document.transcription_attempt_id == "attempt-audio"
     assert repository.chunks[0].start_ms == 0 and repository.chunks[-1].end_ms == 1000
     assert deleted.get("job") is True and deleted.get("blob") == "key.wav"
     assert lifecycle.calls and lifecycle.calls[0]["is_retrievable"] is True
@@ -406,7 +469,10 @@ def test_run_audio_transcription_poll_page_tallies_results(monkeypatch: Any) -> 
     )
 
     class _Lifecycle:
-        def list_transcribing_documents_page(self, *, page_size: int, continuation_token: Any = None) -> AudioTranscribingPage:
+        def list_transcribing_documents_page(
+            self, *, source_id: str, page_size: int,
+            continuation_token: Any = None, settlement_only: bool = False,
+        ) -> AudioTranscribingPage:
             return AudioTranscribingPage(refs, "next-token")
 
     results = iter(["succeeded", "pending", "failed"])
@@ -418,3 +484,174 @@ def test_run_audio_transcription_poll_page_tallies_results(monkeypatch: Any) -> 
     )
     assert (outcome.checked, outcome.succeeded, outcome.pending, outcome.failed) == (3, 1, 1, 1)
     assert token == "next-token"
+
+
+def test_audio_poll_validates_pending_work_before_finalization(monkeypatch: Any) -> None:
+    from ingestion.lifecycle_repository import AudioTranscribingPage, AudioTranscribingRef
+
+    ref = AudioTranscribingRef(
+        "audio-1", "source:run-1", DocumentStatus.PROCESSING,
+        DocumentStage.TRANSCRIBING, "work-1", "attempt-1",
+    )
+    lifecycle = SimpleNamespace(
+        list_transcribing_documents_page=lambda **_kwargs: AudioTranscribingPage((ref,), None),
+    )
+    events: list[str] = []
+    repository = _Repository()
+    repository.stored_document = VersionedRecord(SimpleNamespace(
+        status=DocumentStatus.READY,
+        stage=DocumentStage.TERMINAL,
+        transcription_work_id="work-1",
+        transcription_attempt_id="attempt-1",
+    ), "etag-ready")
+
+    class Registry:
+        def get_document_operation_kind(self, *args: str) -> str:
+            assert args == ("source", "work-1", "source:run-1", "audio-1")
+            events.append("read-work")
+            return "full-sync"
+
+        def assert_document_operation_unresolved(self, *args: Any, **kwargs: Any) -> None:
+            assert args == (
+                "source", "owner-1", "work-1",
+                "source:run-1", "audio-1", "full-sync",
+            )
+            assert kwargs == {"allow_pending": True}
+            events.append("verify-operation")
+
+    monkeypatch.setattr(
+        services,
+        "finalize_audio_transcription",
+        lambda *_args, **_kwargs: events.append("finalize") or "succeeded",
+    )
+    outcome, _ = services.run_audio_transcription_poll_page(
+        _batch_config(),
+        repository,
+        lifecycle,
+        _Connector(),
+        None,
+        object(),
+        speech_token_provider=lambda: "tok",
+        blob_service_client=_BlobService(),
+        page_size=1,
+        work_registry=Registry(),
+        owner_instance_id="owner-1",
+    )
+
+    assert events == ["read-work", "verify-operation", "finalize"]
+    assert outcome.succeeded == 1
+
+
+def test_audio_poll_does_not_finalize_unregistered_transcribing_document(
+    monkeypatch: Any,
+) -> None:
+    from ingestion.lifecycle_repository import AudioTranscribingPage, AudioTranscribingRef
+
+    ref = AudioTranscribingRef(
+        "audio-legacy", "source:run-1", DocumentStatus.PROCESSING,
+        DocumentStage.TRANSCRIBING,
+    )
+    lifecycle = SimpleNamespace(
+        list_transcribing_documents_page=lambda **_kwargs: AudioTranscribingPage((ref,), None),
+    )
+    monkeypatch.setattr(
+        services,
+        "finalize_audio_transcription",
+        lambda *_args, **_kwargs: pytest.fail("unregistered audio must not be mutated"),
+    )
+
+    outcome, _ = services.run_audio_transcription_poll_page(
+        _batch_config(),
+        _Repository(),
+        lifecycle,
+        _Connector(),
+        None,
+        object(),
+        speech_token_provider=lambda: "tok",
+        blob_service_client=_BlobService(),
+        page_size=1,
+        work_registry=object(),
+        owner_instance_id="owner-1",
+    )
+
+    assert outcome.pending == 1
+    assert outcome.succeeded == 0
+
+
+@pytest.mark.parametrize(
+    ("status", "result"),
+    [(DocumentStatus.READY, "succeeded"), (DocumentStatus.FAILED, "failed")],
+)
+def test_audio_poll_page_emits_only_verified_terminal_work(
+    monkeypatch: Any,
+    status: DocumentStatus,
+    result: str,
+) -> None:
+    from ingestion.lifecycle_repository import AudioTranscribingPage, AudioTranscribingRef
+
+    ref = AudioTranscribingRef(
+        "doc-1", "source:run-1", status, DocumentStage.TERMINAL, "work-1", "attempt-1",
+    )
+    lifecycle = SimpleNamespace(
+        list_transcribing_documents_page=lambda **_kwargs: AudioTranscribingPage((ref,), None),
+    )
+    repository = _Repository()
+    repository.stored_document = VersionedRecord(SimpleNamespace(
+        status=status,
+        stage=DocumentStage.TERMINAL,
+        transcription_work_id="work-1",
+        transcription_attempt_id="attempt-1",
+    ), "etag-terminal")
+    monkeypatch.setattr(
+        services,
+        "finalize_audio_transcription",
+        lambda *_args, **_kwargs: pytest.fail("terminal documents must be reconciled, not finalized again"),
+    )
+
+    outcome, token = services.run_audio_transcription_poll_page(
+        _batch_config(), repository, lifecycle, _Connector(), None, object(),
+        speech_token_provider=lambda: "tok", blob_service_client=_BlobService(),
+        page_size=20,
+    )
+
+    assert token is None
+    assert outcome.terminal_work == (
+        services.AudioWorkSettlement("source:run-1", "doc-1", "work-1", "attempt-1", result),
+    )
+
+
+def test_audio_poll_page_keeps_pending_or_mismatched_finalization_unsettled(
+    monkeypatch: Any,
+) -> None:
+    from ingestion.lifecycle_repository import AudioTranscribingPage, AudioTranscribingRef
+
+    pending_ref = AudioTranscribingRef(
+        "doc-pending", "source:run-1", DocumentStatus.PROCESSING,
+        DocumentStage.TRANSCRIBING, "work-pending", "attempt-pending",
+    )
+    terminal_ref = AudioTranscribingRef(
+        "doc-mismatch", "source:run-1", DocumentStatus.READY,
+        DocumentStage.TERMINAL, "work-mismatch", "attempt-mismatch",
+    )
+    lifecycle = SimpleNamespace(
+        list_transcribing_documents_page=lambda **_kwargs: AudioTranscribingPage(
+            (pending_ref, terminal_ref), None,
+        ),
+    )
+    repository = _Repository()
+    repository.stored_document = VersionedRecord(SimpleNamespace(
+        status=DocumentStatus.READY,
+        stage=DocumentStage.TERMINAL,
+        transcription_work_id="work-mismatch",
+        transcription_attempt_id="different-attempt",
+    ), "etag-mismatch")
+    monkeypatch.setattr(services, "finalize_audio_transcription", lambda *_a, **_k: "pending")
+
+    outcome, _ = services.run_audio_transcription_poll_page(
+        _batch_config(), repository, lifecycle, _Connector(), None, object(),
+        speech_token_provider=lambda: "tok", blob_service_client=_BlobService(),
+        page_size=20,
+    )
+
+    assert outcome.pending == 2
+    assert outcome.terminal_work == ()

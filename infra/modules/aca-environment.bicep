@@ -23,7 +23,7 @@ resource environment 'Microsoft.App/managedEnvironments@2024-03-01' = {
   properties: {
     vnetConfiguration: {
       infrastructureSubnetId: infrastructureSubnetId
-      internal: true
+      internal: false
     }
     appLogsConfiguration: {
       destination: 'log-analytics'

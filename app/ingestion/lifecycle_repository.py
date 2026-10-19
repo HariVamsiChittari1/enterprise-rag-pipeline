@@ -19,11 +19,14 @@ from typing import Any, Mapping
 from azure.core import MatchConditions
 
 from ingestion.models import (
-    DocumentStage,
-    DocumentStatus,
     RETIRED_REASONS,
     SOURCE_DOCUMENT_RECORD_TYPE,
     VISUAL_MANIFEST_PAGE_RECORD_TYPE,
+    AclFeedback,
+    AclStatus,
+    DocumentStage,
+    DocumentStatus,
+    canonical_acl_feedback,
 )
 
 logger = logging.getLogger(__name__)
@@ -36,7 +39,6 @@ LIFECYCLE_RECONCILE_TRIGGER_ID = "lifecycle-reconcile-trigger"
 AUDIO_POLL_TRIGGER_ID = "audio-poll-trigger"
 MAX_PATCH_BATCH_OPERATIONS = 100
 MAX_PATCH_BATCH_ATTEMPTS = 3
-MAX_MANIFEST_CONFLICT_ATTEMPTS = 3
 PATCH_RETRY_BASE_SECONDS = 0.25
 TRANSIENT_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 504})
 INTERNAL_PAGE_SIZE = 100
@@ -62,9 +64,14 @@ class ReadyDocumentRef:
     allowed_group_ids: tuple[str, ...]
     acl_hash: str
     etag: str
+    acl_status: AclStatus = AclStatus.VERIFIED
+    acl_feedback: tuple[AclFeedback, ...] = ()
     source_etag: str | None = None
     lifecycle_generation: int = 0
     status: DocumentStatus = DocumentStatus.READY
+    source_id: str | None = None
+    drive_id: str | None = None
+    processing_profile_digest: str | None = None
 
 
 @dataclass(frozen=True)
@@ -86,6 +93,8 @@ class LifecycleDocumentRef:
     expected_chunk_count: int | None = None
     pending_allowed_group_ids: tuple[str, ...] | None = None
     pending_acl_hash: str | None = None
+    pending_acl_status: AclStatus | None = None
+    pending_acl_feedback: tuple[AclFeedback, ...] | None = None
     pending_retired_reason: str | None = None
 
 
@@ -103,10 +112,18 @@ class DuplicateDocumentPage:
 
 @dataclass(frozen=True)
 class AudioTranscribingRef:
-    """Minimal projection of an audio document awaiting batch transcription."""
+    """Minimal projection of a pending or terminal audio-work document."""
 
     document_id: str
     source_run_id: str
+    status: DocumentStatus = DocumentStatus.PROCESSING
+    stage: DocumentStage = DocumentStage.TRANSCRIBING
+    transcription_work_id: str | None = None
+    transcription_attempt_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if (self.transcription_work_id is None) != (self.transcription_attempt_id is None):
+            raise ValueError("transcription work and attempt IDs must be set together")
 
 
 @dataclass(frozen=True)
@@ -121,6 +138,7 @@ class ChunkManifestRef:
     document_key: str
     source_run_id: str
     document_id: str
+    source_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -141,19 +159,21 @@ class DocumentLifecycleRepository:
     def list_ready_documents_page(
         self,
         *,
+        source_id: str,
         page_size: int,
         continuation_token: str | None = None,
     ) -> ReadyDocumentPage:
         _validate_page_size(page_size)
         query = (
-            "SELECT c.documentId, c.sourceRunId, c.documentKey, c.itemId, "
-            "c.allowedGroupIds, c.aclHash, c.eTag, c.status, "
-            "c.lifecycleGeneration, c._etag FROM c "
-            "WHERE c.recordType = @recordType AND ("
+            "SELECT c.sourceId, c.driveId, c.documentId, c.sourceRunId, c.documentKey, c.itemId, "
+            "c.allowedGroupIds, c.aclHash, c.aclStatus, c.aclFeedback, c.eTag, c.status, "
+            "c.lifecycleGeneration, c.processingProfileDigest, c._etag FROM c "
+            "WHERE c.sourceId = @sourceId AND c.recordType = @recordType AND ("
             "ARRAY_CONTAINS(@statuses, c.status) OR "
             "(c.status = @retiredStatus AND c.retiredReason = @retiredReason))"
         )
         parameters = [
+            {"name": "@sourceId", "value": source_id},
             {
                 "name": "@statuses",
                 "value": [DocumentStatus.READY.value, DocumentStatus.ACL_REFRESHING.value],
@@ -174,15 +194,18 @@ class DocumentLifecycleRepository:
             raise LifecycleRepositoryError("Cosmos ready-document scan failed") from None
         return ReadyDocumentPage(tuple(_ready_ref_from_row(row) for row in page), token)
 
-    def find_ready_document_by_document_id(self, document_id: str) -> ReadyDocumentRef | None:
+    def find_ready_document_by_document_id(
+        self, source_id: str, document_id: str,
+    ) -> ReadyDocumentRef | None:
         query = (
-            "SELECT c.documentId, c.sourceRunId, c.documentKey, c.itemId, "
-            "c.allowedGroupIds, c.aclHash, c.eTag, c.status, "
-            "c.lifecycleGeneration, c._etag FROM c "
-            "WHERE c.recordType = @recordType "
+            "SELECT c.sourceId, c.driveId, c.documentId, c.sourceRunId, c.documentKey, c.itemId, "
+            "c.allowedGroupIds, c.aclHash, c.aclStatus, c.aclFeedback, c.eTag, c.status, "
+            "c.lifecycleGeneration, c.processingProfileDigest, c._etag FROM c "
+            "WHERE c.sourceId = @sourceId AND c.recordType = @recordType "
             "AND ARRAY_CONTAINS(@statuses, c.status) AND c.documentId = @documentId"
         )
         parameters = [
+            {"name": "@sourceId", "value": source_id},
             {
                 "name": "@statuses",
                 "value": [DocumentStatus.READY.value, DocumentStatus.ACL_REFRESHING.value],
@@ -207,17 +230,19 @@ class DocumentLifecycleRepository:
 
     def find_acl_revoked_document_by_document_id(
         self,
+        source_id: str,
         document_id: str,
     ) -> ReadyDocumentRef | None:
         query = (
-            "SELECT c.documentId, c.sourceRunId, c.documentKey, c.itemId, "
-            "c.allowedGroupIds, c.aclHash, c.eTag, c.status, "
+            "SELECT c.sourceId, c.driveId, c.documentId, c.sourceRunId, c.documentKey, c.itemId, "
+            "c.allowedGroupIds, c.aclHash, c.aclStatus, c.aclFeedback, c.eTag, c.status, "
             "c.lifecycleGeneration, c._etag, c._ts FROM c "
-            "WHERE c.recordType = @recordType AND c.status = @retiredStatus "
+            "WHERE c.sourceId = @sourceId AND c.recordType = @recordType AND c.status = @retiredStatus "
             "AND c.retiredReason = @retiredReason "
             "AND c.documentId = @documentId"
         )
         parameters = [
+            {"name": "@sourceId", "value": source_id},
             {"name": "@retiredStatus", "value": DocumentStatus.RETIRED.value},
             {"name": "@retiredReason", "value": "acl_revoked"},
             {"name": "@documentId", "value": document_id},
@@ -242,18 +267,21 @@ class DocumentLifecycleRepository:
     def is_authoritative_document_version(
         self,
         *,
+        source_id: str,
         document_id: str,
         source_run_id: str,
         source_etag: str,
     ) -> bool:
         query = (
             "SELECT c.sourceRunId, c.eTag, c.status, c._ts FROM c "
-            "WHERE c.recordType = @recordType AND c.documentId = @documentId"
+            "WHERE c.sourceId = @sourceId AND c.recordType = @recordType "
+            "AND c.documentId = @documentId"
         )
         try:
             rows = list(self._source_documents.query_items(
                 query=query,
                 parameters=[
+                    {"name": "@sourceId", "value": source_id},
                     {"name": "@documentId", "value": document_id},
                     {"name": "@recordType", "value": SOURCE_DOCUMENT_RECORD_TYPE},
                 ],
@@ -281,19 +309,22 @@ class DocumentLifecycleRepository:
     def list_lifecycle_transitions_page(
         self,
         *,
+        source_id: str,
         page_size: int,
         continuation_token: str | None = None,
     ) -> LifecycleDocumentPage:
         _validate_page_size(page_size)
         query = (
-            "SELECT c.documentId, c.sourceRunId, c.documentKey, c.status, "
+            "SELECT c.sourceId, c.driveId, c.documentId, c.sourceRunId, c.documentKey, c.status, "
             "c.lifecycleGeneration, c.allowedGroupIds, c.aclHash, "
             "c.expectedChunkCount, c.pendingAllowedGroupIds, c.pendingAclHash, "
+            "c.pendingAclStatus, c.pendingAclFeedback, "
             "c.pendingRetiredReason, c._etag FROM c "
-            "WHERE c.recordType = @recordType "
+            "WHERE c.sourceId = @sourceId AND c.recordType = @recordType "
             "AND ARRAY_CONTAINS(@statuses, c.status)"
         )
         parameters = [
+            {"name": "@sourceId", "value": source_id},
             {
                 "name": "@statuses",
                 "value": [
@@ -325,19 +356,33 @@ class DocumentLifecycleRepository:
     def list_transcribing_documents_page(
         self,
         *,
+        source_id: str,
         page_size: int,
         continuation_token: str | None = None,
+        settlement_only: bool = False,
     ) -> AudioTranscribingPage:
         """Page audio documents parked at PROCESSING/TRANSCRIBING for the batch poller."""
         _validate_page_size(page_size)
         query = (
-            "SELECT c.documentId, c.sourceRunId FROM c "
-            "WHERE c.recordType = @recordType AND c.status = @status AND c.stage = @stage"
+            "SELECT c.documentId, c.sourceRunId, c.status, c.stage, "
+            "c.transcriptionWorkId, c.transcriptionAttemptId FROM c "
+            "WHERE c.sourceId = @sourceId AND c.recordType = @recordType "
+            "AND ((c.status = @processing AND c.stage = @transcribing AND "
+            "(@settlementOnly = false OR "
+            "(IS_DEFINED(c.transcriptionWorkId) AND IS_DEFINED(c.transcriptionAttemptId)))) OR "
+            "(IS_DEFINED(c.transcriptionWorkId) AND IS_DEFINED(c.transcriptionAttemptId) AND "
+            "((c.status = @ready AND c.stage = @terminal) OR "
+            "(c.status = @failed AND c.stage = @terminal))))"
         )
         parameters = [
+            {"name": "@sourceId", "value": source_id},
             {"name": "@recordType", "value": SOURCE_DOCUMENT_RECORD_TYPE},
-            {"name": "@status", "value": DocumentStatus.PROCESSING.value},
-            {"name": "@stage", "value": DocumentStage.TRANSCRIBING.value},
+            {"name": "@processing", "value": DocumentStatus.PROCESSING.value},
+            {"name": "@transcribing", "value": DocumentStage.TRANSCRIBING.value},
+            {"name": "@ready", "value": DocumentStatus.READY.value},
+            {"name": "@failed", "value": DocumentStatus.FAILED.value},
+            {"name": "@terminal", "value": DocumentStage.TERMINAL.value},
+            {"name": "@settlementOnly", "value": settlement_only},
         ]
         try:
             iterator = self._source_documents.query_items(
@@ -351,27 +396,62 @@ class DocumentLifecycleRepository:
             raise LifecycleRepositoryError("Cosmos transcribing scan failed") from None
         return AudioTranscribingPage(
             tuple(
-                AudioTranscribingRef(row["documentId"], row["sourceRunId"])
+                AudioTranscribingRef(
+                    row["documentId"], row["sourceRunId"],
+                    DocumentStatus(row["status"]), DocumentStage(row["stage"]),
+                    row.get("transcriptionWorkId"), row.get("transcriptionAttemptId"),
+                )
                 for row in page
             ),
             token,
         )
 
+    def find_transcribing_document_by_document_id(
+        self,
+        source_id: str,
+        document_id: str,
+    ) -> Mapping[str, Any] | None:
+        query = (
+            "SELECT c.sourceId, c.driveId, c.sourceRunId, c.documentId, c.itemId, c.eTag "
+            "FROM c WHERE c.sourceId = @sourceId AND c.recordType = @recordType "
+            "AND c.documentId = @documentId AND c.status = @status AND c.stage = @stage"
+        )
+        try:
+            rows = list(self._source_documents.query_items(
+                query=query,
+                parameters=[
+                    {"name": "@sourceId", "value": source_id},
+                    {"name": "@recordType", "value": SOURCE_DOCUMENT_RECORD_TYPE},
+                    {"name": "@documentId", "value": document_id},
+                    {"name": "@status", "value": DocumentStatus.PROCESSING.value},
+                    {"name": "@stage", "value": DocumentStage.TRANSCRIBING.value},
+                ],
+                enable_cross_partition_query=True,
+                max_item_count=2,
+            ))
+        except Exception:
+            raise LifecycleRepositoryError("Cosmos pending-audio lookup failed") from None
+        if len(rows) > 1:
+            raise LifecycleRepositoryError("multiple pending audio versions for source document")
+        return rows[0] if rows else None
+
     def list_duplicate_ready_document_ids_page(
         self,
         *,
+        source_id: str,
         page_size: int,
         continuation_token: str | None = None,
     ) -> DuplicateDocumentPage:
         _validate_page_size(page_size)
         query = (
             "SELECT c.documentId FROM c "
-            "WHERE c.recordType = @recordType AND c.status = 'ready'"
+            "WHERE c.sourceId = @sourceId AND c.recordType = @recordType AND c.status = 'ready'"
         )
         try:
             iterator = self._source_documents.query_items(
                 query=query,
                 parameters=[
+                    {"name": "@sourceId", "value": source_id},
                     {"name": "@recordType", "value": SOURCE_DOCUMENT_RECORD_TYPE}
                 ],
                 enable_cross_partition_query=True,
@@ -397,45 +477,75 @@ class DocumentLifecycleRepository:
 
     def list_ready_document_versions(
         self,
+        source_id: str,
         document_id: str,
     ) -> tuple[ReadyDocumentRef, ...]:
+        """Compatibility wrapper returning every source-scoped physical document version."""
+        refs: list[ReadyDocumentRef] = []
+        continuation_token: str | None = None
+        while True:
+            page = self.list_ready_document_versions_page(
+                source_id=source_id,
+                document_id=document_id,
+                page_size=INTERNAL_PAGE_SIZE,
+                continuation_token=continuation_token,
+            )
+            refs.extend(page.items)
+            continuation_token = page.continuation_token
+            if continuation_token is None:
+                return tuple(refs)
+
+    def list_ready_document_versions_page(
+        self,
+        *,
+        source_id: str,
+        document_id: str,
+        page_size: int,
+        continuation_token: str | None = None,
+    ) -> ReadyDocumentPage:
+        """Page every source-scoped physical version, including non-ready/failed records."""
+        _validate_page_size(page_size)
         query = (
-            "SELECT c.documentId, c.sourceRunId, c.documentKey, c.itemId, "
-            "c.allowedGroupIds, c.aclHash, c.eTag, c.status, "
-            "c.lifecycleGeneration, c._etag FROM c "
-            "WHERE c.recordType = @recordType AND c.status = 'ready' "
+            "SELECT c.sourceId, c.driveId, c.documentId, c.sourceRunId, c.documentKey, c.itemId, "
+            "c.allowedGroupIds, c.aclHash, c.aclStatus, c.aclFeedback, c.eTag, c.status, "
+            "c.lifecycleGeneration, c.processingProfileDigest, c._etag FROM c "
+            "WHERE c.sourceId = @sourceId AND c.recordType = @recordType "
             "AND c.documentId = @documentId"
         )
         try:
-            rows = list(self._source_documents.query_items(
+            iterator = self._source_documents.query_items(
                 query=query,
                 parameters=[
+                    {"name": "@sourceId", "value": source_id},
                     {"name": "@documentId", "value": document_id},
                     {"name": "@recordType", "value": SOURCE_DOCUMENT_RECORD_TYPE},
                 ],
                 enable_cross_partition_query=True,
-                max_item_count=INTERNAL_PAGE_SIZE,
-            ))
+                max_item_count=page_size,
+            )
+            rows, token = _read_resumable_query_page(iterator, continuation_token)
         except Exception:
             raise LifecycleRepositoryError(
                 "Cosmos ready-version lookup failed"
             ) from None
-        return tuple(_ready_ref_from_row(row) for row in rows)
+        return ReadyDocumentPage(tuple(_ready_ref_from_row(row) for row in rows), token)
 
     def list_chunk_manifest_refs_page(
         self,
         *,
+        source_id: str,
         page_size: int,
         continuation_token: str | None = None,
     ) -> ChunkManifestPage:
         _validate_page_size(page_size)
         query = (
-            "SELECT c.id, c.documentKey, c.sourceRunId, c.documentId FROM c"
+            "SELECT c.id, c.sourceId, c.documentKey, c.sourceRunId, c.documentId FROM c "
+            "WHERE c.sourceId = @sourceId"
         )
         try:
             iterator = self._search_chunks.query_items(
                 query=query,
-                parameters=[],
+                parameters=[{"name": "@sourceId", "value": source_id}],
                 enable_cross_partition_query=True,
                 max_item_count=page_size,
             )
@@ -450,6 +560,7 @@ class DocumentLifecycleRepository:
                     document_key=row["documentKey"],
                     source_run_id=row["sourceRunId"],
                     document_id=row["documentId"],
+                    source_id=row.get("sourceId"),
                 ))
             except KeyError as error:
                 raise LifecycleRepositoryError(
@@ -459,91 +570,6 @@ class DocumentLifecycleRepository:
 
     def delete_orphan_chunk(self, *, chunk_id: str, document_key: str) -> None:
         self._delete_item(self._search_chunks, chunk_id, document_key)
-
-    def fail_timed_out_document(
-        self,
-        *,
-        source_run_id: str,
-        document_id: str,
-        error_code: str,
-    ) -> bool:
-        if not isinstance(error_code, str) or not error_code.strip() or len(error_code) > 100:
-            raise ValueError("error_code must be between 1 and 100 characters")
-        timeout_statuses = {
-            DocumentStatus.DISCOVERED.value,
-            DocumentStatus.PROCESSING.value,
-            DocumentStatus.ADMITTING.value,
-            DocumentStatus.READY.value,
-        }
-        timed_out: Mapping[str, Any] | None = None
-        for _ in range(MAX_MANIFEST_CONFLICT_ATTEMPTS):
-            try:
-                current = self._read_document(source_run_id, document_id)
-            except LifecycleConflictError:
-                return False
-            status = current.get("status")
-            if status == DocumentStatus.FAILED.value:
-                error = current.get("error")
-                if (
-                    not isinstance(error, Mapping)
-                    or error.get("code") != error_code.strip()
-                    or error.get("stage") != "orchestration"
-                ):
-                    return False
-                timed_out = current
-                break
-            if status not in timeout_statuses:
-                return False
-            now = _now_iso()
-            generation = _require_generation(current) + 1
-            try:
-                timed_out = self._source_documents.patch_item(
-                    item=document_id,
-                    partition_key=source_run_id,
-                    patch_operations=[
-                        {"op": "set", "path": "/status", "value": DocumentStatus.FAILED.value},
-                        {"op": "set", "path": "/stage", "value": "terminal"},
-                        {"op": "set", "path": "/lifecycleGeneration", "value": generation},
-                        {"op": "set", "path": "/readyAt", "value": None},
-                        {"op": "set", "path": "/failedAt", "value": now},
-                        {
-                            "op": "set",
-                            "path": "/error",
-                            "value": {
-                                "code": error_code.strip(),
-                                "stage": "orchestration",
-                                "retryable": True,
-                            },
-                        },
-                        {"op": "set", "path": "/updatedAt", "value": now},
-                    ],
-                    filter_predicate=(
-                        "from c where c.status = 'discovered' OR "
-                        "c.status = 'processing' OR c.status = 'admitting' OR "
-                        "c.status = 'ready'"
-                    ),
-                    etag=_require_etag(current, "document timeout closure"),
-                    match_condition=MatchConditions.IfNotModified,
-                )
-                break
-            except Exception as error:
-                if _error_status(error) == 412:
-                    continue
-                if _error_status(error) == 404:
-                    return False
-                raise LifecycleRepositoryError("Cosmos document timeout closure failed") from None
-        if timed_out is None:
-            raise LifecycleConflictError("document kept changing during timeout closure")
-
-        document_key = timed_out.get("documentKey")
-        if not isinstance(document_key, str) or not document_key:
-            raise LifecycleRepositoryError("Cosmos timed-out document key is malformed")
-        self.set_document_chunks_retrievable(
-            document_key=document_key,
-            lifecycle_generation=_require_generation(timed_out),
-            is_retrievable=False,
-        )
-        return True
 
     def retire_document(
         self,
@@ -558,9 +584,10 @@ class DocumentLifecycleRepository:
             raise ValueError("retired_reason must be one of the supported values")
         now = _now_iso()
         current = self._read_document(source_run_id, document_id)
+        current_status = current.get("status")
         generation = (
             _require_generation(current)
-            if current.get("status") == DocumentStatus.RETIRING.value
+            if current_status == DocumentStatus.RETIRING.value
             else _require_generation(current) + 1
         )
         begin_operations = [
@@ -575,7 +602,8 @@ class DocumentLifecycleRepository:
                 partition_key=source_run_id,
                 patch_operations=begin_operations,
                 filter_predicate=(
-                    "from c where c.status = 'ready' OR c.status = 'retiring'"
+                    "from c where c.status = 'ready' OR "
+                    "c.status = 'acl_refreshing' OR c.status = 'retiring'"
                 ),
                 etag=etag,
                 match_condition=MatchConditions.IfNotModified,
@@ -597,6 +625,16 @@ class DocumentLifecycleRepository:
             {"op": "set", "path": "/updatedAt", "value": now},
             {"op": "remove", "path": "/pendingRetiredReason"},
         ]
+        for pending_acl_field in (
+            "pendingAllowedGroupIds",
+            "pendingAclHash",
+            "pendingAclStatus",
+            "pendingAclFeedback",
+        ):
+            if pending_acl_field in current:
+                complete_operations.append(
+                    {"op": "remove", "path": f"/{pending_acl_field}"}
+                )
         try:
             self._source_documents.patch_item(
                 item=document_id,
@@ -613,6 +651,55 @@ class DocumentLifecycleRepository:
                 "Cosmos document retirement completion failed"
             ) from None
 
+    def list_source_documents_for_deletion_page(
+        self, *, source_id: str, page_size: int,
+    ) -> LifecycleDocumentPage:
+        """Read a bounded page of all source-document states for source retirement."""
+        _validate_page_size(page_size)
+        try:
+            iterator = self._source_documents.query_items(
+                query=(
+                    "SELECT TOP @pageSize c.documentId, c.sourceRunId, c.documentKey, "
+                    "c.status, c.lifecycleGeneration, c.allowedGroupIds, c.aclHash, "
+                    "c.pendingAclStatus, c.pendingAclFeedback, c._etag FROM c "
+                    "WHERE c.sourceId = @sourceId AND c.recordType = @recordType"
+                ),
+                parameters=[
+                    {"name": "@pageSize", "value": page_size},
+                    {"name": "@sourceId", "value": source_id},
+                    {"name": "@recordType", "value": SOURCE_DOCUMENT_RECORD_TYPE},
+                ],
+                enable_cross_partition_query=True,
+                max_item_count=page_size,
+            )
+            rows = list(iterator)
+        except Exception as error:
+            raise LifecycleRepositoryError("Cosmos source-retirement scan failed") from error
+        return LifecycleDocumentPage(tuple(_lifecycle_ref_from_row(row) for row in rows), None)
+
+    def delete_source_chunks_page(self, *, source_id: str, page_size: int) -> int:
+        """Delete remaining source chunks, including orphan chunks."""
+        _validate_page_size(page_size)
+        try:
+            iterator = self._search_chunks.query_items(
+                query=(
+                    "SELECT TOP @pageSize c.id, c.documentKey FROM c "
+                    "WHERE c.sourceId = @sourceId"
+                ),
+                parameters=[
+                    {"name": "@pageSize", "value": page_size},
+                    {"name": "@sourceId", "value": source_id},
+                ],
+                enable_cross_partition_query=True,
+                max_item_count=page_size,
+            )
+            rows = list(iterator)
+        except Exception as error:
+            raise LifecycleRepositoryError("Cosmos source chunk retirement scan failed") from error
+        for row in rows:
+            self._delete_item(self._search_chunks, row["id"], row["documentKey"])
+        return len(rows)
+
     def refresh_document_acl(
         self,
         *,
@@ -622,7 +709,13 @@ class DocumentLifecycleRepository:
         etag: str,
         allowed_group_ids: tuple[str, ...],
         acl_hash: str,
+        acl_status: AclStatus = AclStatus.VERIFIED,
+        acl_feedback: tuple[AclFeedback, ...] = (),
     ) -> None:
+        if acl_status is not AclStatus.VERIFIED:
+            raise ValueError("ACL refresh requires verified status")
+        if canonical_acl_feedback(acl_feedback) != acl_feedback:
+            raise ValueError("acl_feedback must be sorted and unique")
         now = _now_iso()
         current = self._read_document(source_run_id, document_id)
         generation = (
@@ -639,6 +732,12 @@ class DocumentLifecycleRepository:
                 "value": list(allowed_group_ids),
             },
             {"op": "set", "path": "/pendingAclHash", "value": acl_hash},
+            {"op": "set", "path": "/pendingAclStatus", "value": acl_status.value},
+            {
+                "op": "set",
+                "path": "/pendingAclFeedback",
+                "value": [value.value for value in acl_feedback],
+            },
             {"op": "set", "path": "/updatedAt", "value": now},
         ]
         if (
@@ -686,12 +785,20 @@ class DocumentLifecycleRepository:
         complete_patch = [
             {"op": "set", "path": "/allowedGroupIds", "value": list(allowed_group_ids)},
             {"op": "set", "path": "/aclHash", "value": acl_hash},
+            {"op": "set", "path": "/aclStatus", "value": acl_status.value},
+            {
+                "op": "set",
+                "path": "/aclFeedback",
+                "value": [value.value for value in acl_feedback],
+            },
             {"op": "set", "path": "/aclEvaluatedAt", "value": now},
             {"op": "set", "path": "/status", "value": DocumentStatus.READY.value},
             {"op": "set", "path": "/lifecycleGeneration", "value": generation},
             {"op": "set", "path": "/updatedAt", "value": now},
             {"op": "remove", "path": "/pendingAllowedGroupIds"},
             {"op": "remove", "path": "/pendingAclHash"},
+            {"op": "remove", "path": "/pendingAclStatus"},
+            {"op": "remove", "path": "/pendingAclFeedback"},
         ]
         try:
             self._source_documents.patch_item(
@@ -706,6 +813,44 @@ class DocumentLifecycleRepository:
             if _error_status(error) in (404, 412):
                 raise LifecycleConflictError("document changed during ACL refresh") from None
             raise LifecycleRepositoryError("Cosmos document ACL refresh completion failed") from None
+
+    def update_document_acl_feedback(
+        self,
+        *,
+        source_run_id: str,
+        document_id: str,
+        etag: str,
+        acl_status: AclStatus,
+        acl_feedback: tuple[AclFeedback, ...],
+    ) -> None:
+        """Persist non-authorizing ACL observations without touching chunks or generation."""
+        if acl_status is not AclStatus.VERIFIED:
+            raise ValueError("ACL feedback update requires verified status")
+        if canonical_acl_feedback(acl_feedback) != acl_feedback:
+            raise ValueError("acl_feedback must be sorted and unique")
+        now = _now_iso()
+        try:
+            self._source_documents.patch_item(
+                item=document_id,
+                partition_key=source_run_id,
+                patch_operations=[
+                    {"op": "set", "path": "/aclStatus", "value": acl_status.value},
+                    {
+                        "op": "set",
+                        "path": "/aclFeedback",
+                        "value": [value.value for value in acl_feedback],
+                    },
+                    {"op": "set", "path": "/aclEvaluatedAt", "value": now},
+                    {"op": "set", "path": "/updatedAt", "value": now},
+                ],
+                filter_predicate="from c where c.status = 'ready'",
+                etag=etag,
+                match_condition=MatchConditions.IfNotModified,
+            )
+        except Exception as error:
+            if _error_status(error) in (404, 412):
+                raise LifecycleConflictError("document already changed or missing") from None
+            raise LifecycleRepositoryError("Cosmos document ACL feedback update failed") from None
 
     def set_document_chunks_retrievable(
         self,
@@ -841,6 +986,7 @@ class DocumentLifecycleRepository:
         document_id: str,
         document_key: str,
         etag: str,
+        allow_unready: bool = False,
     ) -> None:
         try:
             current = self._read_document(source_run_id, document_id)
@@ -861,7 +1007,10 @@ class DocumentLifecycleRepository:
                     {"op": "set", "path": "/updatedAt", "value": _now_iso()},
                 ],
                 filter_predicate=(
-                    "from c where c.status = 'ready' OR c.status = 'deleting'"
+                    "from c where IS_DEFINED(c.status)"
+                    if allow_unready
+                    else "from c where c.status = 'ready' OR c.status = 'deleting' "
+                    "OR c.status = 'retired' OR c.status = 'failed'"
                 ),
                 etag=etag,
                 match_condition=MatchConditions.IfNotModified,
@@ -1130,6 +1279,30 @@ class DocumentLifecycleRepository:
         except Exception:
             raise LifecycleRepositoryError("Cosmos webhook subscription save failed") from None
 
+    def clear_webhook_subscription_id(self, source_id: str) -> None:
+        try:
+            current = self._ingestion_runs.read_item(
+                item=WEBHOOK_CONTROL_ID,
+                partition_key=source_id,
+            )
+        except Exception as error:
+            if _error_status(error) == 404:
+                return
+            raise LifecycleRepositoryError("Cosmos webhook subscription read failed") from None
+        try:
+            self._ingestion_runs.delete_item(
+                item=WEBHOOK_CONTROL_ID,
+                partition_key=source_id,
+                etag=current.get("_etag"),
+                match_condition=MatchConditions.IfNotModified,
+            )
+        except Exception as error:
+            if _error_status(error) == 404:
+                return
+            if _error_status(error) == 412:
+                raise LifecycleConflictError("webhook subscription changed during deletion") from None
+            raise LifecycleRepositoryError("Cosmos webhook subscription delete failed") from None
+
 
 def _ready_ref_from_row(row: Mapping[str, Any]) -> ReadyDocumentRef:
     try:
@@ -1141,11 +1314,20 @@ def _ready_ref_from_row(row: Mapping[str, Any]) -> ReadyDocumentRef:
             allowed_group_ids=tuple(row["allowedGroupIds"]),
             acl_hash=row["aclHash"],
             etag=row["_etag"],
+            acl_status=AclStatus(row.get("aclStatus", AclStatus.PENDING.value)),
+            acl_feedback=_acl_feedback(row.get("aclFeedback", [])),
             source_etag=row.get("eTag") if isinstance(row.get("eTag"), str) else None,
             lifecycle_generation=_require_generation(row),
             status=DocumentStatus(row.get("status", DocumentStatus.READY.value)),
+            source_id=row.get("sourceId") if isinstance(row.get("sourceId"), str) else None,
+            drive_id=row.get("driveId") if isinstance(row.get("driveId"), str) else None,
+            processing_profile_digest=(
+                row.get("processingProfileDigest")
+                if isinstance(row.get("processingProfileDigest"), str)
+                else None
+            ),
         )
-    except (KeyError, ValueError) as error:
+    except (KeyError, TypeError, ValueError) as error:
         raise LifecycleRepositoryError("ready-document row is missing an expected field") from error
 
 
@@ -1200,6 +1382,14 @@ def _lifecycle_ref_from_row(row: Mapping[str, Any]) -> LifecycleDocumentRef:
                 if isinstance(row.get("pendingAclHash"), str)
                 else None
             ),
+            pending_acl_status=(
+                AclStatus(row["pendingAclStatus"])
+                if row.get("pendingAclStatus") is not None else None
+            ),
+            pending_acl_feedback=(
+                _acl_feedback(row["pendingAclFeedback"])
+                if row.get("pendingAclFeedback") is not None else None
+            ),
             pending_retired_reason=(
                 row.get("pendingRetiredReason")
                 if isinstance(row.get("pendingRetiredReason"), str)
@@ -1210,6 +1400,15 @@ def _lifecycle_ref_from_row(row: Mapping[str, Any]) -> LifecycleDocumentRef:
         raise LifecycleRepositoryError(
             "lifecycle-transition row is malformed"
         ) from error
+
+
+def _acl_feedback(value: Any) -> tuple[AclFeedback, ...]:
+    if not isinstance(value, list):
+        raise ValueError("persisted ACL feedback must be a list")
+    feedback = tuple(AclFeedback(item) for item in value)
+    if canonical_acl_feedback(feedback) != feedback:
+        raise ValueError("persisted ACL feedback must be sorted and unique")
+    return feedback
 
 
 def _error_status(error: Exception) -> int | None:

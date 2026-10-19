@@ -11,6 +11,9 @@ WORKDIR /app
 
 COPY --from=builder /deps /usr/local/lib/python3.12/site-packages
 COPY retrieval/ retrieval/
+COPY azure_credentials.py ./azure_credentials.py
+COPY source_registry.py ./source_registry.py
+COPY cosmos_connection.py ./cosmos_connection.py
 
 USER agent
 EXPOSE 8080

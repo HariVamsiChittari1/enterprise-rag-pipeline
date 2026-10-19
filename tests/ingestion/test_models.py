@@ -4,20 +4,18 @@ from dataclasses import replace
 from datetime import datetime, timezone
 
 import pytest
-
 from ingestion.models import (
+    ACL_POLICY_VERSION,
+    AclFeedback,
+    AclStatus,
+    ActivityOutcome,
+    ActivityStatus,
     AudioMetadata,
     AudioOperationRecord,
     AudioOperationState,
+    AudioTranscriptDescriptor,
     AudioTranscriptPage,
     AudioTranscriptSegment,
-    AudioTranscriptDescriptor,
-    ACL_POLICY_VERSION,
-    create_audio_transcript_descriptor,
-    verify_audio_transcript_descriptor,
-    verified_acl_hash,
-    ActivityOutcome,
-    ActivityStatus,
     CanonicalExtractionResult,
     CanonicalSegment,
     ChunkingProfile,
@@ -37,19 +35,21 @@ from ingestion.models import (
     RunStatus,
     SearchChunkRecord,
     Settings,
-    SourceLocator,
     SourceControlRecord,
     SourceDocumentRecord,
-    VisualDisposition,
+    SourceLocator,
     VisualCoverage,
     VisualCoverageStatus,
+    VisualDisposition,
     VisualManifestEntry,
     VisualRelevance,
-    canonical_group_ids,
     audio_transcript_hash,
+    canonical_acl_feedback,
+    canonical_group_ids,
     content_sha256,
     create_audio_control_partition_id,
     create_audio_operation_id,
+    create_audio_transcript_descriptor,
     create_chunk_id,
     create_document_id,
     create_document_key,
@@ -59,9 +59,10 @@ from ingestion.models import (
     run_record_id,
     safe_error_from_exception,
     serialized_size_bytes,
+    verified_acl_hash,
+    verify_audio_transcript_descriptor,
     visual_manifest_hash,
 )
-
 
 UTC = "2026-08-05T12:00:00Z"
 
@@ -528,6 +529,7 @@ def test_audio_descriptor_rejects_oversize_acl_provenance() -> None:
 
 def test_audio_manifest_and_chunk_round_trip_to_compatible_reader() -> None:
     from unittest.mock import Mock
+
     from retrieval.cosmos import SecureCosmosRetriever
 
     metadata = audio_metadata()
@@ -639,6 +641,9 @@ def test_identifiers_are_deterministic_and_run_scoped() -> None:
 
     assert first_document_id == second_document_id
     assert len(first_document_id) == 64
+    assert create_document_id("source", "drive-a", "same-item") != create_document_id(
+        "source", "drive-b", "same-item",
+    )
     assert create_document_key("source", "run-a", first_document_id) != create_document_key(
         "source", "run-b", first_document_id
     )
@@ -659,6 +664,19 @@ def test_acl_groups_are_nonempty_sorted_and_unique() -> None:
     assert canonical_group_ids(["group-b", "group-a", "group-a"]) == ("group-a", "group-b")
     with pytest.raises(ValueError, match="at least one"):
         canonical_group_ids([])
+
+
+def test_acl_feedback_is_typed_sorted_and_unique() -> None:
+    assert canonical_acl_feedback([
+        AclFeedback.SHARED_LINK,
+        AclFeedback.DIRECT_USER,
+        AclFeedback.SHARED_LINK,
+    ]) == (
+        AclFeedback.DIRECT_USER,
+        AclFeedback.SHARED_LINK,
+    )
+    with pytest.raises(ValueError, match="invalid value"):
+        canonical_acl_feedback(["SharedLink"])  # type: ignore[list-item]
 
 
 def test_source_control_serializes_to_cosmos_field_names() -> None:
@@ -720,11 +738,47 @@ def test_document_record_enforces_deterministic_keys() -> None:
     assert item["sourceRunId"] == "source:run-a"
     assert item["recordType"] == "source_document"
     assert item["allowedGroupIds"] == ["group-a"]
+    assert item["aclStatus"] == "Pending"
+    assert item["aclFeedback"] == []
     assert item["status"] == "discovered"
 
 
+def test_verified_document_acl_requires_canonical_typed_feedback() -> None:
+    record = SourceDocumentRecord(**(
+        document_values()
+        | {
+            "acl_status": AclStatus.VERIFIED,
+            "acl_feedback": (
+                AclFeedback.DIRECT_USER,
+                AclFeedback.SHARED_LINK,
+            ),
+        }
+    ))
+
+    item = record.to_cosmos_item()
+    assert item["aclStatus"] == "Verified"
+    assert item["aclFeedback"] == ["DirectUser", "SharedLink"]
+    assert item["allowedGroupIds"] == ["group-a"]
+    assert item["aclHash"] == content_sha256("group-a")
+
+    with pytest.raises(ValueError, match="sorted and unique"):
+        replace(
+            record,
+            acl_feedback=(
+                AclFeedback.SHARED_LINK,
+                AclFeedback.DIRECT_USER,
+            ),
+        )
+    with pytest.raises(ValueError, match="invalid value"):
+        replace(record, acl_feedback=("SharedLink",))  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="acl_status is invalid"):
+        replace(record, acl_status="Verified")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="cannot be empty"):
+        replace(record, allowed_group_ids=())
+
+
 def test_visual_manifest_pages_are_deterministic_and_size_bounded() -> None:
-    document = build_document_record()
+    document = replace(build_document_record(), business_name="Business A")
     entries = tuple(
         VisualManifestEntry(
             ordinal=index,
@@ -747,6 +801,9 @@ def test_visual_manifest_pages_are_deterministic_and_size_bounded() -> None:
     assert tuple(page.page_index for page in pages) == tuple(range(len(pages)))
     assert all(page.page_count == len(pages) for page in pages)
     assert all(page.record_type == "visual_manifest_page" for page in pages)
+    assert all(page.business_name == "Business A" for page in pages)
+    assert document.to_cosmos_item()["businessName"] == "Business A"
+    assert all(page.to_cosmos_item()["businessName"] == "Business A" for page in pages)
     assert all(serialized_size_bytes(page.to_cosmos_item()) <= 128 * 1024 for page in pages)
     assert visual_manifest_hash(pages) == visual_manifest_hash(replay)
 
@@ -857,6 +914,10 @@ def test_retired_document_requires_retirement_fields_and_prior_ready_state() -> 
     )
     record = SourceDocumentRecord(**values)
     assert record.to_cosmos_item()["retiredReason"] == "superseded"
+    replacement_failed = SourceDocumentRecord(
+        **dict(values, retired_reason="replacement_failed")
+    )
+    assert replacement_failed.to_cosmos_item()["retiredReason"] == "replacement_failed"
 
     missing_fields = dict(values, retired_at=None, retired_reason=None)
     with pytest.raises(ValueError, match="retired documents require"):
@@ -938,9 +999,13 @@ def test_safe_error_mapping_never_serializes_exception_text() -> None:
     assert "secret" not in str(error)
 
 
-def test_failed_activity_requires_safe_error() -> None:
+@pytest.mark.parametrize(
+    "status",
+    [ActivityStatus.FAILED, ActivityStatus.QUARANTINED],
+)
+def test_failed_activity_requires_safe_error(status: ActivityStatus) -> None:
     with pytest.raises(ValueError, match="require a safe error"):
-        ActivityOutcome("a" * 64, ActivityStatus.FAILED, 0, 2)
+        ActivityOutcome("a" * 64, status, 0, 2)
 
 
 def build_document_record() -> SourceDocumentRecord:

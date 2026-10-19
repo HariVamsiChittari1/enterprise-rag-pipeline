@@ -200,7 +200,7 @@ def _manifest_extras() -> dict[str, Any]:
 
 def _provider(profiles: dict[str, ScoringProfile]) -> SimpleNamespace:
     return SimpleNamespace(snapshot=RuntimeCatalogSnapshot(
-        deployment_instance_id="test", catalog_id="runtime-catalog", etag="etag-a",
+        catalog_id="runtime-catalog", etag="etag-a",
         digest="sha256:" + "a" * 64, operation_id="operation-a",
         changed_at="2026-09-08T00:00:00Z", accepted_at=datetime(2026, 9, 8, tzinfo=timezone.utc),
         over_fetch_factor=1, hybrid_weights=(1, 1), full_text_score_scope="Global",

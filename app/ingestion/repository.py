@@ -14,6 +14,10 @@ from azure.core import MatchConditions
 logger = logging.getLogger(__name__)
 
 from ingestion.models import (
+    SOURCE_DOCUMENT_RECORD_TYPE,
+    VISUAL_MANIFEST_PAGE_RECORD_TYPE,
+    AclFeedback,
+    AclStatus,
     AudioMetadata,
     AudioOperationRecord,
     AudioOperationState,
@@ -27,8 +31,8 @@ from ingestion.models import (
     EnrichmentProfile,
     EnrichmentStatuses,
     Entity,
-    ExtractionProvenance,
     ExtractionProfile,
+    ExtractionProvenance,
     IngestionRunRecord,
     LocatorKind,
     ModuleStatus,
@@ -37,18 +41,15 @@ from ingestion.models import (
     RunStage,
     RunStatus,
     SafeError,
-    ScaleLimits,
     SearchChunkRecord,
-    SOURCE_DOCUMENT_RECORD_TYPE,
     SourceControlRecord,
     SourceDocumentRecord,
     SourceLocator,
-    VisualDisposition,
     VisualCoverageStatus,
+    VisualDisposition,
     VisualManifestEntry,
     VisualManifestPage,
     VisualRelevance,
-    VISUAL_MANIFEST_PAGE_RECORD_TYPE,
     create_audio_control_partition_id,
     create_chunk_id,
     create_source_run_id,
@@ -56,7 +57,6 @@ from ingestion.models import (
     serialized_size_bytes,
     visual_manifest_hash,
 )
-
 
 RecordT = TypeVar("RecordT")
 MAX_BATCH_OPERATIONS = 100
@@ -284,6 +284,13 @@ class IngestionRepository:
             current.record.activated_at
         ):
             raise RepositoryConflictError("run activation is stale")
+        if current is not None:
+            active_run = self.get_run(
+                run.source_id,
+                current.record.current_run_id,
+            )
+            if active_run is None or active_run.record.status is RunStatus.RUNNING:
+                raise RepositoryConflictError("source already has unresolved active work")
 
         operations: list[tuple[Any, ...]] = [("create", (run.to_cosmos_item(),))]
         if current is None:
@@ -319,6 +326,7 @@ class IngestionRepository:
     ) -> VersionedRecord[SourceDocumentRecord]:
         if document.status is not DocumentStatus.DISCOVERED or document.stage is not DocumentStage.DISCOVERED:
             raise ValueError("new source documents must be discovered")
+        _require_business_name_for_new_record(document.business_name, "source document")
         try:
             self._source_documents.create_item(body=document.to_cosmos_item())
         except Exception as error:
@@ -376,7 +384,51 @@ class IngestionRepository:
                 "audio",
                 "transcriptionJobUrl",
                 "stagingBlobName",
+                "transcriptionWorkId",
+                "transcriptionAttemptId",
             },
+        )
+
+    def clear_transcription_work_identity(
+        self,
+        source_run_id: str,
+        document_id: str,
+        work_id: str,
+        attempt_id: str,
+    ) -> bool:
+        """Clear a settled audio permit pointer after verifying terminal document state."""
+        stored = self.get_document(source_run_id, document_id)
+        if stored is None:
+            return False
+        record = stored.record
+        if record.transcription_work_id is None and record.transcription_attempt_id is None:
+            return True
+        if (
+            record.transcription_work_id != work_id
+            or record.transcription_attempt_id != attempt_id
+        ):
+            raise RepositoryConflictError("transcription work identity changed")
+        if (
+            record.status not in {DocumentStatus.READY, DocumentStatus.FAILED}
+            or record.stage is not DocumentStage.TERMINAL
+        ):
+            return False
+        cleared = replace(
+            record,
+            transcription_work_id=None,
+            transcription_attempt_id=None,
+            updated_at=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        )
+        settled = self._replace_document(
+            cleared,
+            stored.etag,
+            expected_status=record.status,
+            allowed_status=record.status,
+            allowed_changes={"transcriptionWorkId", "transcriptionAttemptId", "updatedAt"},
+        )
+        return (
+            settled.record.transcription_work_id is None
+            and settled.record.transcription_attempt_id is None
         )
 
     def mark_document_failed(
@@ -412,6 +464,7 @@ class IngestionRepository:
             or not document.allowed_group_ids
             or not document.acl_hash
             or document.acl_evaluated_at is None
+            or document.acl_status is not AclStatus.VERIFIED
         ):
             raise ValueError("admitting document integrity fields are incomplete")
         if not is_audio:
@@ -427,6 +480,8 @@ class IngestionRepository:
                 "updatedAt",
                 "allowedGroupIds",
                 "aclHash",
+                "aclStatus",
+                "aclFeedback",
                 "aclEvaluatedAt",
                 "expectedChunkCount",
                 "writtenChunkCount",
@@ -482,26 +537,50 @@ class IngestionRepository:
 
     def get_failed_documents(self, source_id: str, run_id: str) -> list[dict[str, Any]]:
         """Return all failed documents for a given run."""
+        results: list[dict[str, Any]] = []
+        continuation_token: str | None = None
+        while True:
+            page = self.list_failed_documents_page(
+                source_id,
+                run_id,
+                page_size=INTERNAL_PAGE_SIZE,
+                continuation_token=continuation_token,
+            )
+            results.extend(page.items)
+            continuation_token = page.continuation_token
+            if continuation_token is None:
+                return results
+
+    def list_failed_documents_page(
+        self,
+        source_id: str,
+        run_id: str,
+        *,
+        page_size: int,
+        continuation_token: str | None = None,
+    ) -> QueryPage:
+        """Return one bounded failed-document page for retry orchestration."""
+        if isinstance(page_size, bool) or not isinstance(page_size, int) or page_size < 1:
+            raise ValueError("failed document page size must be positive")
         source_run_id = create_source_run_id(source_id, run_id)
         query = (
             "SELECT * FROM c WHERE c.sourceRunId = @sourceRunId "
-            "AND c.recordType = @recordType AND c.status = 'failed'"
+            "AND c.recordType = @recordType AND c.status = 'failed' "
+            "AND c.error.retryable = true"
         )
         parameters = [
             {"name": "@sourceRunId", "value": source_run_id},
             {"name": "@recordType", "value": SOURCE_DOCUMENT_RECORD_TYPE},
         ]
-        results: list[dict[str, Any]] = []
-        continuation: str | None = None
-        while True:
-            page, continuation = self._query_page(
-                self._source_documents, query, parameters,
-                source_run_id, INTERNAL_PAGE_SIZE, continuation,
-            )
-            results.extend(page)
-            if continuation is None:
-                break
-        return results
+        page, continuation = self._query_page(
+            self._source_documents,
+            query,
+            parameters,
+            source_run_id,
+            page_size,
+            continuation_token,
+        )
+        return QueryPage(tuple(page), continuation)
 
     def reset_failed_to_discovered(self, doc: dict[str, Any]) -> dict[str, Any] | None:
         """Reset a failed document back to discovered so it can be reprocessed."""
@@ -563,6 +642,7 @@ class IngestionRepository:
     ) -> int:
         validated = self._validate_visual_manifest_pages(pages)
         for page in validated:
+            _require_business_name_for_new_record(page.business_name, "visual manifest page")
             try:
                 self._source_documents.create_item(body=page.to_cosmos_item())
             except Exception as error:
@@ -588,6 +668,7 @@ class IngestionRepository:
             or document.ready_at is None
             or document.failed_at is not None
             or document.error is not None
+            or document.acl_status is not AclStatus.VERIFIED
         ):
             raise ValueError("ready document integrity fields are incomplete")
         # Audio documents have transcript chunks but no visual manifest to verify.
@@ -1035,8 +1116,6 @@ class IngestionRepository:
         validated = tuple(chunks)
         if any(not isinstance(chunk, SearchChunkRecord) for chunk in validated):
             raise TypeError("chunks must be SearchChunkRecord values")
-        if len(validated) > ScaleLimits().max_chunks_per_pdf:
-            raise ValueError("chunk input exceeds the schema-v1 document limit")
         first = validated[0]
         identity = (
             first.document_key,
@@ -1462,6 +1541,12 @@ def _document_from_item(item: Mapping[str, Any]) -> SourceDocumentRecord:
     values["status"] = DocumentStatus(values["status"])
     values["stage"] = DocumentStage(values["stage"])
     values["allowed_group_ids"] = tuple(values["allowed_group_ids"])
+    if "acl_status" in values:
+        values["acl_status"] = AclStatus(values["acl_status"])
+    if "acl_feedback" in values:
+        values["acl_feedback"] = tuple(
+            AclFeedback(feedback) for feedback in values["acl_feedback"]
+        )
     values.setdefault("source_modified_at", None)
     for _removed in ("quality_flags", "profiles", "acl_policy_version", "verified_at"):
         values.pop(_removed, None)
@@ -1552,6 +1637,14 @@ def _domain_item(item: Mapping[str, Any]) -> dict[str, Any]:
 
 def _same_domain(stored: Any, requested: Any) -> bool:
     return stored.to_cosmos_item() == requested.to_cosmos_item()
+
+
+def _require_business_name_for_new_record(
+    business_name: str | None,
+    record_name: str,
+) -> None:
+    if not isinstance(business_name, str) or not business_name.strip():
+        raise ValueError(f"new {record_name}s require business name")
 
 
 def _error_status(error: Exception) -> int | None:

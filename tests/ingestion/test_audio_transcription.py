@@ -157,7 +157,9 @@ def test_parsed_phrases_feed_existing_timed_chunker() -> None:
         phrase(text="Later first.", offsetMilliseconds=1000, durationMilliseconds=1000),
         phrase(text="Earlier second.", offsetMilliseconds=100, durationMilliseconds=1000),
     ]))
-    chunks = chunk_audio_segments(segments, audio_metadata())
+    chunks = chunk_audio_segments(
+        segments, audio_metadata(), max_chunks_per_source=2_000
+    )
     assert len(chunks) == 1
     assert chunks[0].content == "Later first.\nEarlier second."
     assert (chunks[0].locator.start_ms, chunks[0].locator.end_ms) == (100, 2000)

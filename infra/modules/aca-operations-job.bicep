@@ -31,9 +31,6 @@ param cosmosDatabaseName string
 @description('Retrieval configuration container name')
 param retrievalConfigContainerName string
 
-@description('Deployment instance partition key')
-param deploymentInstanceId string
-
 @description('Reviewed seed digest; used only for explicit initialization')
 @maxLength(71)
 param catalogDigest string = ''
@@ -88,7 +85,6 @@ resource job 'Microsoft.App/jobs@2024-03-01' = {
             { name: 'COSMOS_ENDPOINT', value: cosmosEndpoint }
             { name: 'COSMOS_DATABASE', value: cosmosDatabaseName }
             { name: 'RETRIEVAL_CONFIG_CONTAINER', value: retrievalConfigContainerName }
-            { name: 'DEPLOYMENT_INSTANCE_ID', value: deploymentInstanceId }
             { name: 'EXPECTED_CATALOG_DIGEST', value: catalogOperation == 'publish-catalog' ? catalogDigest : '' }
             { name: 'MANAGED_IDENTITY_CLIENT_ID', value: managedIdentityClientId }
           ]

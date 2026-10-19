@@ -66,6 +66,7 @@ infra/modules/*.json
 
 # Test outputs
 .pytest_cache/
+.ruff_cache/
 .coverage
 htmlcov/
 *.cover

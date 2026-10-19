@@ -41,8 +41,6 @@ def _config(**overrides: object) -> RetrievalConfig:
     values = dict(
         cosmos_endpoint="https://cosmos.example",
         cosmos_database="db",
-        cosmos_chunks_container="search-chunks",
-        cosmos_manifests_container="source-documents",
         cosmos_audit_container="service-audit",
         openai_endpoint="https://openai.example",
         embedding_deployment="embedding",
@@ -50,9 +48,6 @@ def _config(**overrides: object) -> RetrievalConfig:
         tenant_id="tenant",
         managed_identity_client_id="mi",
         retrieval_audience="api://retrieval-api",
-        gateway_client_id="33333333-3333-4333-8333-333333333333",
-        gateway_principal_id="44444444-4444-4444-8444-444444444444",
-        deployment_instance_id="instance-a",
         retrieval_timeout_seconds=5.0,
         generation_timeout_seconds=3.0,
         agent_timeout_seconds=8.0,
@@ -64,7 +59,6 @@ def _config(**overrides: object) -> RetrievalConfig:
         openai_api_version="2024-10-21",
         app_insights_connection_string=None,
         include_citations=True,
-        acl_enabled=True,
     )
     values.update(overrides)
     return RetrievalConfig(**values)
