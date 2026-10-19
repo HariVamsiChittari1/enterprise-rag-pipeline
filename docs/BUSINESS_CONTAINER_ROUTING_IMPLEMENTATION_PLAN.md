@@ -32,17 +32,20 @@ Done means:
 
 ## Status
 
-**Implementation status for this request: PARTIALLY STARTED.**
+**Implementation status for this request: COMPLETE IN THE DEVELOPMENT
+ENVIRONMENT (2026-10-18).**
 
-The codebase has completed the source contract, ingestion routing, selected-pair
-retrieval, and per-request ACL policy milestones. Later phases remain deferred
-until their implementation gates.
+All eight phases are complete for the approved development scope. Phase 7
+completed the guarded fresh-content cutover for all four approved sources, and
+Phase 8 completed the deployed acceptance matrix, repository validation,
+review, and handoff. The fresh deployed guest reauthentication limitation is
+recorded under T21 and does not change the current zero-authority evidence.
+Temporary catalog-job retirement, production capacity work, and Agent/OBO
+authentication remain separate decision-gated follow-ups.
 
-This file is the execution plan. The lightweight session tracker is
-`.copilot-tasks/business-container-routing-plan.md`. Update a task to
-`IN PROGRESS` before changing its implementation surfaces and to `DONE` only
-after its acceptance check passes. A failed or unavailable prerequisite is
-`BLOCKED`, with the evidence recorded beside the task.
+This file is the authoritative execution record. The completed lightweight
+tracker is archived at
+`.copilot-tasks/archive/business-container-routing-plan.md`.
 
 | Phase | Status | Exit gate |
 | --- | --- | --- |
@@ -55,36 +58,31 @@ after its acceptance check passes. A failed or unavailable prerequisite is
 | 4B. Local Azure authentication | DONE | Explicit local SP and deployed managed-identity contracts validate |
 | 5. Azure infrastructure | DONE | Six containers, scoped RBAC, and public ACA validate |
 | 6. Business metadata contract | DONE | T33 criteria 29-34, focused tests, review, and documentation complete |
-| 7. Fresh-content cutover | NOT STARTED | All dev sources complete guarded fresh ingestion |
-| 8. Final validation and handoff | NOT STARTED | Full acceptance matrix and review pass |
+| 7. Fresh-content cutover | DONE | Four approved sources completed guarded reset, registration, isolated fresh ingestion, and direct ACA validation |
+| 8. Final validation and handoff | DONE WITH DOCUMENTED LIMITATION | Acceptance matrix, repository validation, review, and archived tracker complete; fresh deployed guest reauthentication remains unavailable |
 
 ## Evidence
 
-- The current source parser enforces an exact schema-v1 config containing the
-  source binding, container pair, and ACL policy but no `businessName`;
-  `app/source_registry.py` is therefore the authoritative T33 contract owner.
-- `SourcePlan` carries the complete source and catalog ETag, and ingestion
-  coordinator/commit paths compare complete plans. T33 must preserve
-  lifecycle/binding validation while excluding label-only changes from
-  ingestion work validity.
-- Retrieval point-reads one `SourceEligibility` and currently compares the
-  complete ETag-bearing value before returning citations. T33 must add the
-  label snapshot while revalidating lifecycle, routing, and ACL semantics
-  rather than failing on a label-only ETag change.
-- `source-documents` stores both `source_document` and
-  `visual_manifest_page` records; both require the snapshot to make the
-  container metadata contract consistent.
-- Ingestion audit items are source-bound through
-  `ingestion.telemetry.write_audit_record`; retrieval separately writes LLM
-  usage items and a `query_request` summary. T33 must update those explicit
-  source-context audit surfaces, not unrelated global catalog events.
+- T20 recorded the SHA-bound development reset, four strict registrations,
+  settled coordinators, exact source/container counts, zero wrong-pair or
+  legacy records, and direct delegated-user ACA retrieval.
+- T21 recorded the four-source deployed matrix, source-isolated citations,
+  paused Common-source no-evidence behavior, anonymous `401`, current identity
+  and group evidence, 1,406 focused tests, 2,705 full-suite tests, fatal Ruff
+  checks, and Bicep compilation.
+- T22 found and resolved the partial commit-boundary defect, completed the
+  documentation and rollback handoff, and archived the implementation tracker
+  with no unresolved must-fix finding.
 - The external-access, VNet-integrated ACA and direct delegated-user
-  authentication are complete and remain unchanged by T33. Microsoft documents
-  the deployed networking model at:
+  authentication remained intact through the later contract and cutover work.
+  Microsoft documents the deployed networking model at:
   [Networking in Azure Container Apps](https://learn.microsoft.com/azure/container-apps/networking).
 - ACA built-in authentication can use an existing Microsoft Entra app
   registration:
   [Enable authentication and authorization in Container Apps with Microsoft Entra ID](https://learn.microsoft.com/azure/container-apps/authentication-entra).
+- Microsoft provides a Bicep reference for Container Apps built-in Entra
+  authentication:
+  [Azure-Samples/containerapps-builtinauth-bicep](https://github.com/Azure-Samples/containerapps-builtinauth-bicep).
 - Cosmos data-plane RBAC should use Microsoft Entra identities and the least
   privilege needed:
   [Connect using role-based access control and Microsoft Entra ID](https://learn.microsoft.com/azure/cosmos-db/how-to-connect-role-based-access-control).
@@ -104,10 +102,9 @@ after its acceptance check passes. A failed or unavailable prerequisite is
   [Microsoft Graph permission resource](https://learn.microsoft.com/graph/api/resources/permission)
   and
   [Microsoft Graph sharingLink resource](https://learn.microsoft.com/graph/api/resources/sharinglink).
-- The current ingestion parser raises on the first sharing link, malformed
-  identity, or unsupported role. The approved rule instead requires complete
-  traversal and at least one independently verified security-group grant;
-  unrelated permission observations cannot invalidate that grant.
+- The ingestion parser traverses all permission entries, records
+  non-authorizing observations, and admits content only when at least one
+  independently verified security-group grant exists.
 
 ## Plan
 
@@ -1951,18 +1948,17 @@ Excluded:
 
 Deferred post-implementation follow-ups:
 
-- Confirm the four development `sourceId` values and SharePoint site/drive
-  bindings at T02.
-- Confirm each source's target container pair and initial ACL policy at T02.
-- Identify one ACL-member and one non-member test user at T02.
-- Confirm the native/public dev client registration for Postman and PowerShell
-  at T02.
-- ACA environment recreation and fresh-ingestion downtime can be scheduled at
-  any time after T18 because no one is using the development environment.
+- retire the temporary catalog job only through its separately reviewed
+  cleanup gate;
+- select and approve a representative production-capacity pilot before sizing
+  or tuning; and
+- define Agent 1/Agent 2 authentication and authorization before implementing
+  OBO or app-only access.
 
-Evidence gaps:
+Known limitation:
 
-- The exact source IDs, bindings, target pairs, test users, and native/public
-  client registration are intentionally not collected yet.
-- Production capacity remains blocked on measured workload evidence and is not
-  an implementation prerequisite for this dev milestone.
+- a fresh deployed guest token was not acquired because the operator no longer
+  has access to the external guest account. Earlier deployed Easy Auth evidence
+  remains available, while current Graph state and live-dependency local
+  authorization prove zero-group no-evidence behavior without weakening
+  authentication.
