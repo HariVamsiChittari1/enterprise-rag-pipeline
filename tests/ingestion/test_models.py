@@ -999,6 +999,15 @@ def test_safe_error_mapping_never_serializes_exception_text() -> None:
     assert "secret" not in str(error)
 
 
+def test_safe_error_mapping_marks_dependency_access_error_replayable() -> None:
+    from ingestion.errors import DependencyAccessError
+
+    error = safe_error_from_exception(DependencyAccessError("vision_unauthorized"), "extracting")
+
+    assert error.code == "dependency_unauthorized"
+    assert error.retryable is True
+
+
 @pytest.mark.parametrize(
     "status",
     [ActivityStatus.FAILED, ActivityStatus.QUARANTINED],

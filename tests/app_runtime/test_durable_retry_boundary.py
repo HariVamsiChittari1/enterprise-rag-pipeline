@@ -142,6 +142,85 @@ def test_process_document_activity_retries_inside_activity(
     assert settlements == [("succeeded", result)]
 
 
+def test_process_document_activity_does_not_retry_dependency_unauthorized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import config
+    import ingestion.services as services
+
+    failed_record = SimpleNamespace(status=SimpleNamespace(value="failed"))
+    calls = {"process": 0, "resets": 0, "sleeps": 0}
+
+    class FakeRepository:
+        def get_document(self, source_run_id, document_id):
+            return SimpleNamespace(record=failed_record, etag="etag-1")
+
+        def reset_failed_to_discovered(self, item):
+            calls["resets"] += 1
+            return item
+
+    class FakeRegistry:
+        def start_document_operation(self, *_args, **_kwargs):
+            return {"status": "started"}
+
+        def settle_document_operation(self, *_args, status, outcome, **_kwargs):
+            settlements.append((status, outcome))
+
+    settlements: list[tuple[str, dict[str, object]]] = []
+
+    def fake_process_document(*_args, **_kwargs):
+        calls["process"] += 1
+        return ActivityOutcome(
+            document_id="ab-doc-1",
+            status=ActivityStatus.FAILED,
+            chunks_written=0,
+            retry_count=0,
+            error=SafeError("dependency_unauthorized", "extracting", True),
+        )
+
+    fake_config = SimpleNamespace(
+        extraction_enabled=False,
+        enrichment_enabled=False,
+        sharepoint_site_url="",
+        drive_id="drive-1",
+        source_id="source-1",
+        audio_writer_enabled=False,
+    )
+    registry = FakeRegistry()
+    repository = FakeRepository()
+
+    monkeypatch.setattr(config, "load_config", lambda: fake_config)
+    monkeypatch.setattr(
+        function_app, "_resolve_source_config",
+        lambda _payload: (fake_config, SimpleNamespace(source_id="source-1"), registry),
+    )
+    monkeypatch.setattr(function_app, "_build_repository", lambda config: repository)
+    monkeypatch.setattr(function_app, "_build_lifecycle_repository", lambda config: object())
+    monkeypatch.setattr(function_app, "_build_graph_client", lambda config: object())
+    monkeypatch.setattr(function_app, "_build_sharepoint_client", lambda config: None)
+    monkeypatch.setattr(function_app, "_build_openai_client", lambda config: object())
+    monkeypatch.setattr(function_app, "_build_audit_container", lambda config: object())
+    monkeypatch.setattr(services, "process_document", fake_process_document)
+    monkeypatch.setattr(
+        function_app.time, "sleep", lambda seconds: calls.__setitem__("sleeps", calls["sleeps"] + 1)
+    )
+
+    result = function_app.process_document_activity(
+        {
+            "document": {"sourceRunId": "run-1", "documentId": "ab-doc-1"},
+            "sourcePlan": {"sourceId": "source-1"},
+            "coordinatorOwnerId": "orchestration-1",
+            "workId": "work-1",
+            "attemptId": "attempt-1",
+        }
+    )
+
+    assert result["status"] == "failed"
+    assert result["error"] == "dependency_unauthorized"
+    assert calls == {"process": 1, "resets": 0, "sleeps": 0}
+    assert settlements == [("failed", result)]
+
+
 def test_prepare_retry_page_claims_before_reset_and_persists_continuation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

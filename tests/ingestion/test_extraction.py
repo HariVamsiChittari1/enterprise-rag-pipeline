@@ -7,10 +7,11 @@ from typing import Any
 import pytest
 from azure.ai.documentintelligence.models import DocumentContentFormat
 
-from ingestion.errors import TerminalDocumentError
+from ingestion.errors import DependencyAccessError, TerminalDocumentError
 from ingestion.extraction import (
     PNG_SIGNATURE,
     VisionExtractionConfig,
+    _classify_service_error,
     extract_content_understanding,
     extract_markdown,
     extract_office_document_intelligence,
@@ -1277,3 +1278,17 @@ def test_given_cleanup_failure_when_extracting_then_fails_closed() -> None:
         extract_pdf(di_client, b"%PDF-test")
 
     assert di_client.deleted == ["result-1"]
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_given_auth_status_when_classifying_then_dependency_access_error(status: int) -> None:
+    error = _classify_service_error("vision", _HttpError(status))
+
+    assert isinstance(error, DependencyAccessError)
+    assert str(error) == "vision_unauthorized"
+
+
+def test_given_other_statuses_when_classifying_then_existing_behavior() -> None:
+    assert isinstance(_classify_service_error("vision", _HttpError(429)), TimeoutError)
+    assert isinstance(_classify_service_error("vision", _HttpError(503)), TimeoutError)
+    assert isinstance(_classify_service_error("vision", _HttpError(400)), TerminalDocumentError)

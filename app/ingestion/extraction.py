@@ -16,7 +16,7 @@ from azure.ai.documentintelligence.models import (
 )
 from markdown_it import MarkdownIt
 
-from ingestion.errors import TerminalDocumentError
+from ingestion.errors import DependencyAccessError, TerminalDocumentError
 from ingestion.models import (
     CanonicalExtractionResult,
     CanonicalSegment,
@@ -1041,6 +1041,8 @@ def _classify_service_error(context: str, error: BaseException) -> Exception:
         isinstance(status, int) and 500 <= status < 600
     ):
         return TimeoutError(f"{context}_transient")
+    if status in (401, 403):
+        return DependencyAccessError(f"{context}_unauthorized")
     if isinstance(status, int) and 400 <= status < 500:
         return TerminalDocumentError(f"{context}_rejected")
     return TimeoutError(f"{context}_transient")
