@@ -10,6 +10,8 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Mapping
 
+from ingestion.errors import DependencyAccessError
+
 SCHEMA_VERSION = 1
 SUPPORTED_AUDIO_MIME_TYPES = frozenset({"audio/wav", "audio/mpeg", "audio/flac"})
 SOURCE_CONTROL_ID = "source-control"
@@ -1412,6 +1414,8 @@ def content_sha256_bytes(content: bytes) -> str:
 
 
 def safe_error_from_exception(error: BaseException, stage: str) -> SafeError:
+    if isinstance(error, DependencyAccessError):
+        return SafeError("dependency_unauthorized", stage, True)
     if isinstance(error, TimeoutError):
         return SafeError("dependency_timeout", stage, True)
     if isinstance(error, PermissionError):

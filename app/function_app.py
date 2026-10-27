@@ -4075,6 +4075,7 @@ def process_document_activity(payload: dict) -> dict:
             if (
                 outcome.error is None
                 or not outcome.error.retryable
+                or outcome.error.code == "dependency_unauthorized"
                 or attempt >= EXECUTION_CONFIG.process_document_max_attempts
             ):
                 return record_outcome({
