@@ -1118,6 +1118,20 @@ def test_document_source_modified_at_defaults_to_none_and_serializes_as_null() -
     assert doc.to_cosmos_item()["sourceModifiedAt"] is None
 
 
+@pytest.mark.parametrize("ctag", [None, "content-v1"])
+def test_document_content_tag_is_optional(ctag: str | None) -> None:
+    doc = SourceDocumentRecord(**{**document_values(), "c_tag": ctag})
+    assert doc.c_tag == ctag
+    assert doc.to_cosmos_item().get("cTag") == ctag
+    assert ("cTag" in doc.to_cosmos_item()) is (ctag is not None)
+
+
+@pytest.mark.parametrize("ctag", ["", " ", 1, "x" * 501])
+def test_document_rejects_invalid_content_tag(ctag: object) -> None:
+    with pytest.raises(ValueError, match="c_tag"):
+        SourceDocumentRecord(**{**document_values(), "c_tag": ctag})
+
+
 def test_source_modified_at_must_be_utc_when_present() -> None:
     doc_values = document_values()
     doc_values["source_modified_at"] = "2024-05-01T00:00:00+05:00"

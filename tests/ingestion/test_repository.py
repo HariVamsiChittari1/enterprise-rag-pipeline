@@ -1957,6 +1957,14 @@ def test_document_from_item_backward_compat_missing_business_name() -> None:
     assert record.business_name is None
 
 
+@pytest.mark.parametrize("ctag", [None, "content-v1"])
+def test_document_content_tag_round_trip_preserves_legacy_items(ctag: str | None) -> None:
+    document = replace(build_document(), c_tag=ctag)
+    item = document.to_cosmos_item()
+    assert repository_module._document_from_item(item) == document
+    assert ("cTag" in item) is (ctag is not None)
+
+
 @pytest.mark.parametrize("status,intent", [
     (DocumentStatus.DISCOVERED, {}),
     (DocumentStatus.ACL_REFRESHING, {

@@ -7,6 +7,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from config import ExecutionBatchConfig, IngestionConfig
+from ingestion.errors import TerminalDocumentError
 from ingestion.graph import ResolvedMarkdownImage, VerifiedAcl
 from ingestion.models import (
     AclFeedback,
@@ -1030,6 +1031,166 @@ def test_given_sparse_office_text_with_visual_when_processing_then_applies_minim
     assert outcome.status is ActivityStatus.SUCCEEDED
     assert repository.chunks
     assert any("rendered process flow" in chunk.content for chunk in repository.chunks)
+
+
+@pytest.mark.parametrize("stored_ctag,etag,ctag,error", [
+    ("content-v1", "metadata-v2", "content-v1", None),
+    ("content-v1", "metadata-v2", "content-v2", "source_content_changed_during_processing"),
+    ("content-v1", "source-etag", None, "source_content_version_unverifiable"),
+    ("content-v1", "source-etag", "", "source_content_version_unverifiable"),
+    ("content-v1", "source-etag", 1, "source_content_version_unverifiable"),
+    ("content-v1", None, "content-v1", "source_version_unverifiable"),
+    (None, "source-etag", None, None),
+    (None, "metadata-v2", "content-v1", "source_etag_changed_during_processing"),
+])
+def test_source_snapshot_content_version_guard(
+    stored_ctag: str | None, etag: str | None, ctag: object, error: str | None,
+) -> None:
+    document = replace(_document("report.pdf"), c_tag=stored_ctag)
+    connector = MagicMock()
+    connector.read_item.return_value = {
+        "name": document.source_name, "eTag": etag, "cTag": ctag,
+        "size": document.size_bytes, "file": {"mimeType": document.mime_type},
+    }
+    if error:
+        with pytest.raises(TerminalDocumentError, match=error):
+            services._read_and_validate_source_snapshot(connector, document)
+    else:
+        services._read_and_validate_source_snapshot(connector, document)
+
+
+def test_source_conversion_preserves_content_tag_without_changing_etag() -> None:
+    item = {
+        "id": "item-1", "name": "report.pdf", "eTag": "source-etag", "cTag": "content-v1",
+        "size": 100, "file": {"mimeType": "application/pdf"},
+        "parentReference": {"id": "parent", "path": "/drive/root:"},
+        "webUrl": "https://example.invalid/report.pdf",
+    }
+    source = services.discovered_pdf_from_item(item, 0)
+    document = services._source_to_document(source, _config(), "content-test")
+    assert document.c_tag == "content-v1" and document.e_tag == "source-etag"
+
+
+def test_stable_content_tag_preserves_mime_guard() -> None:
+    document = replace(_document("report.pdf"), c_tag="content-v1")
+    connector = MagicMock()
+    connector.read_item.return_value = {
+        "name": document.source_name, "eTag": "metadata-v2", "cTag": "content-v1",
+        "size": document.size_bytes, "file": {"mimeType": "application/pdf"},
+    }
+    original = services._read_and_validate_source_snapshot(connector, document)
+    connector.read_item.return_value["file"]["mimeType"] = "text/plain"
+    with pytest.raises(TerminalDocumentError):
+        services._read_and_validate_source_snapshot(connector, document, expected_snapshot=original)
+
+
+@pytest.mark.parametrize("field,value,error", [
+    ("name", "renamed.pdf", "source_name_changed_during_processing"),
+    ("size", 101, "source_size_changed_during_processing"),
+])
+def test_stable_content_tag_preserves_metadata_guards(field: str, value: object, error: str) -> None:
+    document = replace(_document("report.pdf"), c_tag="content-v1")
+    connector = MagicMock()
+    connector.read_item.return_value = {
+        "name": document.source_name, "eTag": "metadata-v2", "cTag": "content-v1",
+        "size": document.size_bytes, "file": {"mimeType": document.mime_type}, field: value,
+    }
+    with pytest.raises(TerminalDocumentError, match=error):
+        services._read_and_validate_source_snapshot(connector, document)
+
+
+@pytest.mark.parametrize("final_ctag,error", [
+    ("content-v1", None),
+    ("content-v2", "source_content_changed_during_processing"),
+    (None, "source_content_version_unverifiable"),
+])
+def test_processing_uses_captured_content_tag_before_admission(
+    monkeypatch: Any, final_ctag: str | None, error: str | None,
+) -> None:
+    connector = _Connector("report.pdf", "application/pdf", b"%PDF-original")
+    connector.item_etags = ["source-etag", "metadata-v2"]
+    read_item = connector.read_item
+
+    def current_item(item_id: str) -> dict[str, Any]:
+        item = read_item(item_id)
+        item["cTag"] = "content-v1" if item["eTag"] == "source-etag" else final_ctag
+        return item
+
+    monkeypatch.setattr(connector, "read_item", current_item)
+    monkeypatch.setattr(
+        services, "extract_pdf",
+        lambda *_args, **_kwargs: _canonical(Page(1, "Extracted PDF content with enough text for one production chunk.")),
+    )
+    repository, _, outcome = _run(monkeypatch, replace(_document("report.pdf"), c_tag="content-v1"), connector)
+    if error:
+        assert outcome.status is ActivityStatus.QUARANTINED and outcome.error.code == error
+        assert "begin_document_admission" not in repository.calls
+    else:
+        assert outcome.status is ActivityStatus.SUCCEEDED
+        assert repository.admitted_document.e_tag == "source-etag"
+        assert repository.admitted_document.c_tag == "content-v1"
+
+
+@pytest.mark.parametrize("etag,ctag,error", [
+    ("metadata-v2", "content-v1", None),
+    ("metadata-v2", "content-v2", "markdown_image_etag_changed_during_processing"),
+    ("image-v1", None, "markdown_image_etag_changed_during_processing"),
+    ("image-v1", "", "markdown_image_etag_changed_during_processing"),
+])
+def test_referenced_image_content_tag_guard(etag: str, ctag: object, error: str | None) -> None:
+    image = ResolvedMarkdownImage("image", "chart.png", "image-v1", 10, "image/png", c_tag="content-v1")
+    item = {"name": image.name, "eTag": etag, "cTag": ctag, "size": image.size_bytes,
+            "file": {"mimeType": image.mime_type}}
+    if error:
+        with pytest.raises(TerminalDocumentError, match=error):
+            services._validate_resolved_image_snapshot(item, image)
+    else:
+        services._validate_resolved_image_snapshot(item, image)
+
+
+@pytest.mark.parametrize("field,value", [("name", "other.png"), ("size", 11), ("mime", "image/jpeg")])
+def test_stable_image_content_tag_preserves_metadata_guards(field: str, value: object) -> None:
+    image = ResolvedMarkdownImage("image", "chart.png", "image-v1", 10, "image/png", c_tag="content-v1")
+    item = {"name": image.name, "eTag": "metadata-v2", "cTag": "content-v1",
+            "size": image.size_bytes, "file": {"mimeType": image.mime_type}}
+    if field == "mime":
+        item["file"]["mimeType"] = value
+    else:
+        item[field] = value
+    with pytest.raises(TerminalDocumentError):
+        services._validate_resolved_image_snapshot(item, image)
+
+
+@pytest.mark.parametrize("acl_changed", [False, True])
+def test_tagged_referenced_image_preserves_final_acl_checks(monkeypatch: Any, acl_changed: bool) -> None:
+    connector = _Connector("guide.md", "text/markdown", b"# Guide with synthetic image")
+    _stub_markdown_image_extraction(monkeypatch)
+    read_item = connector.read_item
+
+    def item(item_id: str) -> dict[str, Any]:
+        value = read_item(item_id)
+        if item_id == "image-1":
+            value["eTag"] = "image-metadata-v2"
+            value["cTag"] = "image-content-v1"
+        return value
+
+    resolve = connector.resolve_relative_markdown_image_sync
+    monkeypatch.setattr(connector, "read_item", item)
+    monkeypatch.setattr(
+        connector, "resolve_relative_markdown_image_sync",
+        lambda *args: replace(resolve(*args), c_tag="image-content-v1"),
+    )
+    if acl_changed:
+        connector.image_acls = [
+            ACL_A, VerifiedAcl((GROUP_A, "33333333-3333-4333-8333-333333333333"), content_sha256("changed")),
+        ]
+    repository, _, outcome = _run(monkeypatch, _document("guide.md"), connector)
+    if acl_changed:
+        assert outcome.status is ActivityStatus.QUARANTINED
+        assert outcome.error.code == "markdown_image_acl_changed_during_processing"
+        assert "begin_document_admission" not in repository.calls
+    else:
+        assert outcome.status is ActivityStatus.SUCCEEDED
 
 
 def test_given_etag_drift_after_chunk_write_when_processing_then_does_not_admit(monkeypatch: Any) -> None:

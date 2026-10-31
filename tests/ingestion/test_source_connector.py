@@ -446,7 +446,7 @@ def test_download_relative_content_uses_encoded_parent_relative_path() -> None:
         if request.url.path.endswith(
             "/drives/drive-1/items/parent-1:/images/chart one.png:"
         ):
-            assert request.url.params["$select"] == "id,name,eTag,size,file"
+            assert request.url.params["$select"] == "id,name,eTag,cTag,size,file"
             return httpx.Response(
                 200,
                 json={

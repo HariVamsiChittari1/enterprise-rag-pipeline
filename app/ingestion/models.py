@@ -810,6 +810,7 @@ class SourceDocumentRecord:
     source_verified_at: str | None = field(default=None, metadata={"omit_none": True})
     processing_profile_digest: str | None = field(default=None, metadata={"omit_none": True})
     business_name: str | None = field(default=None, metadata={"omit_none": True})
+    c_tag: str | None = field(default=None, metadata={"omit_none": True})
     # Transient batch-transcription tracking, set together while stage == TRANSCRIBING.
     transcription_job_url: str | None = field(default=None, metadata={"omit_none": True})
     staging_blob_name: str | None = field(default=None, metadata={"omit_none": True})
@@ -826,6 +827,8 @@ class SourceDocumentRecord:
             raise ValueError("document run keys do not match their deterministic value")
         if self.record_type != SOURCE_DOCUMENT_RECORD_TYPE:
             raise ValueError("invalid source-document record type")
+        if self.c_tag is not None:
+            _require_text("c_tag", self.c_tag, 500)
         if self.processing_profile_digest is not None and re.fullmatch(
             r"[0-9a-f]{64}", self.processing_profile_digest,
         ) is None:
