@@ -41,7 +41,7 @@ DOWNLOAD_HOST_SUFFIXES = (
     "storage.live.com",
     "svc.ms",
 )
-CHILDREN_SELECT = "id,name,eTag,size,file,folder,package,parentReference,webUrl,lastModifiedDateTime"
+CHILDREN_SELECT = "id,name,eTag,cTag,size,file,folder,package,parentReference,webUrl,lastModifiedDateTime"
 SUPPORTED_ACL_ROLES = frozenset({"read", "write", "owner"})
 SUPPORTED_SOURCE_MIME_TYPES: dict[str, frozenset[str]] = {
     ".md": frozenset({"text/markdown", "text/plain", "application/octet-stream"}),
@@ -189,9 +189,10 @@ class DiscoveredPdf:
     size_bytes: int
     discovery_ordinal: int
     last_modified_date_time: str | None = None
+    c_tag: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        value = {
             "itemId": self.item_id,
             "parentItemId": self.parent_item_id,
             "name": self.name,
@@ -203,6 +204,9 @@ class DiscoveredPdf:
             "discoveryOrdinal": self.discovery_ordinal,
             "lastModifiedDateTime": self.last_modified_date_time,
         }
+        if self.c_tag is not None:
+            value["cTag"] = self.c_tag
+        return value
 
 
 @dataclass(frozen=True)
@@ -249,6 +253,7 @@ class ResolvedMarkdownImage:
     e_tag: str
     size_bytes: int
     mime_type: str
+    c_tag: str | None = None
 
 
 class GraphDiscoveryLimitExceeded(RuntimeError):
@@ -368,6 +373,27 @@ def _optional_item_text(item: dict[str, Any], field_name: str) -> str | None:
     return value
 
 
+def _optional_content_tag(item: dict[str, Any]) -> str | None:
+    value = item.get("cTag")
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip() or len(value) > 500:
+        raise ValueError("Graph drive item cTag is invalid")
+    return value
+
+
+def source_content_matches(
+    item: dict[str, Any], expected_etag: str, expected_ctag: str | None,
+) -> bool:
+    """Compare captured content identity, retaining strict ETag fallback."""
+    etag = item.get("eTag")
+    if not isinstance(etag, str) or not etag.strip():
+        return False
+    if expected_ctag is None:
+        return etag == expected_etag
+    return item.get("cTag") == expected_ctag
+
+
 def discovered_pdf_from_item(item: dict[str, Any], ordinal: int) -> DiscoveredPdf:
     item_id = _require_item_text(item, "id")
     name = _require_item_text(item, "name")
@@ -395,6 +421,7 @@ def discovered_pdf_from_item(item: dict[str, Any], ordinal: int) -> DiscoveredPd
         size_bytes=size_bytes,
         discovery_ordinal=ordinal,
         last_modified_date_time=_optional_item_text(item, "lastModifiedDateTime"),
+        c_tag=_optional_content_tag(item),
     )
 
 
@@ -1425,7 +1452,7 @@ def resolve_relative_markdown_image_sync(
     )
     metadata_response = client.get(
         item_url,
-        params={"$select": "id,name,eTag,size,file"},
+        params={"$select": "id,name,eTag,cTag,size,file"},
     )
     if metadata_response.status_code == 429 or metadata_response.status_code >= 500:
         raise TimeoutError("graph_asset_metadata_transient")
@@ -1481,12 +1508,17 @@ def _validate_markdown_image_metadata(
         raise TerminalDocumentError("markdown_image_size_invalid")
     if size > max_bytes:
         raise TerminalDocumentError("vision_image_too_large")
+    try:
+        c_tag = _optional_content_tag(item)
+    except ValueError as error:
+        raise TerminalDocumentError("graph_asset_metadata_invalid") from error
     return ResolvedMarkdownImage(
         item_id=item_id,
         name=name,
         e_tag=e_tag,
         size_bytes=size,
         mime_type=MARKDOWN_IMAGE_MIME_TYPE,
+        c_tag=c_tag,
     )
 
 

@@ -16,7 +16,9 @@ from ingestion.graph import (
     advance_discovery,
     canonical_source_mime,
     discover_next_page,
+    discovered_pdf_from_item,
     read_verified_acl,
+    resolve_relative_markdown_image_sync,
     resolve_site_group_security_groups,
     resolve_source_format,
     validate_sharepoint_drive_site,
@@ -41,6 +43,43 @@ def pdf_item(item_id: str, name: str | None = None, size: int = 100) -> dict:
         "file": {"mimeType": "application/pdf"},
         "parentReference": {"id": "parent", "path": "/drives/drive/root:/Docs"},
     }
+
+
+@pytest.mark.parametrize("ctag", [None, "content-v1"])
+def test_discovery_preserves_optional_content_tag(ctag: str | None) -> None:
+    item = pdf_item("pdf")
+    if ctag is not None:
+        item["cTag"] = ctag
+    discovered = discovered_pdf_from_item(item, 0)
+    assert discovered.c_tag == ctag
+    assert discovered.to_dict().get("cTag") == ctag
+    assert ("cTag" in discovered.to_dict()) is (ctag is not None)
+    assert "cTag" in CHILDREN_SELECT.split(",")
+
+
+@pytest.mark.parametrize("ctag", ["", " ", 1, "x" * 501])
+def test_discovery_rejects_malformed_content_tag(ctag: object) -> None:
+    with pytest.raises(ValueError, match="cTag"):
+        discovered_pdf_from_item({**pdf_item("pdf"), "cTag": ctag}, 0)
+
+
+@pytest.mark.parametrize("ctag", [None, "content-v1", "", " ", 1, "x" * 501])
+def test_relative_image_captures_or_rejects_content_tag(ctag: object) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert "cTag" in request.url.params["$select"].split(",")
+        item = {"id": "image", "name": "chart.png", "eTag": "image-v1",
+                "size": 10, "file": {"mimeType": "image/png"}}
+        if ctag is not None:
+            item["cTag"] = ctag
+        return httpx.Response(200, json=item)
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        if ctag is None or ctag == "content-v1":
+            image = resolve_relative_markdown_image_sync(client, "drive", "parent", "chart.png", 100)
+            assert image.c_tag == ctag
+        else:
+            with pytest.raises(TerminalDocumentError, match="graph_asset_metadata_invalid"):
+                resolve_relative_markdown_image_sync(client, "drive", "parent", "chart.png", 100)
 
 
 def test_verified_acl_keeps_feedback_out_of_authorization_hash() -> None:

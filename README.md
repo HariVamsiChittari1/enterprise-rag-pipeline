@@ -46,6 +46,16 @@ Use [tools/script_query_retrieval.py](tools/script_query_retrieval.py) for an in
 
 Full sync skips a prior-ready file when its source eTag and available modification timestamp are unchanged. Use `retry-failed` for failed documents instead of re-running full sync. Delta failures retain the previous cursor and are replayed by a later tick. See [ARCHITECTURE.md](docs/ARCHITECTURE.md#idempotent-re-runs-skip-if-ready) for details.
 
+During processing, document and referenced-image checks use a captured SharePoint
+content tag (`cTag`) when available; otherwise they retain strict ETag equality.
+An unchanged content tag can tolerate metadata-only ETag changes, but missing or
+changed captured tags and name, size, MIME or ACL changes still block admission.
+Original ETags remain the ownership/version identity; skip-if-ready behavior is
+unchanged. Older stored documents without content tags remain readable. Readers
+that predate the optional persisted `cTag` field may reject new tagged records:
+keep compatible readers/writers during rollout and assess rollback before
+deployment. Live tag availability across SharePoint formats remains unverified.
+
 ## Security
 
 See the [architecture security model and known limitations](docs/ARCHITECTURE.md#security-model), the [Azure identity and network inventory](docs/AZURE_RESOURCES.md), and the [production security gates](docs/PRODUCTION_READINESS.md#security-gaps-and-boundaries).

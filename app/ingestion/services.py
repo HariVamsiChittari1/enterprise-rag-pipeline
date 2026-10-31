@@ -44,6 +44,7 @@ from ingestion.graph import (
     canonical_source_mime,
     discovered_pdf_from_item,
     resolve_source_format,
+    source_content_matches,
     validate_source_signature,
 )
 from ingestion.lifecycle_repository import (
@@ -3234,8 +3235,17 @@ def _read_and_validate_source_snapshot(
     )
     if name != document.source_name:
         raise TerminalDocumentError("source_name_changed_during_processing")
-    if e_tag != document.e_tag:
-        raise TerminalDocumentError("source_etag_changed_during_processing")
+    if not isinstance(e_tag, str) or not e_tag.strip():
+        raise TerminalDocumentError("source_version_unverifiable")
+    if document.c_tag is not None:
+        c_tag = item.get("cTag")
+        if not isinstance(c_tag, str) or not c_tag.strip() or len(c_tag) > 500:
+            raise TerminalDocumentError("source_content_version_unverifiable")
+    if not source_content_matches(item, document.e_tag, document.c_tag):
+        raise TerminalDocumentError(
+            "source_content_changed_during_processing"
+            if document.c_tag is not None else "source_etag_changed_during_processing"
+        )
     if size != document.size_bytes:
         raise TerminalDocumentError("source_size_changed_during_processing")
     source_format = resolve_source_format(name, graph_mime)
@@ -3260,7 +3270,7 @@ def _validate_resolved_image_snapshot(
     )
     if item.get("name") != expected.name:
         raise TerminalDocumentError("markdown_image_name_changed_during_processing")
-    if item.get("eTag") != expected.e_tag:
+    if not source_content_matches(item, expected.e_tag, expected.c_tag):
         raise TerminalDocumentError("markdown_image_etag_changed_during_processing")
     if item.get("size") != expected.size_bytes:
         raise TerminalDocumentError("markdown_image_size_changed_during_processing")
@@ -3276,6 +3286,7 @@ def _source_to_document(source: Any, config: IngestionConfig, run_id: str, inges
         item_id=source.item_id, parent_item_id=source.parent_item_id,
         source_name=source.name, source_path=source.source_path,
         source_url=source.source_url, e_tag=source.e_tag,
+        c_tag=getattr(source, "c_tag", None),
         mime_type=source.mime_type, size_bytes=source.size_bytes,
         discovery_ordinal=source.discovery_ordinal,
         allowed_group_ids=("pending",), acl_hash=content_sha256("pending"),
