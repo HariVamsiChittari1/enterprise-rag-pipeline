@@ -1957,6 +1957,44 @@ def test_document_from_item_backward_compat_missing_business_name() -> None:
     assert record.business_name is None
 
 
+@pytest.mark.parametrize("status,intent", [
+    (DocumentStatus.DISCOVERED, {}),
+    (DocumentStatus.ACL_REFRESHING, {
+        "pendingAllowedGroupIds": ["group-b"],
+        "pendingAclHash": content_sha256("group-b"),
+        "pendingAclStatus": "Verified",
+        "pendingAclFeedback": [],
+    }),
+    (DocumentStatus.RETIRING, {"pendingRetiredReason": "acl_revoked"}),
+])
+def test_document_hydration_preserves_pending_lifecycle_record(
+    status: DocumentStatus, intent: dict[str, Any],
+) -> None:
+    document = replace(build_document(), status=status)
+    item = {**document.to_cosmos_item(), **intent, "_etag": "etag-pending"}
+    before = deepcopy(item)
+    documents = PointReadContainer({(document.source_run_id, document.document_id): item})
+    repository = IngestionRepository(None, documents, None)
+
+    stored = repository.get_document(document.source_run_id, document.document_id)
+
+    assert stored is not None
+    assert stored.record == document
+    assert stored.etag == "etag-pending"
+    assert item == before
+
+
+def test_document_hydration_still_rejects_unknown_fields() -> None:
+    document = build_document()
+    item = {**document.to_cosmos_item(), "unknownField": "invalid", "_etag": "etag-unknown"}
+    documents = PointReadContainer({(document.source_run_id, document.document_id): item})
+
+    with pytest.raises(RepositoryDataError, match="source document does not match schema version 1"):
+        IngestionRepository(None, documents, None).get_document(
+            document.source_run_id, document.document_id,
+        )
+
+
 def test_new_source_document_requires_business_name() -> None:
     repository = IngestionRepository(
         StatefulContainer("sourceId"),

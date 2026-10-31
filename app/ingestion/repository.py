@@ -1550,6 +1550,11 @@ def _document_from_item(item: Mapping[str, Any]) -> SourceDocumentRecord:
     values.setdefault("source_modified_at", None)
     for _removed in ("quality_flags", "profiles", "acl_policy_version", "verified_at"):
         values.pop(_removed, None)
+    for field in (
+        "pending_allowed_group_ids", "pending_acl_hash", "pending_acl_status",
+        "pending_acl_feedback", "pending_retired_reason",
+    ):
+        values.pop(field, None)
     if values.get("error") is not None:
         values["error"] = SafeError(**_snake_keys(values["error"]))
     if values.get("audio") is not None:
