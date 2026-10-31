@@ -2896,6 +2896,76 @@ def test_lifecycle_reconciliation_isolates_poison_documents() -> None:
     )
 
 
+@pytest.mark.parametrize("transient_failure", [False, True])
+def test_interrupted_acl_recovery_uses_real_document_hydration(
+    monkeypatch: pytest.MonkeyPatch, transient_failure: bool,
+) -> None:
+    from copy import deepcopy
+
+    from ingestion.models import DocumentStage, content_sha256
+    from ingestion.repository import IngestionRepository
+    from test_lifecycle_repository import FakeContainer
+    from test_repository import build_document
+
+    document = replace(
+        build_document(), status=DocumentStatus.READY, stage=DocumentStage.TERMINAL,
+        acl_status=AclStatus.VERIFIED,
+    )
+    key = (document.source_run_id, document.document_id)
+    documents = FakeContainer(
+        "sourceRunId", {key: {**document.to_cosmos_item(), "_etag": "etag-ready"}},
+    )
+    chunks = FakeContainer("documentKey", {(document.document_key, "chunk-0"): {
+        "id": "chunk-0", "documentKey": document.document_key,
+        "allowedGroupIds": list(document.allowed_group_ids),
+        "isRetrievable": True, "lifecycleGeneration": 0,
+    }})
+    lifecycle = DocumentLifecycleRepository(FakeContainer("sourceId"), documents, chunks)
+
+    def interrupt(**_kwargs: Any) -> None:
+        raise TimeoutError("synthetic interruption")
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(lifecycle, "set_document_chunks_retrievable", interrupt)
+        with pytest.raises(TimeoutError, match="synthetic interruption"):
+            lifecycle.refresh_document_acl(
+                source_run_id=document.source_run_id, document_id=document.document_id,
+                document_key=document.document_key, etag="etag-ready",
+                allowed_group_ids=("group-b",), acl_hash=content_sha256("group-b"),
+            )
+    before = deepcopy(documents.items[key])
+    assert before["status"] == "acl_refreshing" and before["pendingAllowedGroupIds"] == ["group-b"]
+
+    acl_calls = []
+
+    def acl(item_id: str, max_pages: int) -> VerifiedAcl:
+        acl_calls.append((item_id, max_pages))
+        if transient_failure:
+            raise TimeoutError("synthetic Graph throttling")
+        return VerifiedAcl(("group-b",), content_sha256("group-b"))
+
+    repository = IngestionRepository(None, documents, chunks)
+    outcome, continuation = services.run_lifecycle_reconciliation_page(
+        build_config(), repository, lifecycle, lambda: FakeConnector(acl),
+        source_id=document.source_id, page_size=10,
+    )
+
+    assert continuation is None
+    assert outcome.checked == 1
+    assert acl_calls == [(document.item_id, build_config().execution.acl_max_pages)]
+    assert (outcome.repaired, outcome.failed) == ((0, 1) if transient_failure else (1, 0))
+    if transient_failure:
+        assert documents.items[key] == before
+    else:
+        stored = repository.get_document(document.source_run_id, document.document_id)
+        assert stored is not None and stored.record.status is DocumentStatus.READY
+        assert stored.record.allowed_group_ids == ("group-b",)
+        assert stored.record.lifecycle_generation == 1
+        assert not any(field.startswith("pending") for field in documents.items[key])
+        assert chunks.items[(document.document_key, "chunk-0")]["isRetrievable"] is True
+        assert chunks.items[(document.document_key, "chunk-0")]["allowedGroupIds"] == ["group-b"]
+
+
 def test_lifecycle_reconciliation_retires_when_pending_acl_is_no_longer_verifiable() -> None:
     ref = LifecycleDocumentRef(
         document_id="doc-acl",
